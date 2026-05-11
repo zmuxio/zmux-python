@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zmuxio-aioquic"
+version = "0.1.0"
+description = "Optional aioquic QUIC adapter for zmuxio"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [
+    { name = "zmuxio contributors" }
+]
+keywords = ["zmux", "aioquic", "quic", "stream", "adapter"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Typing :: Typed",
+    "Topic :: Internet",
+    "Topic :: Software Development :: Libraries",
+]
+dependencies = [
+    "zmuxio>=0.1.0",
+    "aioquic>=1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/zmuxio/zmux-python"
+Repository = "https://github.com/zmuxio/zmux-python"
+Issues = "https://github.com/zmuxio/zmux-python/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["zmux_aioquic", "zmux_aioquic.*"]
+
+[tool.setuptools.package-data]
+zmux_aioquic = ["py.typed"]

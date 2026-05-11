@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zmuxio"
+version = "0.1.0"
+description = "Python package for the ZMux v1 stream multiplexing protocol"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [
+    { name = "zmuxio contributors" }
+]
+keywords = ["zmux", "multiplexing", "networking", "protocol", "stream"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Typing :: Typed",
+    "Topic :: Internet",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.optional-dependencies]
+aioquic = ["zmuxio-aioquic>=0.1.0"]
+
+[project.urls]
+Homepage = "https://github.com/zmuxio/zmux-python"
+Repository = "https://github.com/zmuxio/zmux-python"
+Issues = "https://github.com/zmuxio/zmux-python/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["zmux", "zmux.*"]
+
+[tool.setuptools.package-data]
+zmux = ["py.typed"]
