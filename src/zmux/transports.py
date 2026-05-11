@@ -19,6 +19,7 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
+    TypeAlias,
     Tuple,
     Union,
     runtime_checkable,
@@ -45,7 +46,7 @@ MAX_RETAINED_IO_BUFFER = 64 * 1024
 _MIN_SOCKET_TIMEOUT = 1e-6
 _UNSET = object()
 
-Address = object
+Address: TypeAlias = object
 
 
 @dataclass(frozen=True)

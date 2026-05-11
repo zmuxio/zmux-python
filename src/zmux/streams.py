@@ -5,13 +5,13 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable
 from types import TracebackType
-from typing import Optional, Protocol, Union, runtime_checkable
+from typing import Optional, Protocol, TypeAlias, Union, runtime_checkable
 
 from .payload import MetadataUpdate, StreamMetadata
 
-ReadableBuffer = Union[bytes, bytearray, memoryview]
-WritableBuffer = Union[bytearray, memoryview]
-Deadline = Optional[float]
+ReadableBuffer: TypeAlias = Union[bytes, bytearray, memoryview]
+WritableBuffer: TypeAlias = Union[bytearray, memoryview]
+Deadline: TypeAlias = Optional[float]
 
 
 @runtime_checkable

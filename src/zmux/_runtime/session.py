@@ -137,6 +137,8 @@ from ..payload import StreamMetadata, build_error_payload
 from ..preface import Negotiated, Preface
 from ..protocol import ErrorCode, FrameType, MAX_VARINT62, Role
 
+T = TypeVar("T")
+
 MAX_UINT64 = (1 << 64) - 1
 
 CONN_READ_BUFFER_SIZE = 512
@@ -1516,9 +1518,6 @@ class SessionRuntimeState:
                 visible_terminal_churn_budget=abuse.visible_terminal_churn_budget,
             ),
         )
-
-
-T = TypeVar("T")
 
 
 @dataclass

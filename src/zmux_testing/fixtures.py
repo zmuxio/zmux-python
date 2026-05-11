@@ -13,9 +13,9 @@ import threading
 import unittest
 from copy import deepcopy
 from pathlib import Path, PureWindowsPath
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, TypeAlias, Union
 
-PathLike = Union[str, os.PathLike]
+PathLike: TypeAlias = Union[str, os.PathLike[str]]
 
 _FIXTURE_ENV = "ZMUX_FIXTURE_DIR"
 _REQUIRED_FIXTURE_FILES = ("wire_valid.ndjson", "wire_invalid.ndjson")

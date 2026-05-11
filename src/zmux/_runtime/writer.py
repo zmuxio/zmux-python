@@ -31,12 +31,12 @@ from .queue import (
     tx_frames_queue_cost,
     write_all,
 )
-from .sched import (
+from .batch_scheduler import BatchScheduler
+from .sched_core import (
     FALLBACK_GROUP_BUCKET,
     MAX_EXPLICIT_GROUPS,
     BatchConfig,
     BatchItem,
-    BatchScheduler,
     GroupKey,
     RequestMeta,
     StreamMeta,
@@ -454,20 +454,7 @@ class EncodedBatch:
                 dst.extend(part)
 
     def to_bytes(self) -> bytes:
-        out = bytearray(self.stats.encoded_bytes)
-        view = memoryview(out)
-        offset = 0
-        for frame in self.frames:
-            header = frame.header
-            view[offset: offset + len(header)] = header
-            offset += len(header)
-            for part in frame.payload_parts:
-                part_len = len(part)
-                view[offset: offset + part_len] = part
-                offset += part_len
-        if offset != self.stats.encoded_bytes:
-            raise _local_internal_error("encoded write batch length mismatch")
-        return bytes(out)
+        return append_encoded_frames(self.frames, self.stats.encoded_bytes)
 
 
 class SupportsWriteVectored(Protocol):
