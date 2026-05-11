@@ -8,8 +8,8 @@ from collections.abc import Iterable
 from typing import Optional, Tuple
 
 from zmux.config import OpenOptions
-from zmux.errors import AdapterUnsupported, ErrorCode
-from zmux.protocol import MAX_VARINT62
+from zmux.errors import AdapterUnsupported
+from zmux.protocol import ErrorCode, MAX_VARINT62
 
 
 def _normalize_open_options(options: Optional[OpenOptions]) -> OpenOptions:

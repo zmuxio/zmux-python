@@ -58,8 +58,8 @@ from ..errors import (
     TerminationKind,
     WriteClosed,
     ZmuxError,
-    code as error_code,
-    reason as error_reason,
+    error_code,
+    error_reason,
 )
 from ..frame import Frame
 from ..payload import (

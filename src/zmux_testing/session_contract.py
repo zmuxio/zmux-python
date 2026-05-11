@@ -391,10 +391,14 @@ async def _cancel_read(stream: Any, code: int, timeout: float) -> None:
     await _call_timed(stream, "cancel_read", timeout, code)
 
 
-async def _close_stream(stream: Any, timeout: float = DEFAULT_TIMEOUT) -> None:
-    method = _first_callable(stream, ("close",))
+async def _close_object(obj: Any, timeout: float) -> None:
+    method = _first_callable(obj, ("close",))
     if method is not None:
         await _await_with_timeout(_invoke(method), timeout)
+
+
+async def _close_stream(stream: Any, timeout: float = DEFAULT_TIMEOUT) -> None:
+    await _close_object(stream, timeout)
 
 
 async def _close_stream_with_error(
@@ -404,9 +408,7 @@ async def _close_stream_with_error(
 
 
 async def _close_session(session: Any, timeout: float = DEFAULT_TIMEOUT) -> None:
-    method = _first_callable(session, ("close",))
-    if method is not None:
-        await _await_with_timeout(_invoke(method), timeout)
+    await _close_object(session, timeout)
 
 
 async def _close_session_with_error(
@@ -475,7 +477,7 @@ async def _call_timed_with_optional_timeout(
     return await _await_with_timeout(_invoke(method), timeout)
 
 
-async def _call_with_optional_timeout(method: Callable[..., Any], *args: Any) -> Any:
+async def _call_with_optional_timeout(method: Any, *args: Any) -> Any:
     if len(args) < 2:
         return await _invoke(method, *args)
     value_args = args[:-1]
@@ -490,7 +492,7 @@ async def _call_with_optional_timeout(method: Callable[..., Any], *args: Any) ->
     return await _await_with_timeout(_invoke(method, *value_args), timeout)
 
 
-def _supports_keyword(method: Callable[..., Any], name: str) -> bool:
+def _supports_keyword(method: Any, name: str) -> bool:
     try:
         signature = inspect.signature(method)
     except (TypeError, ValueError):
@@ -506,7 +508,7 @@ def _supports_keyword(method: Callable[..., Any], name: str) -> bool:
     return False
 
 
-def _supports_positional_count(method: Callable[..., Any], count: int) -> bool:
+def _supports_positional_count(method: Any, count: int) -> bool:
     try:
         signature = inspect.signature(method)
     except (TypeError, ValueError):
@@ -535,7 +537,7 @@ async def _await_with_timeout(value: Any, timeout: float) -> Any:
     return value
 
 
-async def _invoke(method: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+async def _invoke(method: Any, *args: Any, **kwargs: Any) -> Any:
     if inspect.iscoroutinefunction(method):
         return await method(*args, **kwargs)
     loop = asyncio.get_running_loop()
@@ -588,7 +590,7 @@ async def _cancel_task(
         return
 
 
-def _first_callable(obj: Any, names: Tuple[str, ...]) -> Optional[Callable[..., Any]]:
+def _first_callable(obj: Any, names: Tuple[str, ...]) -> Any:
     for name in names:
         candidate = getattr(obj, name, None)
         if callable(candidate):

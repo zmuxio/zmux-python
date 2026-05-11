@@ -13,7 +13,7 @@ import sys
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Callable, Optional
+from typing import Callable, List, Optional, Tuple
 
 from .flow import MAX_UINT64, saturating_add, saturating_mul_div_floor
 from .write_policy import (
@@ -303,7 +303,7 @@ class QueuedWriteCommit:
 
 @dataclass
 class WriteBurstState:
-    frames: list[Frame] = field(default_factory=list)
+    frames: List[Frame] = field(default_factory=list)
     queued_bytes: int = 0
     commit: QueuedWriteCommit = field(default_factory=QueuedWriteCommit)
     data_frames: int = 0
@@ -316,7 +316,7 @@ class WriteBurstState:
         self.data_frames = _nonnegative_int(self.data_frames, "data_frames")
 
     def init_frame_buffer(
-            self, start: WriteBatchStart, frames: Optional[list[Frame]] = None
+            self, start: WriteBatchStart, frames: Optional[List[Frame]] = None
     ) -> None:
         self.frames = [] if frames is None else list(_frame_tuple(frames, "frames"))
         self.frames.clear()
@@ -366,7 +366,7 @@ class WriteBurstState:
 @dataclass(frozen=True)
 class WriteBurstBatchPreparation:
     start: WriteBatchStart = field(default_factory=WriteBatchStart)
-    frames: tuple[Frame, ...] = ()
+    frames: Tuple[Frame, ...] = ()
     queued_bytes: int = 0
     progress: int = 0
     final_state: WriteBurstFinalState = WriteBurstFinalState.NOT_FINALIZED
@@ -408,13 +408,13 @@ class WriteBurstResult:
         object.__setattr__(self, "stop", _require_bool(self.stop, "stop"))
 
 
-def total_part_len(parts: Iterable[ReadableBuffer]) -> tuple[int, bool]:
+def total_part_len(parts: Iterable[ReadableBuffer]) -> Tuple[int, bool]:
     return total_part_len_within(parts, sys.maxsize)
 
 
 def total_part_len_within(
         parts: Iterable[ReadableBuffer], limit: int
-) -> tuple[int, bool]:
+) -> Tuple[int, bool]:
     if isinstance(limit, bool) or not isinstance(limit, int):
         raise TypeError("limit must be an integer")
     if limit < 0:
@@ -451,7 +451,7 @@ def advance_parts(
         index: int,
         offset: int,
         amount: int,
-) -> tuple[int, int]:
+) -> Tuple[int, int]:
     index = max(0, _signed_int(index, "index"))
     offset = max(0, _signed_int(offset, "offset"))
     amount = _nonnegative_int(amount, "amount")
@@ -579,7 +579,7 @@ def _buffer_byte_len(data: ReadableBuffer) -> int:
     return len(view)
 
 
-def _frame_tuple(frames: Iterable[Frame], name: str) -> tuple[Frame, ...]:
+def _frame_tuple(frames: Iterable[Frame], name: str) -> Tuple[Frame, ...]:
     if isinstance(frames, Frame):
         raise TypeError("%s must be a sequence of Frame objects" % name)
     try:

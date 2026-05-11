@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
-from typing import Callable, Optional, Set, Tuple
+from typing import Optional, Set, Tuple
 
 from zmux.config import OpenOptions
 from zmux.conformance import SUITE_STREAM_ADAPTER_PROFILE
@@ -13,7 +13,6 @@ from zmux.errors import (
     AcceptTimeout,
     AdapterUnsupported,
     ApplicationError,
-    ErrorCode,
     ErrorOperation,
     ErrorSource,
     OpenTimeout,
@@ -21,7 +20,7 @@ from zmux.errors import (
     SessionWaitTimeout,
 )
 from zmux.preface import Negotiated, Preface
-from zmux.protocol import CLAIM_STREAM_ADAPTER_PROFILE_V1
+from zmux.protocol import CLAIM_STREAM_ADAPTER_PROFILE_V1, ErrorCode
 from zmux.session import (
     AsyncSession,
     ReasonStats,
@@ -162,7 +161,7 @@ class AioquicSession:
         stream_id = _stream_id(writer, reader)
         stream = AioquicStream.local(self, reader, writer, stream_id, options)
         try:
-            await stream._maybe_send_open_prelude_on_open(
+            await stream.send_open_prelude_on_open(
                 timeout=_remaining_timeout(start, timeout)
             )
         except asyncio.CancelledError:
@@ -187,7 +186,7 @@ class AioquicSession:
         stream_id = _stream_id(writer, reader)
         stream = AioquicSendStream.local(self, writer, stream_id, options)
         try:
-            await stream._maybe_send_open_prelude_on_open(
+            await stream.send_open_prelude_on_open(
                 timeout=_remaining_timeout(start, timeout)
             )
         except asyncio.CancelledError:
@@ -396,20 +395,26 @@ class AioquicSession:
         with self._lock:
             reset_reasons, reset_overflow = self._reset_reasons.snapshot()
             abort_reasons, abort_overflow = self._abort_reasons.snapshot()
-            return SessionStats(
-                state=self.state,
-                sent_data_bytes=self._sent_data_bytes,
-                received_data_bytes=self._received_data_bytes,
-                open_streams=self._open_streams,
-                accepted_streams=self._accepted_streams,
-                active_streams=self._active.snapshot(),
-                reasons=ReasonStats(
-                    reset=reset_reasons,
-                    reset_overflow=reset_overflow,
-                    abort=abort_reasons,
-                    abort_overflow=abort_overflow,
-                ),
+            state = self.state
+            sent_data_bytes = self._sent_data_bytes
+            received_data_bytes = self._received_data_bytes
+            open_streams = self._open_streams
+            accepted_streams = self._accepted_streams
+            active_streams = self._active.snapshot()
+        return SessionStats(
+            state=state,
+            sent_data_bytes=sent_data_bytes,
+            received_data_bytes=received_data_bytes,
+            open_streams=open_streams,
+            accepted_streams=accepted_streams,
+            active_streams=active_streams,
+            reasons=ReasonStats(
+                reset=reset_reasons,
+                reset_overflow=reset_overflow,
+                abort=abort_reasons,
+                abort_overflow=abort_overflow,
             )
+        )
 
     @property
     def peer_go_away_error(self) -> Optional[ApplicationError]:
@@ -420,13 +425,16 @@ class AioquicSession:
         err = self._close_error
         return err if isinstance(err, ApplicationError) else None
 
-    def local_preface(self) -> Preface:
+    @staticmethod
+    def local_preface() -> Preface:
         return _empty_preface()
 
-    def peer_preface(self) -> Preface:
+    @staticmethod
+    def peer_preface() -> Preface:
         return _empty_preface()
 
-    def negotiated(self) -> Negotiated:
+    @staticmethod
+    def negotiated() -> Negotiated:
         return _empty_negotiated()
 
     async def _create_stream(
@@ -494,9 +502,7 @@ class AioquicSession:
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    def _direct_accept_method(
-            self, bidirectional: bool
-    ) -> Optional[Callable[..., object]]:
+    def _direct_accept_method(self, bidirectional: bool) -> Optional[object]:
         method = _first_callable(
             self._connection,
             (

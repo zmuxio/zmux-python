@@ -13,7 +13,6 @@ from zmux.errors import (
     AdapterUnsupported,
     ApplicationError,
     EmptyMetadataUpdate,
-    ErrorCode,
     ErrorSource,
     PriorityUpdateUnavailable,
     ReadClosed,
@@ -25,6 +24,7 @@ from zmux.errors import (
     WriteTimeout,
 )
 from zmux.payload import MetadataUpdate, StreamMetadata
+from zmux.protocol import ErrorCode
 from ._constants import WRITEV_COALESCE_MAX_BYTES, _EMPTY_STREAM_PRELUDE
 from ._errors import translate_read_error, translate_write_error
 from ._io import (
@@ -534,7 +534,7 @@ class _StreamBase:
             _remaining_deadline(self._write_deadline, self._deadline),
         )
 
-    async def _maybe_send_open_prelude_on_open(
+    async def send_open_prelude_on_open(
             self, *, timeout: Optional[float] = None
     ) -> None:
         if self._opened_locally and self._has_peer_visible_open_metadata():

@@ -21,30 +21,37 @@ class StreamHandle(Protocol):
     @property
     def stream_id(self) -> int:
         """Numeric stream identifier after opening-frame commit."""
+        raise NotImplementedError
 
     @property
     def opened_locally(self) -> bool:
         """Whether this endpoint opened the stream."""
+        raise NotImplementedError
 
     @property
     def bidirectional(self) -> bool:
         """Whether the stream has both read and write halves."""
+        raise NotImplementedError
 
     @property
     def open_info(self) -> bytes:
         """Return opaque open-time metadata known locally."""
+        raise NotImplementedError
 
     @property
     def metadata(self) -> StreamMetadata:
         """Return the current peer-visible metadata snapshot."""
+        raise NotImplementedError
 
     @property
     def local_addr(self) -> Optional[object]:
         """Return the local address object when the transport exposes one."""
+        raise NotImplementedError
 
     @property
     def remote_addr(self) -> Optional[object]:
         """Return the peer address object when the transport exposes one."""
+        raise NotImplementedError
 
     def set_deadline(self, deadline: Deadline) -> None:
         """Set an implementation-defined absolute read/write deadline."""
@@ -77,6 +84,7 @@ class RecvStream(StreamHandle, Protocol):
     @property
     def read_closed(self) -> bool:
         """Whether the local read half is closed."""
+        raise NotImplementedError
 
     def read(self, max_bytes: int = -1, *, timeout: Optional[float] = None) -> bytes:
         """Read ordered inbound bytes."""
@@ -109,6 +117,7 @@ class SendStream(StreamHandle, Protocol):
     @property
     def write_closed(self) -> bool:
         """Whether the local write half is closed."""
+        raise NotImplementedError
 
     def write(self, data: ReadableBuffer, *, timeout: Optional[float] = None) -> int:
         """Write bytes into the local zmux send path."""
@@ -161,30 +170,37 @@ class AsyncStreamHandle(Protocol):
     @property
     def stream_id(self) -> int:
         """Numeric stream identifier after opening-frame commit."""
+        raise NotImplementedError
 
     @property
     def opened_locally(self) -> bool:
         """Whether this endpoint opened the stream."""
+        raise NotImplementedError
 
     @property
     def bidirectional(self) -> bool:
         """Whether the stream has both read and write halves."""
+        raise NotImplementedError
 
     @property
     def open_info(self) -> bytes:
         """Return opaque open-time metadata known locally."""
+        raise NotImplementedError
 
     @property
     def metadata(self) -> StreamMetadata:
         """Return the current peer-visible metadata snapshot."""
+        raise NotImplementedError
 
     @property
     def local_addr(self) -> Optional[object]:
         """Return the local address object when the transport exposes one."""
+        raise NotImplementedError
 
     @property
     def remote_addr(self) -> Optional[object]:
         """Return the peer address object when the transport exposes one."""
+        raise NotImplementedError
 
     def set_deadline(self, deadline: Deadline) -> None:
         """Set an implementation-defined absolute read/write deadline."""
@@ -217,6 +233,7 @@ class AsyncRecvStream(AsyncStreamHandle, Protocol):
     @property
     def read_closed(self) -> bool:
         """Whether the local read half is closed."""
+        raise NotImplementedError
 
     async def read(
             self, max_bytes: int = -1, *, timeout: Optional[float] = None
@@ -253,6 +270,7 @@ class AsyncSendStream(AsyncStreamHandle, Protocol):
     @property
     def write_closed(self) -> bool:
         """Whether the local write half is closed."""
+        raise NotImplementedError
 
     async def write(
             self, data: ReadableBuffer, *, timeout: Optional[float] = None

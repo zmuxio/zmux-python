@@ -618,7 +618,7 @@ def has_code(error: BaseException) -> bool:
     )
 
 
-def code(error: BaseException, fallback: Optional[int] = None) -> Optional[int]:
+def error_code(error: BaseException, fallback: Optional[int] = None) -> Optional[int]:
     """Return a nested zmux error code, or ``fallback``."""
 
     found = _find_zmux_error(error, lambda candidate: candidate.numeric_code is not None)
@@ -628,7 +628,7 @@ def code(error: BaseException, fallback: Optional[int] = None) -> Optional[int]:
 def typed_code(error: BaseException) -> Optional[ErrorCode]:
     """Return a standard typed error code if one is carried."""
 
-    numeric = code(error)
+    numeric = error_code(error)
     if numeric is None:
         return None
     try:
@@ -640,10 +640,10 @@ def typed_code(error: BaseException) -> Optional[ErrorCode]:
 def is_error_code(error: BaseException, expected: int) -> bool:
     """Return whether a nested zmux error carries ``expected``."""
 
-    return code(error) == _require_error_code(expected, "expected")
+    return error_code(error) == _require_error_code(expected, "expected")
 
 
-def reason(error: BaseException) -> str:
+def error_reason(error: BaseException) -> str:
     """Return the application reason or best available exception message."""
 
     app = find_error(error, ApplicationError)
@@ -655,27 +655,27 @@ def reason(error: BaseException) -> str:
     return "" if error is None else str(error)
 
 
-def scope(error: BaseException) -> ErrorScope:
+def error_scope(error: BaseException) -> ErrorScope:
     found = find_error(error, ZmuxError)
     return ErrorScope.UNKNOWN if found is None else found.scope
 
 
-def operation(error: BaseException) -> ErrorOperation:
+def error_operation(error: BaseException) -> ErrorOperation:
     found = find_error(error, ZmuxError)
     return ErrorOperation.UNKNOWN if found is None else found.operation
 
 
-def source(error: BaseException) -> ErrorSource:
+def error_source(error: BaseException) -> ErrorSource:
     found = find_error(error, ZmuxError)
     return ErrorSource.UNKNOWN if found is None else found.source
 
 
-def direction(error: BaseException) -> ErrorDirection:
+def error_direction(error: BaseException) -> ErrorDirection:
     found = find_error(error, ZmuxError)
     return ErrorDirection.UNKNOWN if found is None else found.direction
 
 
-def termination_kind(error: BaseException) -> TerminationKind:
+def error_termination_kind(error: BaseException) -> TerminationKind:
     found = find_error(error, ZmuxError)
     return TerminationKind.UNKNOWN if found is None else found.termination_kind
 
@@ -729,7 +729,7 @@ def stream_not_writable(error: BaseException) -> bool:
 
 
 def open_limited(error: BaseException) -> bool:
-    message = reason(error)
+    message = error_reason(error)
     return (
             find_error(error, OpenLimited) is not None
             or OPEN_LIMITED_MESSAGE == message
@@ -739,7 +739,7 @@ def open_limited(error: BaseException) -> bool:
 
 
 def open_expired(error: BaseException) -> bool:
-    message = reason(error)
+    message = error_reason(error)
     return (
             find_error(error, OpenExpired) is not None
             or OPEN_EXPIRED_MESSAGE == message
@@ -760,7 +760,7 @@ def open_metadata_too_large(error: BaseException) -> bool:
 
 
 def adapter_unsupported(error: BaseException) -> bool:
-    message = reason(error)
+    message = error_reason(error)
     return (
             find_error(error, AdapterUnsupported) is not None
             or ADAPTER_UNSUPPORTED_FRAGMENT in message
@@ -768,7 +768,7 @@ def adapter_unsupported(error: BaseException) -> bool:
 
 
 def priority_update_unavailable(error: BaseException) -> bool:
-    message = reason(error)
+    message = error_reason(error)
     return (
             find_error(error, PriorityUpdateUnavailable) is not None
             or message == PRIORITY_UPDATE_UNAVAILABLE_MESSAGE
@@ -796,7 +796,7 @@ def keepalive_timeout(error: BaseException) -> bool:
                                   candidate.is_error_code(ErrorCode.IDLE_TIMEOUT)
                                   and (
                                           candidate.message == KEEPALIVE_TIMEOUT_MESSAGE
-                                          or reason(candidate) == KEEPALIVE_TIMEOUT_MESSAGE
+                                          or error_reason(candidate) == KEEPALIVE_TIMEOUT_MESSAGE
                                   )
                           ),
     )
@@ -838,7 +838,7 @@ def source_exception(error: BaseException) -> Optional[BaseException]:
     return None if found is None else found.source_error
 
 
-def _contains_error_type(error: BaseException, error_type: Type[BaseException]) -> bool:
+def _contains_error_type(error: BaseException, error_type: type[BaseException]) -> bool:
     return find_error(error, error_type) is not None
 
 
@@ -999,10 +999,15 @@ __all__ = [
     "ZmuxTimeoutError",
     "adapter_unsupported",
     "as_structured_error",
-    "code",
-    "direction",
     "empty_metadata_update",
+    "error_code",
     "error_code_name",
+    "error_direction",
+    "error_operation",
+    "error_reason",
+    "error_scope",
+    "error_source",
+    "error_termination_kind",
     "find_error",
     "graceful_close_timeout",
     "has_code",
@@ -1013,19 +1018,14 @@ __all__ = [
     "open_info_unavailable",
     "open_limited",
     "open_metadata_too_large",
-    "operation",
     "priority_update_too_large",
     "priority_update_unavailable",
     "read_closed",
-    "reason",
-    "scope",
     "session_closed",
-    "source",
     "source_exception",
     "stream_closed",
     "stream_not_readable",
     "stream_not_writable",
-    "termination_kind",
     "timeout",
     "typed_code",
     "write_closed",

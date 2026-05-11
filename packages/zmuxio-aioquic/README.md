@@ -141,7 +141,7 @@ including a just-submitted metadata prelude.
 - QUIC transport or connection closure is normalized into the stable ZMux error
   surface.
 
-Use helpers such as `zmux.code(...)`, `zmux.open_limited(...)`,
+Use helpers such as `zmux.error_code(...)`, `zmux.open_limited(...)`,
 `zmux.adapter_unsupported(...)`, `zmux.priority_update_unavailable(...)`,
 `zmux.session_closed(...)`, `zmux.stream_not_readable(...)`,
 `zmux.stream_not_writable(...)`, `zmux.read_closed(...)`,

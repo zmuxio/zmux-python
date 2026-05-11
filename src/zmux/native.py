@@ -22,7 +22,6 @@ from .errors import (
     AcceptTimeout,
     ApplicationError,
     EmptyMetadataUpdate,
-    ErrorCode,
     ErrorDirection,
     ErrorOperation,
     ErrorScope,
@@ -57,6 +56,7 @@ from .payload import (
 from .preface import Negotiated, Preface, negotiate_prefaces, read_preface
 from .protocol import (
     EXT_PRIORITY_UPDATE,
+    ErrorCode,
     FRAME_FLAG_FIN,
     FRAME_FLAG_OPEN_METADATA,
     MAX_VARINT62,

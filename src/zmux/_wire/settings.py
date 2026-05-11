@@ -244,8 +244,8 @@ class _UnknownSettingTracker:
     __slots__ = ("_inline", "_overflow")
 
     def __init__(self) -> None:
-        self._inline = []  # type: List[int]
-        self._overflow = None  # type: Optional[Set[int]]
+        self._inline: List[int] = []
+        self._overflow: Optional[Set[int]] = None
 
     def insert(self, typ: int) -> bool:
         overflow = self._overflow

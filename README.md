@@ -168,13 +168,13 @@ except Exception as exc:
         return
     if zmux.timeout(exc):
         raise
-    app_code = zmux.code(exc)
+    app_code = zmux.error_code(exc)
 ```
 
 Common helpers include `session_closed`, `read_closed`, `write_closed`,
 `stream_not_readable`, `stream_not_writable`, `open_limited`, `open_expired`,
 `priority_update_unavailable`, `adapter_unsupported`, `timeout`,
-`interrupted`, `code`, and `reason`.
+`interrupted`, `error_code`, and `error_reason`.
 
 ## Configuration And Codec Helpers
 

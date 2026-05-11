@@ -869,34 +869,42 @@ class Session(Protocol):
     @property
     def closed(self) -> bool:
         """Return whether the session has terminated."""
+        raise NotImplementedError
 
     @property
     def local_addr(self) -> Optional[object]:
         """Return the local transport address when known."""
+        raise NotImplementedError
 
     @property
     def remote_addr(self) -> Optional[object]:
         """Return the peer transport address when known."""
+        raise NotImplementedError
 
     @property
     def close_error(self) -> Optional[BaseException]:
         """Return the terminal close error if one is known."""
+        raise NotImplementedError
 
     @property
     def state(self) -> SessionState:
         """Return the public lifecycle state."""
+        raise NotImplementedError
 
     @property
     def stats(self) -> SessionStats:
         """Return a point-in-time stats snapshot."""
+        raise NotImplementedError
 
     @property
     def peer_go_away_error(self) -> Optional[ApplicationError]:
         """Return the peer GOAWAY application error when present."""
+        raise NotImplementedError
 
     @property
     def peer_close_error(self) -> Optional[ApplicationError]:
         """Return the peer CLOSE application error when present."""
+        raise NotImplementedError
 
     def local_preface(self) -> Preface:
         """Return the local preface."""
@@ -983,34 +991,42 @@ class AsyncSession(Protocol):
     @property
     def closed(self) -> bool:
         """Return whether the session has terminated."""
+        raise NotImplementedError
 
     @property
     def local_addr(self) -> Optional[object]:
         """Return the local transport address when known."""
+        raise NotImplementedError
 
     @property
     def remote_addr(self) -> Optional[object]:
         """Return the peer transport address when known."""
+        raise NotImplementedError
 
     @property
     def close_error(self) -> Optional[BaseException]:
         """Return the terminal close error if one is known."""
+        raise NotImplementedError
 
     @property
     def state(self) -> SessionState:
         """Return the public lifecycle state."""
+        raise NotImplementedError
 
     @property
     def stats(self) -> SessionStats:
         """Return a point-in-time stats snapshot."""
+        raise NotImplementedError
 
     @property
     def peer_go_away_error(self) -> Optional[ApplicationError]:
         """Return the peer GOAWAY application error when present."""
+        raise NotImplementedError
 
     @property
     def peer_close_error(self) -> Optional[ApplicationError]:
         """Return the peer CLOSE application error when present."""
+        raise NotImplementedError
 
     def local_preface(self) -> Preface:
         """Return the local preface."""

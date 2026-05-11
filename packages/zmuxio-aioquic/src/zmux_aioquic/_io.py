@@ -6,7 +6,7 @@ import asyncio
 import inspect
 import time
 from collections.abc import Awaitable, Iterable
-from typing import Callable, Optional, Tuple
+from typing import Optional, Tuple
 
 from zmux.errors import AdapterUnsupported, ReadClosed, ReadTimeout, WriteClosed
 from zmux.protocol import ErrorCode
@@ -69,7 +69,7 @@ async def _write_all(
         data: object,
         timeout: Optional[float],
         *,
-        progress: Optional[Callable[[int], None]] = None,
+        progress: Optional[object] = None,
 ) -> None:
     if writer is None:
         raise WriteClosed()
@@ -99,6 +99,8 @@ async def _write_all(
             raise OSError("zmux: aioquic writer returned a non-integer byte count")
         offset += written
         if progress is not None and written:
+            if not callable(progress):
+                raise TypeError("progress must be callable")
             progress(written)
         if drain is not None:
             await _await_with_timeout(
@@ -303,7 +305,7 @@ def _consume_task_exception(task: "asyncio.Task[object]") -> None:
         return
 
 
-def _first_callable(target: object, names: Tuple[str, ...]) -> Optional[Callable[..., object]]:
+def _first_callable(target: object, names: Tuple[str, ...]) -> Optional[object]:
     for name in names:
         if not name:
             continue

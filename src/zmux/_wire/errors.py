@@ -12,7 +12,7 @@ from ..errors import (
     FrameSizeError,
     ProtocolError,
     ZmuxError,
-    code as error_code,
+    error_code,
     is_error_code,
 )
 from ..protocol import ErrorCode, MAX_VARINT62

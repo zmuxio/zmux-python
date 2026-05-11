@@ -7,7 +7,7 @@ from enum import Enum
 from typing import Any, Optional, Type
 
 from .half import _require_bool
-from ..errors import SessionClosed, code as error_code
+from ..errors import SessionClosed, error_code
 from ..protocol import ErrorCode
 from ..session import SessionState
 

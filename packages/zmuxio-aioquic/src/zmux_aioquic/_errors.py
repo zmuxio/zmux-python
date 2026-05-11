@@ -7,7 +7,6 @@ from typing import Optional
 
 from zmux.errors import (
     ApplicationError,
-    ErrorCode,
     ErrorDirection,
     ErrorOperation,
     ErrorScope,
@@ -20,6 +19,7 @@ from zmux.errors import (
     SessionClosed,
     ZmuxError,
 )
+from zmux.protocol import ErrorCode
 from ._validation import _require_application_code
 
 

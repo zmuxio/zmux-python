@@ -742,11 +742,10 @@ class PackageSurfaceTest(unittest.TestCase):
         except RuntimeError as wrapped:
             self.assertIs(zmux.find_error(wrapped, ApplicationError), app)
             self.assertTrue(zmux.has_code(wrapped))
-            self.assertEqual(zmux.code(wrapped), int(ErrorCode.CANCELLED))
+            self.assertEqual(zmux.error_code(wrapped), int(ErrorCode.CANCELLED))
             self.assertEqual(zmux.typed_code(wrapped), ErrorCode.CANCELLED)
             self.assertTrue(zmux.is_error_code(wrapped, ErrorCode.CANCELLED))
-            self.assertFalse(hasattr(zmux, "error_code"))
-            self.assertEqual(zmux.reason(wrapped), "stop")
+            self.assertEqual(zmux.error_reason(wrapped), "stop")
 
         with self.assertRaises(ValueError):
             ApplicationError(zmux.MAX_VARINT62 + 1, "bad")

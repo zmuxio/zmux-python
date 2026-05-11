@@ -127,8 +127,8 @@ from ..errors import (
     ApplicationError,
     OpenExpired,
     SessionClosed,
-    code as error_code,
-    reason as error_reason,
+    error_code,
+    error_reason,
 )
 from ..events import Event, EventType, StreamEventInfo
 from ..frame import Frame, marshal_frame
