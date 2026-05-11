@@ -749,31 +749,32 @@ def queued_bytes_map(state: Optional[BatchState]) -> Dict[int, int]:
     return state.scratch.queued_bytes
 
 
-def batch_stream_meta_map(state: Optional[BatchState], cap_hint: int) -> Dict[int, StreamMeta]:
-    del cap_hint
+def _scratch_map(state: Optional[BatchState], attr: str, cap_hint: int):
     if state is None:
         return {}
-    state.scratch.stream_meta.clear()
-    return state.scratch.stream_meta
+    cap_hint = _uint64(cap_hint, "cap_hint")
+    values = getattr(state.scratch, attr)
+    if batch_scratch_oversized(len(values), cap_hint):
+        values = {}
+        setattr(state.scratch, attr, values)
+    else:
+        values.clear()
+    return values
+
+
+def batch_stream_meta_map(state: Optional[BatchState], cap_hint: int) -> Dict[int, StreamMeta]:
+    return _scratch_map(state, "stream_meta", cap_hint)
 
 
 def prepared_stream_map(
         state: Optional[BatchState],
         cap_hint: int,
 ) -> Dict[int, BatchPreparedStream]:
-    del cap_hint
-    if state is None:
-        return {}
-    state.scratch.prepared_streams.clear()
-    return state.scratch.prepared_streams
+    return _scratch_map(state, "prepared_streams", cap_hint)
 
 
 def bypass_selections_map(state: Optional[BatchState], cap_hint: int) -> Dict[int, int]:
-    del cap_hint
-    if state is None:
-        return {}
-    state.scratch.bypass_selections.clear()
-    return state.scratch.bypass_selections
+    return _scratch_map(state, "bypass_selections", cap_hint)
 
 
 def active_stream_list(state: Optional[BatchState], bulk: bool, cap_hint: int) -> list:
@@ -815,63 +816,39 @@ def group_candidate_list(state: Optional[BatchState], bulk: bool, cap_hint: int)
 
 
 def transient_stream_finish_map(state: Optional[BatchState], cap_hint: int) -> Dict[int, int]:
-    del cap_hint
-    if state is None:
-        return {}
-    state.scratch.transient_stream_finish.clear()
-    return state.scratch.transient_stream_finish
+    return _scratch_map(state, "transient_stream_finish", cap_hint)
 
 
 def transient_stream_last_served_map(
         state: Optional[BatchState],
         cap_hint: int,
 ) -> Dict[int, int]:
-    del cap_hint
-    if state is None:
-        return {}
-    state.scratch.transient_stream_last_served.clear()
-    return state.scratch.transient_stream_last_served
+    return _scratch_map(state, "transient_stream_last_served", cap_hint)
 
 
 def transient_group_virtual_map(
         state: Optional[BatchState],
         cap_hint: int,
 ) -> Dict[GroupKey, int]:
-    del cap_hint
-    if state is None:
-        return {}
-    state.scratch.transient_group_virtual.clear()
-    return state.scratch.transient_group_virtual
+    return _scratch_map(state, "transient_group_virtual", cap_hint)
 
 
 def transient_group_finish_map(
         state: Optional[BatchState],
         cap_hint: int,
 ) -> Dict[GroupKey, int]:
-    del cap_hint
-    if state is None:
-        return {}
-    state.scratch.transient_group_finish.clear()
-    return state.scratch.transient_group_finish
+    return _scratch_map(state, "transient_group_finish", cap_hint)
 
 
 def transient_group_last_served_map(
         state: Optional[BatchState],
         cap_hint: int,
 ) -> Dict[GroupKey, int]:
-    del cap_hint
-    if state is None:
-        return {}
-    state.scratch.transient_group_last_served.clear()
-    return state.scratch.transient_group_last_served
+    return _scratch_map(state, "transient_group_last_served", cap_hint)
 
 
 def tie_pref_streams_map(state: Optional[BatchState], cap_hint: int) -> Dict[GroupKey, int]:
-    del cap_hint
-    if state is None:
-        return {}
-    state.scratch.tie_pref_streams.clear()
-    return state.scratch.tie_pref_streams
+    return _scratch_map(state, "tie_pref_streams", cap_hint)
 
 
 def ordered_list(state: Optional[BatchState], cap_hint: int) -> list:

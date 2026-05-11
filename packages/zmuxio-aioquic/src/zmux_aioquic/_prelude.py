@@ -12,7 +12,7 @@ from zmux.payload import StreamMetadata, parse_stream_metadata_bytes_view
 from zmux.varint import encoded_len_from_first, parse_varint
 from ._constants import (
     DEFAULT_ACCEPTED_PRELUDE_READ_TIMEOUT,
-    _EMPTY_STREAM_PRELUDE,
+    EMPTY_STREAM_PRELUDE,
     OPEN_METADATA_CAPABILITIES,
     STREAM_PRELUDE_MAX_PAYLOAD,
 )
@@ -53,7 +53,7 @@ def build_stream_prelude(options: Optional[OpenOptions] = None) -> bytes:
         options.open_info,
         STREAM_PRELUDE_MAX_PAYLOAD,
     )
-    return prefix if prefix else _EMPTY_STREAM_PRELUDE
+    return prefix if prefix else EMPTY_STREAM_PRELUDE
 
 
 async def read_stream_prelude(

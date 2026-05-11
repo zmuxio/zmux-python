@@ -793,8 +793,8 @@ class PendingStreamState:
             )
         return True
 
+    @staticmethod
     def pending_control_flush_state(
-            self,
             kind: PendingStreamControlKind,
             *,
             id_assigned: bool,
@@ -834,8 +834,9 @@ class PendingStreamState:
     def clear_pending_priority_update(self) -> None:
         self.set_pending_priority_update(b"")
 
+    @staticmethod
     def pending_priority_flush_state(
-            self, phase: LocalOpenPhase, send_half: SendHalfState
+            phase: LocalOpenPhase, send_half: SendHalfState
     ) -> Tuple[bool, bool]:
         return should_flush_priority_update(phase, send_half)
 
@@ -868,24 +869,35 @@ class PendingStreamState:
             self.terminal.buffered_bytes = 0
 
     def set_terminal_stop(self, payload: bytes, stream_id: int = 0) -> PendingTerminalResult:
-        payload = _payload_bytes(payload, "payload")
-        if self.flags & PendingStreamFlag.TERMINAL_ABORT:
-            return PendingTerminalResult(coalesced=True)
-        if self.flags & PendingStreamFlag.TERMINAL_STOP and self.terminal.stop_payload == payload:
-            return PendingTerminalResult(coalesced=True)
-        self.terminal.stop_payload = payload
-        self.flags |= PendingStreamFlag.TERMINAL_STOP
-        self.recompute_pending_terminal_control_bytes(stream_id)
-        return PendingTerminalResult(changed=True)
+        return self._set_non_abort_terminal(
+            PendingStreamFlag.TERMINAL_STOP,
+            "stop_payload",
+            payload,
+            stream_id,
+        )
 
     def set_terminal_reset(self, payload: bytes, stream_id: int = 0) -> PendingTerminalResult:
+        return self._set_non_abort_terminal(
+            PendingStreamFlag.TERMINAL_RESET,
+            "reset_payload",
+            payload,
+            stream_id,
+        )
+
+    def _set_non_abort_terminal(
+            self,
+            flag: PendingStreamFlag,
+            payload_attr: str,
+            payload: bytes,
+            stream_id: int,
+    ) -> PendingTerminalResult:
         payload = _payload_bytes(payload, "payload")
         if self.flags & PendingStreamFlag.TERMINAL_ABORT:
             return PendingTerminalResult(coalesced=True)
-        if self.flags & PendingStreamFlag.TERMINAL_RESET and self.terminal.reset_payload == payload:
+        if self.flags & flag and getattr(self.terminal, payload_attr) == payload:
             return PendingTerminalResult(coalesced=True)
-        self.terminal.reset_payload = payload
-        self.flags |= PendingStreamFlag.TERMINAL_RESET
+        setattr(self.terminal, payload_attr, payload)
+        self.flags |= flag
         self.recompute_pending_terminal_control_bytes(stream_id)
         return PendingTerminalResult(changed=True)
 
@@ -925,7 +937,7 @@ class PendingStreamState:
         return tuple(frames)
 
     def pending_terminal_flush_state(self) -> Tuple[bool, bool]:
-        return (self.has_pending_terminal_control(), False)
+        return self.has_pending_terminal_control(), False
 
     def pending_terminal_control_bytes(self) -> int:
         return self.terminal.buffered_bytes
@@ -1054,7 +1066,8 @@ class StreamTerminalState:
             self.recv_close_error = session_close_half_error(error, ErrorDirection.READ)
         self._set_terminal(error.application_code or 0, error.reason)
 
-    def peer_stop_write_closed(self) -> WriteClosed:
+    @staticmethod
+    def peer_stop_write_closed() -> WriteClosed:
         return _write_closed(ErrorSource.REMOTE, TerminationKind.STOPPED)
 
     def operation_error(self, half_state: StreamHalfState) -> BaseException:
@@ -1554,11 +1567,7 @@ class StreamState:
             reason: str = "",
             source: TerminalAbortSource = TerminalAbortSource.LOCAL,
     ) -> None:
-        source = _coerce_enum(source, TerminalAbortSource, "source")
-        if source is TerminalAbortSource.PEER:
-            self.terminal.record_peer_abort(code, reason)
-        else:
-            self.terminal.record_local_abort(code, reason)
+        self._record_abort_source(code, reason, source)
         if self.half.send_half is not SendHalfState.ABSENT:
             self.half.send_half = SendHalfState.ABORTED
         self.half.send_reset_from_stop = False
@@ -1595,11 +1604,7 @@ class StreamState:
             reason: str = "",
             source: TerminalAbortSource = TerminalAbortSource.LOCAL,
     ) -> None:
-        source = _coerce_enum(source, TerminalAbortSource, "source")
-        if source is TerminalAbortSource.PEER:
-            self.terminal.record_peer_abort(code, reason)
-        else:
-            self.terminal.record_local_abort(code, reason)
+        self._record_abort_source(code, reason, source)
         if self.half.recv_half is not RecvHalfState.ABSENT:
             self.half.recv_half = RecvHalfState.ABORTED
         self.clear_read_buffer()
@@ -1614,6 +1619,19 @@ class StreamState:
     ) -> None:
         self.set_send_abort_with_source(code, reason, source)
         self.set_recv_abort_with_source(code, reason, source)
+
+    def _record_abort_source(
+            self,
+            code: int,
+            reason: str,
+            source: TerminalAbortSource,
+    ) -> TerminalAbortSource:
+        source = _coerce_enum(source, TerminalAbortSource, "source")
+        if source is TerminalAbortSource.PEER:
+            self.terminal.record_peer_abort(code, reason)
+        else:
+            self.terminal.record_local_abort(code, reason)
+        return source
 
     def data_frame(
             self,

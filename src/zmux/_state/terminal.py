@@ -257,13 +257,13 @@ def ignore_peer_stop_sending(
         send_half: SendHalfState,
         recv_half: RecvHalfState,
 ) -> bool:
-    local_send = _require_bool(local_send, "local_send")
-    local_receive = _require_bool(local_receive, "local_receive")
-    send_half = _coerce_enum(send_half, SendHalfState, "send_half")
-    recv_half = _coerce_enum(recv_half, RecvHalfState, "recv_half")
-    if ignore_late_non_opening_control(local_send, local_receive, send_half, recv_half):
-        return True
-    return send_half in _PEER_STOP_IGNORED_SEND_STATES
+    return _ignore_late_peer_control(
+        local_send,
+        local_receive,
+        send_half,
+        recv_half,
+        send_terminal_states=_PEER_STOP_IGNORED_SEND_STATES,
+    )
 
 
 def ignore_peer_reset(
@@ -272,13 +272,31 @@ def ignore_peer_reset(
         send_half: SendHalfState,
         recv_half: RecvHalfState,
 ) -> bool:
+    return _ignore_late_peer_control(
+        local_send,
+        local_receive,
+        send_half,
+        recv_half,
+        recv_terminal_states=_PEER_RESET_IGNORED_RECV_STATES,
+    )
+
+
+def _ignore_late_peer_control(
+        local_send: bool,
+        local_receive: bool,
+        send_half: SendHalfState,
+        recv_half: RecvHalfState,
+        *,
+        send_terminal_states=frozenset(),
+        recv_terminal_states=frozenset(),
+) -> bool:
     local_send = _require_bool(local_send, "local_send")
     local_receive = _require_bool(local_receive, "local_receive")
     send_half = _coerce_enum(send_half, SendHalfState, "send_half")
     recv_half = _coerce_enum(recv_half, RecvHalfState, "recv_half")
     if ignore_late_non_opening_control(local_send, local_receive, send_half, recv_half):
         return True
-    return recv_half in _PEER_RESET_IGNORED_RECV_STATES
+    return send_half in send_terminal_states or recv_half in recv_terminal_states
 
 
 def ignore_peer_abort(

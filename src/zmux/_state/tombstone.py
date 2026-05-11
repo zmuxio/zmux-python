@@ -328,8 +328,7 @@ def same_used_stream_marker(left: UsedStreamMarker, right: UsedStreamMarker) -> 
 def used_stream_range_contains(stream_range: UsedStreamRange, stream_id: int) -> bool:
     stream_id = _require_u64(stream_id, "stream_id")
     return (
-            stream_id >= stream_range.start
-            and stream_id <= stream_range.end
+            stream_range.start <= stream_id <= stream_range.end
             and (stream_id - stream_range.start) % 4 == 0
     )
 

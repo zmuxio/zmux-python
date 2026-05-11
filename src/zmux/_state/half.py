@@ -136,6 +136,8 @@ def _require_bool(value: bool, name: str) -> bool:
 __all__ = (
     "RecvHalfState",
     "SendHalfState",
+    "_coerce_enum",
+    "_require_bool",
     "base_recv_half_state",
     "base_send_half_state",
     "fully_terminal",

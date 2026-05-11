@@ -956,7 +956,9 @@ class PendingControlState:
 def store_pending_control_payload(existing: bytes, payload: bytes) -> bytes:
     """Return an owned copy of a pending control payload."""
 
-    return _payload_bytes(payload, "payload")
+    existing = _payload_bytes(existing, "existing")
+    payload = _payload_bytes(payload, "payload")
+    return existing if existing == payload else payload
 
 
 def is_urgent_type(frame_type: FrameType) -> bool:

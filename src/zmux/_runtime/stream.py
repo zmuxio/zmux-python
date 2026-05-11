@@ -265,7 +265,8 @@ class StreamAddr:
         if self.stream_id_set and self.stream_id == 0:
             raise ValueError("stream_id must be non-zero when stream_id_set is true")
 
-    def network(self) -> str:
+    @staticmethod
+    def network() -> str:
         return "zmux"
 
     def __str__(self) -> str:
@@ -383,9 +384,7 @@ class StreamReadBuffer:
             return 0
         chunk = _ReadChunk(view, offset, retained_bytes)
         if offset:
-            released = chunk.tighten_after_consume()
-            if released:
-                retained_bytes = max(0, chunk.retained_bytes)
+            chunk.tighten_after_consume()
         readable = chunk.remaining()
         retained = max(readable, chunk.retained_bytes)
         chunk.retained_bytes = retained
@@ -917,14 +916,15 @@ class StreamTerminalState:
             )
         return self.error_for_choice(choice)
 
-    def peer_stop_write_closed(self) -> WriteClosed:
+    @staticmethod
+    def peer_stop_write_closed() -> WriteClosed:
         return WriteClosed(
             source=ErrorSource.REMOTE,
             termination_kind=TerminationKind.STOPPED,
         )
 
+    @staticmethod
     def _recv_closed_error(
-            self,
             local_read_stop: bool,
             recv_half: RecvHalfState,
     ) -> ReadClosed:
@@ -1098,23 +1098,32 @@ class PendingTerminalState:
         self.abort_payload = b""
 
     def set_stop(self, payload: bytes) -> PendingTerminalResult:
-        payload = _payload_bytes(payload, "payload")
-        if self.flags & PendingTerminalKind.ABORT:
-            return PendingTerminalResult(changed=False, coalesced=True)
-        if self.flags & PendingTerminalKind.STOP and self.stop_payload == payload:
-            return PendingTerminalResult(changed=False, coalesced=True)
-        self.stop_payload = payload
-        self.flags |= PendingTerminalKind.STOP
-        return PendingTerminalResult(changed=True)
+        return self._set_non_abort_terminal(
+            PendingTerminalKind.STOP,
+            "stop_payload",
+            payload,
+        )
 
     def set_reset(self, payload: bytes) -> PendingTerminalResult:
+        return self._set_non_abort_terminal(
+            PendingTerminalKind.RESET,
+            "reset_payload",
+            payload,
+        )
+
+    def _set_non_abort_terminal(
+            self,
+            kind: PendingTerminalKind,
+            payload_attr: str,
+            payload: bytes,
+    ) -> PendingTerminalResult:
         payload = _payload_bytes(payload, "payload")
         if self.flags & PendingTerminalKind.ABORT:
             return PendingTerminalResult(changed=False, coalesced=True)
-        if self.flags & PendingTerminalKind.RESET and self.reset_payload == payload:
+        if self.flags & kind and getattr(self, payload_attr) == payload:
             return PendingTerminalResult(changed=False, coalesced=True)
-        self.reset_payload = payload
-        self.flags |= PendingTerminalKind.RESET
+        setattr(self, payload_attr, payload)
+        self.flags |= kind
         return PendingTerminalResult(changed=True)
 
     def set_abort(self, payload: bytes) -> PendingTerminalResult:
@@ -1316,10 +1325,9 @@ class StreamRuntimeState:
 
     def prepare_terminal_local_opener(
             self,
-            app_error: Optional[ApplicationError],
+            _app_error: Optional[ApplicationError],
             policy: TerminalOpenerPolicy,
     ) -> TerminalLocalOpenerResult:
-        del app_error
         policy = _coerce_enum(policy, TerminalOpenerPolicy, "policy")
         if not self.local_open_phase().needs_local_opener():
             return TerminalLocalOpenerResult()

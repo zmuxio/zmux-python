@@ -25,7 +25,7 @@ from zmux.errors import (
 )
 from zmux.payload import MetadataUpdate, StreamMetadata
 from zmux.protocol import ErrorCode
-from ._constants import WRITEV_COALESCE_MAX_BYTES, _EMPTY_STREAM_PRELUDE
+from ._constants import EMPTY_STREAM_PRELUDE, WRITEV_COALESCE_MAX_BYTES
 from ._errors import translate_read_error, translate_write_error
 from ._io import (
     _await_with_timeout,
@@ -557,7 +557,7 @@ class _StreamBase:
                 if not self._prelude_frozen:
                     self._prelude = build_stream_prelude(self._options)
                     self._prelude_frozen = True
-                prelude = self._prelude or _EMPTY_STREAM_PRELUDE
+                prelude = self._prelude or EMPTY_STREAM_PRELUDE
                 offset = self._prelude_offset
             if offset < len(prelude):
                 view = memoryview(prelude)[offset:]
