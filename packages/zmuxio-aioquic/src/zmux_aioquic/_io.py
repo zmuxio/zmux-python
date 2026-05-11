@@ -5,10 +5,11 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
-from collections.abc import Awaitable, Callable, Iterable
-from typing import Optional, Tuple
+from collections.abc import Awaitable, Iterable
+from typing import Callable, Optional, Tuple
 
-from zmux.errors import AdapterUnsupported, ErrorCode, ReadClosed, ReadTimeout, WriteClosed
+from zmux.errors import AdapterUnsupported, ReadClosed, ReadTimeout, WriteClosed
+from zmux.protocol import ErrorCode
 from ._errors import _protocol_prelude_error
 from ._validation import (
     _memoryview,

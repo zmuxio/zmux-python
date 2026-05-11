@@ -13,11 +13,10 @@ from __future__ import annotations
 import math
 import time
 from collections import deque
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import IntEnum
 from threading import RLock
-from typing import Any, Deque, Dict, Generic, List, Optional, TypeVar
+from typing import Any, Callable, Deque, Dict, Generic, List, Optional, TypeVar
 
 from .control import MIN_PENDING_CONTROL_BUDGET, MIN_PENDING_PRIORITY_BUDGET
 from .flow import repo_default_urgent_lane_cap

@@ -11,10 +11,9 @@ from __future__ import annotations
 
 import time
 from collections import deque
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import BinaryIO, Deque, Optional
+from typing import BinaryIO, Callable, Deque, Optional
 
 from .flow import (
     aggregate_late_data_cap,

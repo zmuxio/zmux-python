@@ -13,10 +13,10 @@ import queue as _stdlib_queue
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterable, MutableSequence, Sequence
+from collections.abc import Iterable, MutableSequence, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum, IntEnum
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 from .flow import queue_would_block as _flow_queue_would_block
 from .stream import SendHalfState, effective_deadline
@@ -67,6 +67,7 @@ QUEUED_WRITE_DISCARDED_MESSAGE = "zmux: queued write was discarded"
 
 DEFAULT_URGENCY_RANK = 100
 _POLL_WAIT_CAP_SECONDS = 3600.0
+POLL_WAIT_CAP_SECONDS = _POLL_WAIT_CAP_SECONDS
 
 
 class TxPayloadKind(IntEnum):
@@ -1887,8 +1888,7 @@ def frame_bypasses_capacity(frame: Frame) -> bool:
     return frame_is_urgent(frame)
 
 
-def frame_bypasses_urgent_capacity(frame: Frame) -> bool:
-    del frame
+def frame_bypasses_urgent_capacity(_frame: Frame) -> bool:
     return False
 
 
@@ -2173,10 +2173,17 @@ def _internal_queue_error(message: str) -> ProtocolError:
     )
 
 
+internal_queue_error = _internal_queue_error
+nonnegative_duration = _nonnegative_duration
+order_urgent_jobs_in_place = _order_urgent_jobs_in_place
+saturating_add = _saturating_add
+
+
 __all__ = (
     "DEFAULT_URGENCY_RANK",
     "FRAME_QUEUE_OVERHEAD_BYTES",
     "MAX_REQUEST_COST",
+    "POLL_WAIT_CAP_SECONDS",
     "MAX_UINT64",
     "MAX_WRITE_BATCH_FRAMES",
     "PENDING_CONTROL_BUDGET_MESSAGE",
@@ -2222,6 +2229,7 @@ __all__ = (
     "classify_write_request",
     "clone_tx_frames_if_needed",
     "collect_ready_batch_into",
+    "complete_job_error",
     "effective_deadline",
     "frame_buffered_bytes",
     "frame_chunk_spans",
@@ -2233,18 +2241,26 @@ __all__ = (
     "frame_is_urgent",
     "frame_queue_cost",
     "frames_queue_cost",
+    "internal_queue_error",
     "is_urgent_type",
+    "jobs_have_removable_stream_frame",
     "make_prepared_priority_update",
     "make_tx_frame",
     "max_tx_payload_length",
+    "merge_coalesced_priority_update",
+    "nonnegative_duration",
+    "order_urgent_jobs_in_place",
     "prepared_priority_update_from_frames",
     "promote_lane",
     "queue_cost_for",
     "queue_would_block",
+    "remove_stream_frames",
+    "replacement_would_exceed_limit",
     "request_buffered_bytes",
     "request_cost_from_bytes",
     "retained_frame_queue_cost",
     "retained_frames_queue_cost",
+    "saturating_add",
     "trim_tx_payload_parts",
     "tx_frame_buffered_bytes",
     "tx_frame_chunk_spans",

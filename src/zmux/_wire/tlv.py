@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Iterator, MutableSequence
+from collections.abc import Iterable, Iterator, MutableSequence
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import Callable, List, Tuple
 
 from .errors import (
     ERR_TLV_VALUE_OVERRUN,

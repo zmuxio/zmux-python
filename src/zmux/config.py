@@ -6,7 +6,7 @@ import math
 import secrets
 import threading
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, MutableSequence, Optional
+from typing import Any, Callable, MutableSequence, Optional, TypeAlias
 
 from .protocol import (
     MAX_PREFACE_SETTINGS_BYTES,
@@ -86,6 +86,8 @@ _SETTING_VARINT_FIELDS = (
     "max_extension_payload_bytes",
     "ping_padding_key",
 )
+
+EventHandler: TypeAlias = Callable[[Any], None]
 
 
 @dataclass(frozen=True)
@@ -278,7 +280,7 @@ class Config:
     stop_sending_graceful_tail_cap: Optional[int] = None
     graceful_close_drain_timeout: Optional[float] = DEFAULT_CLOSE_DRAIN_TIMEOUT
     go_away_drain_interval: Optional[float] = DEFAULT_GO_AWAY_DRAIN_INTERVAL
-    event_handler: Optional[Callable[[Any], None]] = None
+    event_handler: Optional[EventHandler] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "role", _coerce_role(self.role))
@@ -456,6 +458,8 @@ class OpenOptions:
 _default_config_lock = threading.Lock()
 _default_config_template: Optional[Config] = None
 
+ConfigUpdater: TypeAlias = Callable[[Config], Optional[Config]]
+
 
 def default_settings() -> Settings:
     """Return the repository-default settings."""
@@ -473,7 +477,7 @@ def default_config() -> Config:
         return replace(_default_config_template)
 
 
-def configure_default_config(update: Callable[[Config], Optional[Config]]) -> None:
+def configure_default_config(update: ConfigUpdater) -> None:
     """Mutate the process-wide default configuration template.
 
     ``update`` receives the current immutable template and should return a new
@@ -514,16 +518,7 @@ def random_varint62(nonce_source: Optional[Any] = None) -> int:
 
     for _ in range(1024):
         raw = _random_bytes(nonce_source, 8)
-        value = (
-                ((raw[0] & 0x3F) << 56)
-                | (raw[1] << 48)
-                | (raw[2] << 40)
-                | (raw[3] << 32)
-                | (raw[4] << 24)
-                | (raw[5] << 16)
-                | (raw[6] << 8)
-                | raw[7]
-        )
+        value = _varint62_from_random_bytes(raw)
         if value != 0:
             return value
     raise RuntimeError("nonce source produced only zero varint62 values")
@@ -764,19 +759,25 @@ def _random_uint64n(source: Optional[Any], n: int) -> int:
     limit = (1 << 62) - ((1 << 62) % n)
     for _ in range(1024):
         raw = _random_bytes(source, 8)
-        value = (
-                ((raw[0] & 0x3F) << 56)
-                | (raw[1] << 48)
-                | (raw[2] << 40)
-                | (raw[3] << 32)
-                | (raw[4] << 24)
-                | (raw[5] << 16)
-                | (raw[6] << 8)
-                | raw[7]
-        )
+        value = _varint62_from_random_bytes(raw)
         if value < limit:
             return value % n
     raise RuntimeError("nonce source produced only rejected random values")
+
+
+def _varint62_from_random_bytes(raw: bytes) -> int:
+    if len(raw) != 8:
+        raise ValueError("random varint62 source must be exactly 8 bytes")
+    return (
+            ((raw[0] & 0x3F) << 56)
+            | (raw[1] << 48)
+            | (raw[2] << 40)
+            | (raw[3] << 32)
+            | (raw[4] << 24)
+            | (raw[5] << 16)
+            | (raw[6] << 8)
+            | raw[7]
+    )
 
 
 _DEFAULT_SETTINGS = Settings()

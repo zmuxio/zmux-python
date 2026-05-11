@@ -5,25 +5,24 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, MutableSequence
-from typing import Deque, Optional, Tuple
+from collections.abc import MutableSequence
+from typing import Callable, Deque, Optional, Tuple
 
-from . import tx as _tx
 from .tx import *
 from .tx import (
+    POLL_WAIT_CAP_SECONDS,
     complete_job_error,
+    internal_queue_error,
     jobs_have_removable_stream_frame,
     merge_coalesced_priority_update,
+    nonnegative_duration,
+    order_urgent_jobs_in_place,
     remove_stream_frames,
     replacement_would_exceed_limit,
+    saturating_add,
 )
 from ..errors import ProtocolError, SessionClosed
 
-_POLL_WAIT_CAP_SECONDS = _tx._POLL_WAIT_CAP_SECONDS
-_internal_queue_error = _tx._internal_queue_error
-_nonnegative_duration = _tx._nonnegative_duration
-_order_urgent_jobs_in_place = _tx._order_urgent_jobs_in_place
-_saturating_add = _tx._saturating_add
 _WRITE_QUEUE_LANES = (QueueLane.URGENT, QueueLane.ORDINARY)
 
 
@@ -67,7 +66,7 @@ class WriteQueue:
         self._push(job, block=False, force=True, deadline=None)
 
     def push(self, job: WriteJob, timeout: Optional[float] = None) -> None:
-        deadline = None if timeout is None else time.monotonic() + _nonnegative_duration(timeout, "timeout")
+        deadline = None if timeout is None else time.monotonic() + nonnegative_duration(timeout, "timeout")
         self._push(job, block=True, force=False, deadline=deadline)
 
     def push_until(
@@ -75,9 +74,8 @@ class WriteQueue:
             job: WriteJob,
             deadline: Optional[float],
             check: Optional[Callable[[], None]] = None,
-            operation: str = "write",
+            _operation: str = "write",
     ) -> None:
-        del operation
         pending = job
         while True:
             if check is not None:
@@ -195,7 +193,7 @@ class WriteQueue:
             self, batch: MutableSequence[WriteJob], timeout: Optional[float] = None
     ) -> WriteQueuePopStatus:
         batch.clear()
-        deadline = None if timeout is None else time.monotonic() + _nonnegative_duration(timeout, "timeout")
+        deadline = None if timeout is None else time.monotonic() + nonnegative_duration(timeout, "timeout")
         with self._cond:
             while self._is_empty_locked() and not self._closed:
                 if deadline is None:
@@ -204,7 +202,7 @@ class WriteQueue:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0.0:
                     return WriteQueuePopStatus.TIMED_OUT
-                self._cond.wait(min(remaining, _POLL_WAIT_CAP_SECONDS))
+                self._cond.wait(min(remaining, POLL_WAIT_CAP_SECONDS))
             if self._is_empty_locked():
                 return WriteQueuePopStatus.CLOSED
 
@@ -218,7 +216,7 @@ class WriteQueue:
                     batch.append(job)
                     if job.kind is WriteJobKind.SHUTDOWN:
                         break
-                _order_urgent_jobs_in_place(batch)
+                order_urgent_jobs_in_place(batch)
                 self._cond.notify_all()
                 return WriteQueuePopStatus.BATCH
 
@@ -231,14 +229,14 @@ class WriteQueue:
                 job = self._ordinary.popleft()
                 cost = job.cost_bytes()
                 would_exceed = (
-                        _saturating_add(nonurgent_batch_bytes, cost)
+                        saturating_add(nonurgent_batch_bytes, cost)
                         > self.limits.max_batch_bytes
                 )
                 if saw_nonurgent and would_exceed:
                     self._ordinary.appendleft(job)
                     break
                 saw_nonurgent = True
-                nonurgent_batch_bytes = _saturating_add(nonurgent_batch_bytes, cost)
+                nonurgent_batch_bytes = saturating_add(nonurgent_batch_bytes, cost)
                 self._apply_cost_remove(queue_cost_for(lane, job, cost))
                 batch.append(job)
                 if job.kind in (WriteJobKind.SHUTDOWN, WriteJobKind.DRAIN_SHUTDOWN):
@@ -379,7 +377,7 @@ class WriteQueue:
         remaining = deadline - time.monotonic()
         if remaining <= 0.0:
             raise WriteTimeout()
-        self._cond.wait(min(remaining, _POLL_WAIT_CAP_SECONDS))
+        self._cond.wait(min(remaining, POLL_WAIT_CAP_SECONDS))
 
     def _discard_stream(
             self,
@@ -582,7 +580,7 @@ class WriteQueue:
     def _raise_intrinsic_cost_errors(self, cost: QueueCost) -> None:
         message = self._intrinsic_capacity_message(cost)
         if message is not None:
-            raise _internal_queue_error(message)
+            raise internal_queue_error(message)
 
     def _intrinsic_capacity_message(self, cost: QueueCost) -> Optional[str]:
         if cost.pending_control > self.limits.pending_control_max_bytes:
@@ -633,34 +631,34 @@ class WriteQueue:
             queue_block: bool,
     ) -> None:
         if queue_block:
-            raise _internal_queue_error(WRITER_QUEUE_FULL_MESSAGE)
+            raise internal_queue_error(WRITER_QUEUE_FULL_MESSAGE)
         if urgent_block:
-            raise _internal_queue_error(URGENT_WRITER_QUEUE_FULL_MESSAGE)
+            raise internal_queue_error(URGENT_WRITER_QUEUE_FULL_MESSAGE)
         pending = (
             self._replacement_pending_capacity_error(old or QueueCost(), new)
             if replacement
             else self._pending_capacity_error(new)
         )
         if pending is not None:
-            raise _internal_queue_error(pending)
-        raise _internal_queue_error(QUEUED_DATA_HWM_MESSAGE)
+            raise internal_queue_error(pending)
+        raise internal_queue_error(QUEUED_DATA_HWM_MESSAGE)
 
     def _apply_cost_add(self, cost: QueueCost) -> None:
-        self._queued_bytes = _saturating_add(self._queued_bytes, cost.queued)
-        self._urgent_queued_bytes = _saturating_add(
+        self._queued_bytes = saturating_add(self._queued_bytes, cost.queued)
+        self._urgent_queued_bytes = saturating_add(
             self._urgent_queued_bytes, cost.urgent
         )
-        self._pending_control_bytes = _saturating_add(
+        self._pending_control_bytes = saturating_add(
             self._pending_control_bytes, cost.pending_control
         )
-        self._pending_priority_bytes = _saturating_add(
+        self._pending_priority_bytes = saturating_add(
             self._pending_priority_bytes, cost.pending_priority
         )
-        self._data_queued_bytes = _saturating_add(
+        self._data_queued_bytes = saturating_add(
             self._data_queued_bytes, cost.data.total
         )
         for stream_id, count in cost.data.items():
-            self._data_queued_by_stream[stream_id] = _saturating_add(
+            self._data_queued_by_stream[stream_id] = saturating_add(
                 self._data_queued_by_stream.get(stream_id, 0), count
             )
 

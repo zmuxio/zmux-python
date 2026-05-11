@@ -260,7 +260,7 @@ class WriteBatchScratch:
     queued_streams: List[object] = field(default_factory=list)
 
     def batch_slice(self, n: int, cap_hint: int = 0) -> List[QueuedWriteRequest]:
-        del cap_hint
+        _nonnegative_int(cap_hint, "cap_hint")
         self.batch.clear()
         self.batch.extend(QueuedWriteRequest() for _ in range(_nonnegative_int(n, "n")))
         return self.batch
@@ -276,7 +276,7 @@ class WriteBatchScratch:
         return self.ordered
 
     def rejected_slice(self, cap_hint: int = 0) -> List[RejectedWriteRequest]:
-        del cap_hint
+        _nonnegative_int(cap_hint, "cap_hint")
         self.rejected.clear()
         return self.rejected
 
@@ -327,7 +327,7 @@ class WriteBatchScratch:
         self.queued_streams.clear()
 
     def queued_stream_scratch(self, cap_hint: int = 0) -> Dict[int, int]:
-        del cap_hint
+        _nonnegative_int(cap_hint, "cap_hint")
         self.clear_queued_stream_refs()
         return self.queued_by_stream
 
@@ -357,7 +357,8 @@ class WriteBatchScratch:
             if id(stream) in self.queued_by_stream
         )
 
-    def stream_value_accumulator(self, cap_hint: int = 0) -> StreamValueAccumulator:
+    @staticmethod
+    def stream_value_accumulator(cap_hint: int = 0) -> StreamValueAccumulator:
         return StreamValueAccumulator(cap_hint=_nonnegative_int(cap_hint, "cap_hint"))
 
 

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional, Type, TypeVar
+from typing import Optional, TypeVar
 
 from .protocol import ErrorCode, MAX_VARINT62
 
@@ -600,7 +600,7 @@ def error_code_name(code: int) -> str:
         return "APPLICATION_ERROR"
 
 
-def find_error(error: BaseException, error_type: Type[_E]) -> Optional[_E]:
+def find_error(error: BaseException, error_type: type[_E]) -> Optional[_E]:
     """Find the first nested exception of ``error_type`` within ``error``."""
 
     for candidate in _iter_error_tree(error):

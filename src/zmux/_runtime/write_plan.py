@@ -10,10 +10,10 @@ duplicating the edge-case arithmetic.
 from __future__ import annotations
 
 import sys
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Optional
+from typing import Callable, Optional
 
 from .flow import MAX_UINT64, saturating_add, saturating_mul_div_floor
 from .write_policy import (

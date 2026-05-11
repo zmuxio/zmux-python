@@ -13,9 +13,9 @@ import functools
 import inspect
 import math
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable
 from numbers import Real
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, Optional, Tuple
 
 import zmux
 

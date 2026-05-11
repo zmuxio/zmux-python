@@ -9,10 +9,10 @@ budgeting, coalescing, and write-batch construction.
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Callable, Iterable, MutableSequence
+from collections.abc import Iterable, MutableSequence
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import Optional
+from typing import Callable, Optional
 
 from .._wire.varint import encode_varint, varint_len
 from ..config import Settings, default_settings
