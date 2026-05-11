@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .half import _require_bool
+from .half import require_bool
 from ..protocol import MAX_VARINT62, Role
 
 _OPENER_BIT = 0x1
@@ -11,7 +11,7 @@ _BIDI_BIT = 0x2
 
 def first_local_stream_id(role: Role, bidi: bool) -> int:
     role = _coerce_role(role)
-    bidi = _require_bool(bidi, "bidi")
+    bidi = require_bool(bidi, "bidi")
     if role is Role.INITIATOR:
         return 4 if bidi else 2
     if role is Role.RESPONDER:
@@ -21,7 +21,7 @@ def first_local_stream_id(role: Role, bidi: bool) -> int:
 
 def first_peer_stream_id(local_role: Role, bidi: bool) -> int:
     local_role = _coerce_role(local_role)
-    bidi = _require_bool(bidi, "bidi")
+    bidi = require_bool(bidi, "bidi")
     if local_role is Role.INITIATOR:
         return 1 if bidi else 3
     if local_role is Role.RESPONDER:
@@ -63,7 +63,7 @@ def validate_stream_id_for_role(local_role: Role, stream_id: int) -> None:
 
 def validate_local_open_id(local_role: Role, stream_id: int, bidi: bool) -> None:
     validate_stream_id_for_role(local_role, stream_id)
-    bidi = _require_bool(bidi, "bidi")
+    bidi = require_bool(bidi, "bidi")
     if not stream_is_local(local_role, stream_id):
         raise ValueError(
             "stream_id %d is not locally owned for role %s" % (stream_id, local_role)

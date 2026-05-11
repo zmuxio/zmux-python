@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Optional, Type
 
-from .half import _require_bool
+from .half import require_bool
 from ..errors import SessionClosed, error_code
 from ..protocol import ErrorCode
 from ..session import SessionState
@@ -48,7 +48,7 @@ class BeginClosePlan:
         object.__setattr__(
             self,
             "outcome",
-            _coerce_enum(self.outcome, BeginCloseOutcome, "outcome"),
+            coerce_enum(self.outcome, BeginCloseOutcome, "outcome"),
         )
         object.__setattr__(
             self,
@@ -64,8 +64,8 @@ class PeerGoAwayPlan:
     next_state: Optional[SessionState] = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "ignore", _require_bool(self.ignore, "ignore"))
-        object.__setattr__(self, "changed", _require_bool(self.changed, "changed"))
+        object.__setattr__(self, "ignore", require_bool(self.ignore, "ignore"))
+        object.__setattr__(self, "changed", require_bool(self.changed, "changed"))
         if self.next_state is not None:
             object.__setattr__(
                 self,
@@ -79,7 +79,7 @@ class PeerClosePlan:
     ignore: bool = False
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "ignore", _require_bool(self.ignore, "ignore"))
+        object.__setattr__(self, "ignore", require_bool(self.ignore, "ignore"))
 
 
 def can_open_locally(state: Any) -> bool:
@@ -92,7 +92,7 @@ def is_session_finished(state: Any) -> bool:
 
 
 def ignore_peer_non_close_frame(state: Any, close_error_present: bool) -> bool:
-    close_error_present = _require_bool(close_error_present, "close_error_present")
+    close_error_present = require_bool(close_error_present, "close_error_present")
     if close_error_present:
         return True
     state = _coerce_session_state(state)
@@ -105,11 +105,11 @@ def allow_local_non_close_control(
         peer_close_error_present: bool = False,
         close_frame_outstanding: bool = False,
 ) -> bool:
-    close_error_present = _require_bool(close_error_present, "close_error_present")
-    peer_close_error_present = _require_bool(
+    close_error_present = require_bool(close_error_present, "close_error_present")
+    peer_close_error_present = require_bool(
         peer_close_error_present, "peer_close_error_present"
     )
-    close_frame_outstanding = _require_bool(
+    close_frame_outstanding = require_bool(
         close_frame_outstanding, "close_frame_outstanding"
     )
     if close_error_present or peer_close_error_present or close_frame_outstanding:
@@ -123,10 +123,10 @@ def plan_local_open(
         graceful_close_active: bool = False,
         close_error_present: bool = False,
 ) -> LocalOpenOutcome:
-    graceful_close_active = _require_bool(
+    graceful_close_active = require_bool(
         graceful_close_active, "graceful_close_active"
     )
-    close_error_present = _require_bool(close_error_present, "close_error_present")
+    close_error_present = require_bool(close_error_present, "close_error_present")
     if close_error_present:
         return LocalOpenOutcome.RETURN_EXISTING
     if graceful_close_active:
@@ -142,11 +142,11 @@ def plan_begin_close(
         close_error_present: bool = False,
         has_open_streams: bool = False,
 ) -> BeginClosePlan:
-    graceful_close_active = _require_bool(
+    graceful_close_active = require_bool(
         graceful_close_active, "graceful_close_active"
     )
-    close_error_present = _require_bool(close_error_present, "close_error_present")
-    has_open_streams = _require_bool(has_open_streams, "has_open_streams")
+    close_error_present = require_bool(close_error_present, "close_error_present")
+    has_open_streams = require_bool(has_open_streams, "has_open_streams")
     state = _coerce_session_state(state)
     if state.terminal():
         return BeginClosePlan(BeginCloseOutcome.RETURN_EXISTING, state)
@@ -160,7 +160,7 @@ def plan_begin_close(
 
 
 def advance_session_on_go_away(state: Any, changed: bool) -> SessionState:
-    changed = _require_bool(changed, "changed")
+    changed = require_bool(changed, "changed")
     state = _coerce_session_state(state)
     if changed and state is SessionState.READY:
         return SessionState.DRAINING
@@ -175,7 +175,7 @@ def plan_peer_go_away(
         next_bidi: int,
         next_uni: int,
 ) -> PeerGoAwayPlan:
-    close_error_present = _require_bool(close_error_present, "close_error_present")
+    close_error_present = require_bool(close_error_present, "close_error_present")
     current_bidi = _nonnegative_int(current_bidi, "current_bidi")
     current_uni = _nonnegative_int(current_uni, "current_uni")
     next_bidi = _nonnegative_int(next_bidi, "next_bidi")
@@ -246,7 +246,7 @@ def ignore_peer_close(
         peer_close_error_present: bool,
         closed_sentinel: Optional[BaseException] = None,
 ) -> bool:
-    peer_close_error_present = _require_bool(
+    peer_close_error_present = require_bool(
         peer_close_error_present, "peer_close_error_present"
     )
     if peer_close_error_present:
@@ -278,7 +278,7 @@ def _coerce_session_state(value: Any) -> SessionState:
     raise TypeError("session state must be a SessionState or string")
 
 
-def _coerce_enum(value: Any, enum_type: Type[Enum], name: str):
+def coerce_enum(value: Any, enum_type: Type[Enum], name: str):
     if isinstance(value, enum_type):
         return value
     if isinstance(value, bool):

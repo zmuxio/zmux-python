@@ -14,8 +14,8 @@ from .flow import ignore_late_non_opening_control
 from .half import (
     RecvHalfState,
     SendHalfState,
-    _coerce_enum,
-    _require_bool,
+    coerce_enum,
+    require_bool,
     fully_terminal,
     recv_terminal,
     send_terminal,
@@ -152,9 +152,9 @@ class PeerAbortPlan:
 def read_error_choice(
         local_receive: bool, local_read_stop: bool, recv_half: RecvHalfState
 ) -> TerminalErrorChoice:
-    local_receive = _require_bool(local_receive, "local_receive")
-    local_read_stop = _require_bool(local_read_stop, "local_read_stop")
-    recv_half = _coerce_enum(recv_half, RecvHalfState, "recv_half")
+    local_receive = require_bool(local_receive, "local_receive")
+    local_read_stop = require_bool(local_read_stop, "local_read_stop")
+    recv_half = coerce_enum(recv_half, RecvHalfState, "recv_half")
     if not local_receive:
         return TerminalErrorChoice.NONE
     if local_read_stop:
@@ -173,8 +173,8 @@ def read_error_choice(
 def terminal_error_priority(
         send_half: SendHalfState, recv_half: RecvHalfState
 ) -> TerminalErrorChoice:
-    send_half = _coerce_enum(send_half, SendHalfState, "send_half")
-    recv_half = _coerce_enum(recv_half, RecvHalfState, "recv_half")
+    send_half = coerce_enum(send_half, SendHalfState, "send_half")
+    recv_half = coerce_enum(recv_half, RecvHalfState, "recv_half")
     if send_half is SendHalfState.ABORTED:
         return TerminalErrorChoice.SEND_ABORT
     if recv_half is RecvHalfState.ABORTED:
@@ -191,8 +191,8 @@ def terminal_error_priority(
 
 
 def local_close_write_action(local_send: bool, send_half: SendHalfState) -> LocalSendAction:
-    local_send = _require_bool(local_send, "local_send")
-    send_half = _coerce_enum(send_half, SendHalfState, "send_half")
+    local_send = require_bool(local_send, "local_send")
+    send_half = coerce_enum(send_half, SendHalfState, "send_half")
     if not local_send:
         return LocalSendAction.NOT_WRITABLE
     if send_half is SendHalfState.FIN:
@@ -207,8 +207,8 @@ def local_reset_action(local_send: bool, send_half: SendHalfState) -> LocalSendA
 
 
 def local_close_read_action(local_receive: bool, recv_half: RecvHalfState) -> LocalRecvAction:
-    local_receive = _require_bool(local_receive, "local_receive")
-    recv_half = _coerce_enum(recv_half, RecvHalfState, "recv_half")
+    local_receive = require_bool(local_receive, "local_receive")
+    recv_half = coerce_enum(recv_half, RecvHalfState, "recv_half")
     if not local_receive:
         return LocalRecvAction.NOT_READABLE
     if recv_half in _RECV_CLOSED_CHOICES:
@@ -221,8 +221,8 @@ def local_close_read_action(local_receive: bool, recv_half: RecvHalfState) -> Lo
 def local_abort_action_for_stream(
         send_half: SendHalfState, recv_half: RecvHalfState
 ) -> LocalAbortAction:
-    send_half = _coerce_enum(send_half, SendHalfState, "send_half")
-    recv_half = _coerce_enum(recv_half, RecvHalfState, "recv_half")
+    send_half = coerce_enum(send_half, SendHalfState, "send_half")
+    recv_half = coerce_enum(recv_half, RecvHalfState, "recv_half")
     if send_half is SendHalfState.ABORTED or recv_half is RecvHalfState.ABORTED:
         return LocalAbortAction.NO_OP
     return LocalAbortAction.APPLY
@@ -235,11 +235,11 @@ def session_close_transition(
         recv_half: RecvHalfState,
         abortive: bool,
 ) -> SessionClosePlan:
-    local_send = _require_bool(local_send, "local_send")
-    local_receive = _require_bool(local_receive, "local_receive")
-    send_half = _coerce_enum(send_half, SendHalfState, "send_half")
-    recv_half = _coerce_enum(recv_half, RecvHalfState, "recv_half")
-    abortive = _require_bool(abortive, "abortive")
+    local_send = require_bool(local_send, "local_send")
+    local_receive = require_bool(local_receive, "local_receive")
+    send_half = coerce_enum(send_half, SendHalfState, "send_half")
+    recv_half = coerce_enum(recv_half, RecvHalfState, "recv_half")
+    abortive = require_bool(abortive, "abortive")
     if abortive:
         return SessionClosePlan(
             abort_send=local_send and not send_terminal(send_half),
@@ -290,10 +290,10 @@ def _ignore_late_peer_control(
         send_terminal_states=frozenset(),
         recv_terminal_states=frozenset(),
 ) -> bool:
-    local_send = _require_bool(local_send, "local_send")
-    local_receive = _require_bool(local_receive, "local_receive")
-    send_half = _coerce_enum(send_half, SendHalfState, "send_half")
-    recv_half = _coerce_enum(recv_half, RecvHalfState, "recv_half")
+    local_send = require_bool(local_send, "local_send")
+    local_receive = require_bool(local_receive, "local_receive")
+    send_half = coerce_enum(send_half, SendHalfState, "send_half")
+    recv_half = coerce_enum(recv_half, RecvHalfState, "recv_half")
     if ignore_late_non_opening_control(local_send, local_receive, send_half, recv_half):
         return True
     return send_half in send_terminal_states or recv_half in recv_terminal_states
@@ -305,10 +305,10 @@ def ignore_peer_abort(
         send_half: SendHalfState,
         recv_half: RecvHalfState,
 ) -> bool:
-    local_send = _require_bool(local_send, "local_send")
-    local_receive = _require_bool(local_receive, "local_receive")
-    send_half = _coerce_enum(send_half, SendHalfState, "send_half")
-    recv_half = _coerce_enum(recv_half, RecvHalfState, "recv_half")
+    local_send = require_bool(local_send, "local_send")
+    local_receive = require_bool(local_receive, "local_receive")
+    send_half = coerce_enum(send_half, SendHalfState, "send_half")
+    recv_half = coerce_enum(recv_half, RecvHalfState, "recv_half")
     if ignore_late_non_opening_control(local_send, local_receive, send_half, recv_half):
         return True
     return send_half is SendHalfState.ABORTED or recv_half is RecvHalfState.ABORTED
@@ -321,11 +321,11 @@ def peer_data_transition(
         recv_half: RecvHalfState,
         fin: bool,
 ) -> PeerDataPlan:
-    local_send = _require_bool(local_send, "local_send")
-    local_receive = _require_bool(local_receive, "local_receive")
-    send_half = _coerce_enum(send_half, SendHalfState, "send_half")
-    recv_half = _coerce_enum(recv_half, RecvHalfState, "recv_half")
-    fin = _require_bool(fin, "fin")
+    local_send = require_bool(local_send, "local_send")
+    local_receive = require_bool(local_receive, "local_receive")
+    send_half = coerce_enum(send_half, SendHalfState, "send_half")
+    recv_half = coerce_enum(recv_half, RecvHalfState, "recv_half")
+    fin = require_bool(fin, "fin")
     if not local_receive:
         if fully_terminal(local_send, local_receive, send_half, recv_half):
             return PeerDataPlan(PeerDataOutcome.IGNORE)
@@ -348,14 +348,14 @@ def peer_data_transition(
 
 
 def _set_bool_field(instance: object, name: str) -> None:
-    object.__setattr__(instance, name, _require_bool(getattr(instance, name), name))
+    object.__setattr__(instance, name, require_bool(getattr(instance, name), name))
 
 
 def _set_enum_field(instance: object, name: str, enum_type: type[IntEnum]) -> None:
     object.__setattr__(
         instance,
         name,
-        _coerce_enum(getattr(instance, name), enum_type, name),
+        coerce_enum(getattr(instance, name), enum_type, name),
     )
 
 
@@ -365,7 +365,7 @@ def peer_stop_sending_outcome(
         send_half: SendHalfState,
         recv_half: RecvHalfState,
 ) -> StopSendingOutcome:
-    recv_half = _coerce_enum(recv_half, RecvHalfState, "recv_half")
+    recv_half = coerce_enum(recv_half, RecvHalfState, "recv_half")
     if ignore_peer_stop_sending(local_send, local_receive, send_half, recv_half):
         return StopSendingOutcome.IGNORE
     if recv_half in _RECV_TERMINAL_FAILURES:

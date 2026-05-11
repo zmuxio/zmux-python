@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum, IntFlag
 from typing import Optional, Tuple
 
-from .half import _coerce_enum, _require_bool
+from .half import coerce_enum, require_bool
 from .tombstone import (
     LateDataAction,
     LateDataCause,
@@ -226,7 +226,7 @@ class StreamMetadataState:
         return len(self.metadata.open_info)
 
     def local_open_phase(self, opened_locally: bool) -> LocalOpenPhase:
-        opened_locally = _require_bool(opened_locally, "opened_locally")
+        opened_locally = require_bool(opened_locally, "opened_locally")
         return LocalOpenVisibility(
             opened_locally,
             self.opened_on_wire,
@@ -238,7 +238,7 @@ class StreamMetadataState:
         self.opened_on_wire = True
 
     def should_mark_peer_visible(self, opened_locally: bool, id_assigned: bool) -> bool:
-        id_assigned = _require_bool(id_assigned, "id_assigned")
+        id_assigned = require_bool(id_assigned, "id_assigned")
         return id_assigned and self.local_open_phase(opened_locally).should_mark_peer_visible()
 
     def mark_peer_visible(self) -> None:
@@ -254,8 +254,8 @@ class StreamMetadataState:
     def awaiting_peer_visibility(
             self, opened_locally: bool, id_assigned: bool, fully_terminal_value: bool
     ) -> bool:
-        id_assigned = _require_bool(id_assigned, "id_assigned")
-        fully_terminal_value = _require_bool(
+        id_assigned = require_bool(id_assigned, "id_assigned")
+        fully_terminal_value = require_bool(
             fully_terminal_value, "fully_terminal_value"
         )
         return (
@@ -265,7 +265,7 @@ class StreamMetadataState:
         )
 
     def can_take_pending_priority_update(self, opened_locally: bool) -> bool:
-        opened_locally = _require_bool(opened_locally, "opened_locally")
+        opened_locally = require_bool(opened_locally, "opened_locally")
         return self.local_open_phase(opened_locally).can_take_pending_priority_update()
 
     def build_opening_prefix(
@@ -342,7 +342,7 @@ class StreamMetadataState:
     def apply_priority_update(
             self, capabilities: int, metadata: StreamMetadata, valid: bool = True
     ) -> MetadataChange:
-        valid = _require_bool(valid, "valid")
+        valid = require_bool(valid, "valid")
         if not valid:
             return MetadataChange()
         next_priority = (
@@ -420,7 +420,7 @@ class StreamMetadataState:
             *,
             group_present: bool = False,
     ) -> None:
-        group_present = _require_bool(group_present, "group_present")
+        group_present = require_bool(group_present, "group_present")
         if priority is not None:
             self.pending_priority_update_priority = _normalize_optional_varint(
                 priority, "priority"
@@ -475,7 +475,7 @@ class StreamLifecycleState:
     visibility_sequence: int = 0
 
     def visible_stream_id(self, opened_on_wire: bool) -> int:
-        opened_on_wire = _require_bool(opened_on_wire, "opened_on_wire")
+        opened_on_wire = require_bool(opened_on_wire, "opened_on_wire")
         return self.stream_id if opened_on_wire else 0
 
     def assign_stream_id(self, stream_id: int) -> None:
@@ -782,7 +782,7 @@ class PendingStreamState:
     ) -> bool:
         kind = _coerce_pending_control_kind(kind)
         value = _require_varint62(value, "value")
-        blocked_queued = _require_bool(blocked_queued, "blocked_queued")
+        blocked_queued = require_bool(blocked_queued, "blocked_queued")
         blocked_at = _require_varint62(blocked_at, "blocked_at")
         pending = self.pending_control_value(kind)
         if kind is PendingStreamControlKind.MAX_DATA:
@@ -806,11 +806,11 @@ class PendingStreamState:
             send_half: SendHalfState,
     ) -> Tuple[bool, bool]:
         kind = _coerce_pending_control_kind(kind)
-        id_assigned = _require_bool(id_assigned, "id_assigned")
-        local_send = _require_bool(local_send, "local_send")
-        local_receive = _require_bool(local_receive, "local_receive")
-        read_stopped = _require_bool(read_stopped, "read_stopped")
-        recv_terminal_value = _require_bool(
+        id_assigned = require_bool(id_assigned, "id_assigned")
+        local_send = require_bool(local_send, "local_send")
+        local_receive = require_bool(local_receive, "local_receive")
+        read_stopped = require_bool(read_stopped, "read_stopped")
+        recv_terminal_value = require_bool(
             recv_terminal_value, "recv_terminal_value"
         )
         if kind is PendingStreamControlKind.MAX_DATA:
@@ -1056,8 +1056,8 @@ class StreamTerminalState:
             close_write_half: bool,
             close_read_half: bool,
     ) -> None:
-        close_write_half = _require_bool(close_write_half, "close_write_half")
-        close_read_half = _require_bool(close_read_half, "close_read_half")
+        close_write_half = require_bool(close_write_half, "close_write_half")
+        close_read_half = require_bool(close_read_half, "close_read_half")
         if error is None:
             return
         if close_write_half:
@@ -1101,8 +1101,8 @@ class StreamTerminalState:
             local_read_stop: bool,
             recv_half: RecvHalfState,
     ) -> Optional[BaseException]:
-        local_receive = _require_bool(local_receive, "local_receive")
-        local_read_stop = _require_bool(local_read_stop, "local_read_stop")
+        local_receive = require_bool(local_receive, "local_receive")
+        local_read_stop = require_bool(local_read_stop, "local_read_stop")
         choice = read_error_choice(local_receive, local_read_stop, recv_half)
         if choice is TerminalErrorChoice.NONE:
             return None
@@ -1220,9 +1220,9 @@ class StreamState:
 
     def __post_init__(self) -> None:
         self.stream_id = _nonnegative_int(self.stream_id, "stream_id")
-        self.id_assigned = _require_bool(self.id_assigned, "id_assigned")
-        self.bidirectional = _require_bool(self.bidirectional, "bidirectional")
-        self.opened_locally = _require_bool(self.opened_locally, "opened_locally")
+        self.id_assigned = require_bool(self.id_assigned, "id_assigned")
+        self.bidirectional = require_bool(self.bidirectional, "bidirectional")
+        self.opened_locally = require_bool(self.opened_locally, "opened_locally")
         if self.stream_id:
             self.lifecycle.assign_stream_id(self.stream_id)
             self.id_assigned = True
@@ -1231,11 +1231,11 @@ class StreamState:
         if self.local_send is None:
             self.local_send = self.opened_locally or self.bidirectional
         else:
-            self.local_send = _require_bool(self.local_send, "local_send")
+            self.local_send = require_bool(self.local_send, "local_send")
         if self.local_receive is None:
             self.local_receive = self.bidirectional or not self.opened_locally
         else:
-            self.local_receive = _require_bool(self.local_receive, "local_receive")
+            self.local_receive = require_bool(self.local_receive, "local_receive")
         self.half = StreamHalfState(self.local_send, self.local_receive)
         if self.lifecycle.stream_id == 0 and self.stream_id:
             self.lifecycle.assign_stream_id(self.stream_id)
@@ -1444,7 +1444,7 @@ class StreamState:
         )
 
     def should_compact_terminal(self, still_tracked: bool) -> bool:
-        still_tracked = _require_bool(still_tracked, "still_tracked")
+        still_tracked = require_bool(still_tracked, "still_tracked")
         if self.queue.enqueued and self.open_info_len() > 0:
             return False
         if self.send.queued_data_bytes or self.send.inflight_queued_bytes:
@@ -1555,7 +1555,7 @@ class StreamState:
             reason: str = "",
             source: TerminalResetSource = TerminalResetSource.DIRECT,
     ) -> None:
-        source = _coerce_enum(source, TerminalResetSource, "source")
+        source = coerce_enum(source, TerminalResetSource, "source")
         self.terminal.record_local_write_reset(code, reason)
         self.half.mark_send_reset(from_stop=source is TerminalResetSource.FROM_STOP_SENDING)
         self._clear_send_pending_runtime_state()
@@ -1626,7 +1626,7 @@ class StreamState:
             reason: str,
             source: TerminalAbortSource,
     ) -> TerminalAbortSource:
-        source = _coerce_enum(source, TerminalAbortSource, "source")
+        source = coerce_enum(source, TerminalAbortSource, "source")
         if source is TerminalAbortSource.PEER:
             self.terminal.record_peer_abort(code, reason)
         else:
@@ -1699,7 +1699,7 @@ def validate_open_metadata_update_capability(
 def metadata_update_route(
         phase: LocalOpenPhase, capabilities: int, update: MetadataUpdate
 ) -> MetadataUpdateRoute:
-    phase = _coerce_enum(phase, LocalOpenPhase, "phase")
+    phase = coerce_enum(phase, LocalOpenPhase, "phase")
     if phase.needs_local_opener():
         validate_open_metadata_update_capability(capabilities, update)
         return MetadataUpdateRoute.OPEN_METADATA
@@ -1747,7 +1747,7 @@ def build_merged_priority_update_payload(
 def received_metadata_policy(
         capabilities: int, carriage: ReceivedMetadataCarriage
 ) -> ReceivedMetadataPolicy:
-    carriage = _coerce_enum(carriage, ReceivedMetadataCarriage, "carriage")
+    carriage = coerce_enum(carriage, ReceivedMetadataCarriage, "carriage")
     if carriage.allows_open_info():
         return ReceivedMetadataPolicy(
             capabilities_can_carry_priority_on_open(capabilities),

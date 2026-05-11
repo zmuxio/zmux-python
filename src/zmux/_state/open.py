@@ -6,7 +6,7 @@ import sys
 import time
 from typing import Optional, Tuple
 
-from .half import _require_bool
+from .half import require_bool
 from .stream_id import stream_is_bidi, stream_is_local
 from ..config import Settings
 from ..protocol import MAX_VARINT62, Role
@@ -25,7 +25,7 @@ def local_open_refused_by_goaway(
         peer_goaway_uni: int,
 ) -> bool:
     stream_id = _nonnegative_int(stream_id, "stream_id")
-    bidi = _require_bool(bidi, "bidi")
+    bidi = require_bool(bidi, "bidi")
     peer_goaway_bidi = _nonnegative_int(peer_goaway_bidi, "peer_goaway_bidi")
     peer_goaway_uni = _nonnegative_int(peer_goaway_uni, "peer_goaway_uni")
     return stream_id > (peer_goaway_bidi if bidi else peer_goaway_uni)
@@ -64,12 +64,12 @@ def admission_hard_cap(pending_limit: int) -> int:
 
 
 def provisional_soft_cap(bidi: bool, pending_limit: int) -> int:
-    _require_bool(bidi, "bidi")
+    require_bool(bidi, "bidi")
     return admission_soft_cap(pending_limit)
 
 
 def provisional_hard_cap(bidi: bool, pending_limit: int) -> int:
-    _require_bool(bidi, "bidi")
+    require_bool(bidi, "bidi")
     return admission_hard_cap(pending_limit)
 
 
@@ -87,7 +87,7 @@ def provisional_expired(
         now: Optional[float] = None,
         max_age: float = PROVISIONAL_OPEN_MAX_AGE,
 ) -> bool:
-    id_set = _require_bool(id_set, "id_set")
+    id_set = require_bool(id_set, "id_set")
     if id_set or created_at is None or max_age <= 0:
         return False
     now_value = time.monotonic() if now is None else float(now)
@@ -130,7 +130,7 @@ def active_stream_within_limit(
         max_incoming_bidi: int,
         max_incoming_uni: int,
 ) -> bool:
-    bidi = _require_bool(bidi, "bidi")
+    bidi = require_bool(bidi, "bidi")
     active_bidi = _nonnegative_int(active_bidi, "active_bidi")
     active_uni = _nonnegative_int(active_uni, "active_uni")
     max_incoming_bidi = _nonnegative_int(max_incoming_bidi, "max_incoming_bidi")
@@ -159,7 +159,7 @@ def decrement_active_stream_count(
         active_bidi: int,
         active_uni: int,
 ) -> Tuple[int, int]:
-    bidi = _require_bool(bidi, "bidi")
+    bidi = require_bool(bidi, "bidi")
     active_bidi = _nonnegative_int(active_bidi, "active_bidi")
     active_uni = _nonnegative_int(active_uni, "active_uni")
     if bidi:
@@ -188,7 +188,7 @@ def initial_send_window(local_role: Role, peer: Settings, stream_id: int) -> int
 
 
 def initial_local_opened_send_window(peer: Settings, bidi: bool) -> int:
-    bidi = _require_bool(bidi, "bidi")
+    bidi = require_bool(bidi, "bidi")
     if bidi:
         return peer.initial_max_stream_data_bidi_peer_opened
     return peer.initial_max_stream_data_uni

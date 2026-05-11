@@ -117,7 +117,7 @@ class RuntimeReadLoopFlowTests(unittest.TestCase):
             target=64,
             emergency_threshold=2,
             min_pending=16,
-            standing_growth_allowed=False,
+            allow_standing_growth=False,
         )
         self.assertTrue(decision.should_flush)
         self.assertEqual(decision.desired_limit, 101)

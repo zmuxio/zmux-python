@@ -5,10 +5,10 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Dict
 
-from . import sched_core as _core
 from .sched_core import (
     FALLBACK_GROUP_BUCKET,
     MAX_EXPLICIT_GROUPS,
+    MAX_UINT64,
     BatchConfig,
     BatchItem,
     BatchState,
@@ -18,13 +18,11 @@ from .sched_core import (
     normalize_batch_state,
     order_batch_indices,
     release_idle_batch_state_storage,
+    require_bool,
     scrub_idle_retained_batch_state,
+    uint64,
+    varint62,
 )
-
-_require_bool = _core._require_bool
-_uint64 = _core._uint64
-_varint62 = _core._varint62
-MAX_UINT64 = _core.MAX_UINT64
 
 
 class BatchScheduler:
@@ -57,7 +55,7 @@ class BatchScheduler:
         )
 
     def track_explicit_group(self, group_id: int) -> None:
-        group_id = _uint64(group_id, "group_id")
+        group_id = uint64(group_id, "group_id")
         if group_id == 0:
             return
         self.active_group_refs[group_id] = min(
@@ -65,7 +63,7 @@ class BatchScheduler:
         )
 
     def untrack_explicit_group(self, group_id: int) -> None:
-        group_id = _uint64(group_id, "group_id")
+        group_id = uint64(group_id, "group_id")
         if group_id == 0:
             return
         refs = self.active_group_refs.get(group_id, 0)
@@ -79,9 +77,9 @@ class BatchScheduler:
     def group_key_for_stream(
             self, stream_id: int, group: int = 0, group_fair: bool = False
     ) -> GroupKey:
-        stream_id = _uint64(stream_id, "stream_id")
-        group = _varint62(group, "group")
-        group_fair = _require_bool(group_fair, "group_fair")
+        stream_id = uint64(stream_id, "stream_id")
+        group = varint62(group, "group")
+        group_fair = require_bool(group_fair, "group_fair")
         if stream_id == 0 or not group_fair or group == 0:
             self.drop_stream_group(stream_id)
             return GroupKey.stream(stream_id)
@@ -101,13 +99,13 @@ class BatchScheduler:
         return GroupKey.explicit(bucket)
 
     def drop_stream_group(self, stream_id: int) -> None:
-        stream_id = _uint64(stream_id, "stream_id")
+        stream_id = uint64(stream_id, "stream_id")
         binding = self.stream_groups.pop(stream_id, None)
         if binding is not None and binding.bucket:
             self.untrack_explicit_group(binding.bucket)
 
     def drop_stream(self, stream_id: int) -> None:
-        stream_id = _uint64(stream_id, "stream_id")
+        stream_id = uint64(stream_id, "stream_id")
         if stream_id == 0:
             return
         binding = self.stream_groups.pop(stream_id, None)

@@ -12,8 +12,8 @@ from enum import IntEnum
 from .half import (
     RecvHalfState,
     SendHalfState,
-    _coerce_enum,
-    _require_bool,
+    coerce_enum,
+    require_bool,
     fully_terminal,
 )
 
@@ -34,8 +34,8 @@ def ignore_late_non_opening_control(
 ) -> bool:
     """Return whether late stream control can be ignored as terminal noise."""
 
-    local_send = _require_bool(local_send, "local_send")
-    local_receive = _require_bool(local_receive, "local_receive")
+    local_send = require_bool(local_send, "local_send")
+    local_receive = require_bool(local_receive, "local_receive")
     return fully_terminal(local_send, local_receive, send_half, recv_half)
 
 
@@ -72,16 +72,16 @@ def peer_blocked_action(
 def should_advertise_max_data(local_receive: bool, recv_half: RecvHalfState) -> bool:
     """Return whether this endpoint can still advertise receive credit."""
 
-    local_receive = _require_bool(local_receive, "local_receive")
-    recv_half = _coerce_enum(recv_half, RecvHalfState, "recv_half")
+    local_receive = require_bool(local_receive, "local_receive")
+    recv_half = coerce_enum(recv_half, RecvHalfState, "recv_half")
     return local_receive and recv_half is RecvHalfState.OPEN
 
 
 def should_advertise_blocked(local_send: bool, send_half: SendHalfState) -> bool:
     """Return whether this endpoint can still advertise send-side blockage."""
 
-    local_send = _require_bool(local_send, "local_send")
-    send_half = _coerce_enum(send_half, SendHalfState, "send_half")
+    local_send = require_bool(local_send, "local_send")
+    send_half = coerce_enum(send_half, SendHalfState, "send_half")
     return local_send and send_half is SendHalfState.OPEN
 
 

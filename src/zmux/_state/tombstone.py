@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Optional
 
-from .half import RecvHalfState, SendHalfState, _coerce_enum, _require_bool
+from .half import RecvHalfState, SendHalfState, coerce_enum, require_bool
 from .terminal import TerminalErrorChoice, terminal_error_priority
 from ..config import DEFAULT_TOMBSTONE_LIMIT, DEFAULT_USED_MARKER_LIMIT
 from ..protocol import MAX_VARINT62
@@ -80,10 +80,10 @@ class StreamTombstone:
 
 
 def tombstone_late_data_action(local_receive: bool, recv_half: RecvHalfState) -> LateDataAction:
-    local_receive = _require_bool(local_receive, "local_receive")
+    local_receive = require_bool(local_receive, "local_receive")
     if not local_receive:
         return LateDataAction.IGNORE
-    if _coerce_enum(recv_half, RecvHalfState, "recv_half") is RecvHalfState.FIN:
+    if coerce_enum(recv_half, RecvHalfState, "recv_half") is RecvHalfState.FIN:
         return LateDataAction.ABORT_CLOSED
     return LateDataAction.IGNORE
 
@@ -153,11 +153,11 @@ def should_compact_terminal(
         read_buf_len: int,
         still_tracked: bool,
 ) -> bool:
-    id_set = _require_bool(id_set, "id_set")
-    fully_terminal_value = _require_bool(fully_terminal_value, "fully_terminal_value")
+    id_set = require_bool(id_set, "id_set")
+    fully_terminal_value = require_bool(fully_terminal_value, "fully_terminal_value")
     recv_buffer = _require_u64(recv_buffer, "recv_buffer")
     read_buf_len = _require_u64(read_buf_len, "read_buf_len")
-    still_tracked = _require_bool(still_tracked, "still_tracked")
+    still_tracked = require_bool(still_tracked, "still_tracked")
     if not id_set or not fully_terminal_value:
         return False
     if recv_buffer != 0 or read_buf_len != 0:
@@ -216,11 +216,11 @@ class StreamTombstoneRecord:
     def __post_init__(self) -> None:
         if not isinstance(self.tombstone, StreamTombstone):
             raise TypeError("tombstone must be a StreamTombstone")
-        self.hidden = _require_bool(self.hidden, "hidden")
+        self.hidden = require_bool(self.hidden, "hidden")
         self.created_at = _require_timestamp(self.created_at, "created_at")
         self.order_index = _require_queue_index(self.order_index, "order_index")
         self.hidden_index = _require_queue_index(self.hidden_index, "hidden_index")
-        self.late_data_cause = _coerce_enum(
+        self.late_data_cause = coerce_enum(
             self.late_data_cause, LateDataCause, "late_data_cause"
         )
         self.late_data_received = _require_u64(
@@ -231,11 +231,11 @@ class StreamTombstoneRecord:
             self.late_data_cap = _require_u64(self.late_data_cap, "late_data_cap")
 
     def queue_index(self, hidden: bool) -> int:
-        hidden = _require_bool(hidden, "hidden")
+        hidden = require_bool(hidden, "hidden")
         return self.hidden_index if hidden else self.order_index
 
     def set_queue_index(self, hidden: bool, index: int) -> None:
-        hidden = _require_bool(hidden, "hidden")
+        hidden = require_bool(hidden, "hidden")
         index = _require_queue_index(index, "index")
         if hidden:
             self.hidden_index = index
@@ -432,7 +432,7 @@ def used_stream_marker_from_tombstone(
 ) -> UsedStreamMarker:
     if not isinstance(tombstone, StreamTombstone):
         raise TypeError("tombstone must be a StreamTombstone")
-    cause = _coerce_enum(cause, LateDataCause, "cause")
+    cause = coerce_enum(cause, LateDataCause, "cause")
     return UsedStreamMarker(tombstone.data_action, cause)
 
 
@@ -471,7 +471,7 @@ class TerminalBookkeepingState:
             self.hidden_control_retained_max_age,
             "hidden_control_retained_max_age",
         )
-        self.marker_only_limit_exceeded = _require_bool(
+        self.marker_only_limit_exceeded = require_bool(
             self.marker_only_limit_exceeded,
             "marker_only_limit_exceeded",
         )
@@ -521,7 +521,7 @@ class TerminalBookkeepingState:
         stream_id = _require_u64(stream_id, "stream_id")
         if not isinstance(tombstone, StreamTombstoneRecord):
             raise TypeError("tombstone must be a StreamTombstoneRecord")
-        enforce = _require_bool(enforce, "enforce")
+        enforce = require_bool(enforce, "enforce")
         now = time.monotonic() if now is None else _require_timestamp(now, "now")
         if tombstone.created_at <= 0:
             tombstone.created_at = now
@@ -1148,14 +1148,14 @@ def _coerce_marker(value: UsedStreamMarker) -> UsedStreamMarker:
 
 
 def _set_bool_field(instance: object, name: str) -> None:
-    object.__setattr__(instance, name, _require_bool(getattr(instance, name), name))
+    object.__setattr__(instance, name, require_bool(getattr(instance, name), name))
 
 
 def _set_enum_field(instance: object, name: str, enum_type: type[IntEnum]) -> None:
     object.__setattr__(
         instance,
         name,
-        _coerce_enum(getattr(instance, name), enum_type, name),
+        coerce_enum(getattr(instance, name), enum_type, name),
     )
 
 

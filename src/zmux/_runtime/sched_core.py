@@ -2449,11 +2449,19 @@ def _uint64(value: int, name: str) -> int:
     return min(value, MAX_UINT64)
 
 
+def uint64(value: int, name: str) -> int:
+    return _uint64(value, name)
+
+
 def _varint62(value: int, name: str) -> int:
     value = _uint64(value, name)
     if value > MAX_VARINT62:
         raise ValueError("%s must be within varint62 range" % name)
     return value
+
+
+def varint62(value: int, name: str) -> int:
+    return _varint62(value, name)
 
 
 def _int64(value: int, name: str) -> int:
@@ -2470,6 +2478,10 @@ def _require_bool(value: bool, name: str) -> bool:
     if not isinstance(value, bool):
         raise TypeError("%s must be a boolean" % name)
     return value
+
+
+def require_bool(value: bool, name: str) -> bool:
+    return _require_bool(value, name)
 
 
 def _saturating_abs_i64(value: int) -> int:
@@ -2579,6 +2591,7 @@ __all__ = (
     "recycle_group_queue_entry_lists",
     "recycle_stream_order_lists",
     "remove_queue_entry",
+    "require_bool",
     "retain_batch_stream_classes",
     "scheduler_quantum",
     "scrub_idle_retained_batch_state",
@@ -2609,8 +2622,10 @@ __all__ = (
     "transient_group_virtual_map",
     "transient_stream_finish_map",
     "transient_stream_last_served_map",
+    "uint64",
     "update_bypass_selections",
     "update_lag_feedback",
+    "varint62",
     "next_group_queue_entry_list",
     "next_group_queue_map",
     "next_stream_order_list",

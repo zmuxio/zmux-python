@@ -51,12 +51,12 @@ def splitmix64_from_state(state: int) -> int:
 def init_keepalive_jitter_state(seed: int) -> int:
     """Preserve explicit non-zero seeds and allocate distinct default seeds."""
     seed = _uint64(seed, "seed")
-    if seed != 0:
-        return seed
-    global _seed_counter
-    with _seed_lock:
-        _seed_counter = (_seed_counter + KEEPALIVE_JITTER_GAMMA) & MAX_UINT64
-        return _seed_counter
+    if seed == 0:
+        global _seed_counter
+        with _seed_lock:
+            _seed_counter = (_seed_counter + KEEPALIVE_JITTER_GAMMA) & MAX_UINT64
+            seed = _seed_counter
+    return seed
 
 
 def init_session_nonce_state(seed: int) -> int:
@@ -429,7 +429,7 @@ def adaptive_rtt_timeout(
     timeout = base
     if rtt > 0 and multiplier > 0:
         timeout = max(timeout, saturating_duration_mul_add(rtt, multiplier, slack))
-    if maximum > 0 and timeout > maximum:
+    if 0 < maximum < timeout:
         return maximum
     return timeout
 

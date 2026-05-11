@@ -1247,7 +1247,7 @@ def replenish_decision(
         target: int,
         emergency_threshold: int,
         min_pending: int,
-        standing_growth_allowed: bool,
+        allow_standing_growth: bool,
         force: bool = False,
 ) -> ReplenishDecision:
     should_flush = should_flush_receive_credit(
@@ -1264,7 +1264,7 @@ def replenish_decision(
     return ReplenishDecision(
         True,
         next_credit_limit(
-            advertised, pending, received, target, standing_growth_allowed
+            advertised, pending, received, target, allow_standing_growth
         ),
     )
 

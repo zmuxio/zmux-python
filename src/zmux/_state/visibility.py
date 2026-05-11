@@ -13,8 +13,8 @@ from enum import IntEnum
 from .half import (
     RecvHalfState,
     SendHalfState,
-    _coerce_enum,
-    _require_bool,
+    coerce_enum,
+    require_bool,
     fully_terminal,
     send_terminal,
 )
@@ -72,22 +72,22 @@ class LocalOpenVisibility:
         object.__setattr__(
             self,
             "local_opened",
-            _require_bool(self.local_opened, "local_opened"),
+            require_bool(self.local_opened, "local_opened"),
         )
         object.__setattr__(
             self,
             "send_committed",
-            _require_bool(self.send_committed, "send_committed"),
+            require_bool(self.send_committed, "send_committed"),
         )
         object.__setattr__(
             self,
             "peer_visible",
-            _require_bool(self.peer_visible, "peer_visible"),
+            require_bool(self.peer_visible, "peer_visible"),
         )
         object.__setattr__(
             self,
             "opener_queued",
-            _require_bool(self.opener_queued, "opener_queued"),
+            require_bool(self.opener_queued, "opener_queued"),
         )
 
     def phase(self) -> LocalOpenPhase:
@@ -103,9 +103,9 @@ class LocalOpenVisibility:
 
 
 def should_enqueue_accepted(application_visible: bool, accepted: bool, enqueued: bool) -> bool:
-    application_visible = _require_bool(application_visible, "application_visible")
-    accepted = _require_bool(accepted, "accepted")
-    enqueued = _require_bool(enqueued, "enqueued")
+    application_visible = require_bool(application_visible, "application_visible")
+    accepted = require_bool(accepted, "accepted")
+    enqueued = require_bool(enqueued, "enqueued")
     return application_visible and not accepted and not enqueued
 
 
@@ -116,11 +116,11 @@ def should_flush_stream_max_data(
         read_stopped_value: bool,
         recv_terminal_value: bool,
 ) -> tuple[bool, bool]:
-    id_set = _require_bool(id_set, "id_set")
-    local_receive = _require_bool(local_receive, "local_receive")
-    phase = _coerce_enum(phase, LocalOpenPhase, "phase")
-    read_stopped_value = _require_bool(read_stopped_value, "read_stopped_value")
-    recv_terminal_value = _require_bool(recv_terminal_value, "recv_terminal_value")
+    id_set = require_bool(id_set, "id_set")
+    local_receive = require_bool(local_receive, "local_receive")
+    phase = coerce_enum(phase, LocalOpenPhase, "phase")
+    read_stopped_value = require_bool(read_stopped_value, "read_stopped_value")
+    recv_terminal_value = require_bool(recv_terminal_value, "recv_terminal_value")
     if not id_set or not local_receive:
         return False, False
     if read_stopped_value or recv_terminal_value:
@@ -136,10 +136,10 @@ def should_flush_stream_blocked(
         phase: LocalOpenPhase,
         send_half: SendHalfState,
 ) -> tuple[bool, bool]:
-    id_set = _require_bool(id_set, "id_set")
-    local_send = _require_bool(local_send, "local_send")
-    phase = _coerce_enum(phase, LocalOpenPhase, "phase")
-    send_half = _coerce_enum(send_half, SendHalfState, "send_half")
+    id_set = require_bool(id_set, "id_set")
+    local_send = require_bool(local_send, "local_send")
+    phase = coerce_enum(phase, LocalOpenPhase, "phase")
+    send_half = coerce_enum(send_half, SendHalfState, "send_half")
     if not id_set or not local_send:
         return False, False
     if send_half is not SendHalfState.OPEN:
@@ -152,8 +152,8 @@ def should_flush_stream_blocked(
 def should_flush_priority_update(
         phase: LocalOpenPhase, send_half: SendHalfState
 ) -> tuple[bool, bool]:
-    phase = _coerce_enum(phase, LocalOpenPhase, "phase")
-    send_half = _coerce_enum(send_half, SendHalfState, "send_half")
+    phase = coerce_enum(phase, LocalOpenPhase, "phase")
+    send_half = coerce_enum(send_half, SendHalfState, "send_half")
     if send_half is SendHalfState.STOP_SEEN or send_terminal(send_half):
         return False, False
     if not phase.can_take_pending_priority_update():
@@ -173,9 +173,9 @@ def should_reclaim_unseen_local_stream(
         send_half: SendHalfState,
         recv_half: RecvHalfState,
 ) -> bool:
-    phase = _coerce_enum(phase, LocalOpenPhase, "phase")
-    id_assigned = _require_bool(id_assigned, "id_assigned")
-    bidi = _require_bool(bidi, "bidi")
+    phase = coerce_enum(phase, LocalOpenPhase, "phase")
+    id_assigned = require_bool(id_assigned, "id_assigned")
+    bidi = require_bool(bidi, "bidi")
     stream_id = _nonnegative_int(stream_id, "stream_id")
     peer_go_away_bidi = _nonnegative_int(peer_go_away_bidi, "peer_go_away_bidi")
     peer_go_away_uni = _nonnegative_int(peer_go_away_uni, "peer_go_away_uni")
@@ -196,8 +196,8 @@ def should_finalize_peer_active(
         send_half: SendHalfState,
         recv_half: RecvHalfState,
 ) -> bool:
-    active_counted = _require_bool(active_counted, "active_counted")
-    local_opened = _require_bool(local_opened, "local_opened")
+    active_counted = require_bool(active_counted, "active_counted")
+    local_opened = require_bool(local_opened, "local_opened")
     return (
             active_counted
             and not local_opened

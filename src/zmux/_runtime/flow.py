@@ -198,7 +198,7 @@ def crossed_low_watermark(prev: int, next_value: int, low_watermark_value: int) 
     prev = _nonnegative_int(prev, "prev")
     next_value = _nonnegative_int(next_value, "next_value")
     low_watermark_value = _nonnegative_int(low_watermark_value, "low_watermark")
-    return prev > low_watermark_value and next_value <= low_watermark_value
+    return next_value <= low_watermark_value < prev
 
 
 def gained_credit(prev: int, next_value: int) -> bool:
@@ -349,15 +349,15 @@ def next_credit_limit(
         pending: int,
         received: int,
         target: int,
-        standing_growth_allowed: bool,
+        allow_standing_growth: bool,
 ) -> int:
-    standing_growth_allowed = _require_bool(
-        standing_growth_allowed,
-        "standing_growth_allowed",
+    allow_standing_growth = _require_bool(
+        allow_standing_growth,
+        "allow_standing_growth",
     )
     floor = saturating_add(advertised, pending)
     desired = floor
-    if standing_growth_allowed:
+    if allow_standing_growth:
         desired = max(desired, saturating_add(received, target))
     return min(desired, MAX_VARINT62)
 

@@ -155,7 +155,7 @@ class ImplementationProfile(str, Enum):
 
     def claims(self) -> tuple[Claim, ...]:
         if self is ImplementationProfile.V1:
-            return (Claim.WIRE_V1, Claim.OPEN_METADATA, Claim.PRIORITY_UPDATE)
+            return Claim.WIRE_V1, Claim.OPEN_METADATA, Claim.PRIORITY_UPDATE
         if self is ImplementationProfile.REFERENCE_PROFILE_V1:
             return (
                 Claim.WIRE_V1,
