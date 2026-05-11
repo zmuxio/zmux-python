@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import MutableSequence
-from typing import BinaryIO, Optional
+from typing import BinaryIO, List, Optional
 
 from .errors import (
     ERR_INVALID_FLAGS,
@@ -541,6 +541,7 @@ def _read_exact(reader: BinaryIO, size: int, truncated_message: str) -> bytes:
             offset += n
         return bytes(out)
 
+    chunks: List[bytes] = []
     remaining = size
     while remaining:
         try:
@@ -557,28 +558,9 @@ def _read_exact(reader: BinaryIO, size: int, truncated_message: str) -> bytes:
         if len(chunk) > remaining:
             exc = OSError("reader returned more bytes than requested")
             raise _transport_read_error(exc) from exc
-        if len(chunk) == remaining:
+        if len(chunk) == remaining and not chunks:
             return bytes(chunk)
-        chunks = [chunk]
-        remaining -= len(chunk)
-        break
-
-    while remaining:
-        try:
-            chunk = reader.read(remaining)
-        except InterruptedError:
-            continue
-        except OSError as exc:
-            raise _transport_read_error(exc) from exc
-        if chunk is None:
-            exc = BlockingIOError("non-blocking reader returned no data")
-            raise _transport_read_error(exc) from exc
-        if chunk == b"":
-            raise _protocol_read(truncated_message)
-        if len(chunk) > remaining:
-            exc = OSError("reader returned more bytes than requested")
-            raise _transport_read_error(exc) from exc
-        chunks.append(chunk)
+        chunks.append(bytes(chunk))
         remaining -= len(chunk)
     return b"".join(chunks)
 

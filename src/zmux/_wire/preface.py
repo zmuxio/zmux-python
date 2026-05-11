@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import BinaryIO
+from typing import BinaryIO, List
 
 from .settings import marshal_settings_tlv, parse_settings_tlv
 from .varint import encode_varint_into, parse_varint, read_varint, varint_len
@@ -364,6 +364,7 @@ def _read_preface_varint(reader: BinaryIO) -> tuple[int, int]:
 def _read_exact(reader: BinaryIO, size: int, truncated_message: str) -> bytes:
     if size == 0:
         return b""
+    chunks: List[bytes] = []
     remaining = size
     while remaining:
         try:
@@ -382,29 +383,8 @@ def _read_exact(reader: BinaryIO, size: int, truncated_message: str) -> bytes:
         if chunk_len > remaining:
             exc = OSError("reader returned more bytes than requested")
             raise _transport_read_error(exc) from exc
-        if chunk_len == remaining:
+        if chunk_len == remaining and not chunks:
             return chunk if isinstance(chunk, bytes) else view.tobytes()
-        chunks = [view.tobytes()]
-        remaining -= chunk_len
-        break
-
-    while remaining:
-        try:
-            chunk = reader.read(remaining)
-        except InterruptedError:
-            continue
-        except OSError as exc:
-            raise _transport_read_error(exc) from exc
-        if chunk is None:
-            exc = BlockingIOError("non-blocking reader returned no data")
-            raise _transport_read_error(exc) from exc
-        view = _read_chunk_view(chunk)
-        chunk_len = len(view)
-        if chunk_len == 0:
-            raise _preface_parse_error(truncated_message)
-        if chunk_len > remaining:
-            exc = OSError("reader returned more bytes than requested")
-            raise _transport_read_error(exc) from exc
         chunks.append(view.tobytes())
         remaining -= chunk_len
     return b"".join(chunks)

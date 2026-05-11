@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import IntEnum, IntFlag
-from typing import Type, TypeVar
+from typing import TypeVar
 
 MAGIC = b"ZMUX"
 PREFACE_VERSION = 1
@@ -15,7 +15,7 @@ MAX_VARINT_LEN = 8
 _E = TypeVar("_E", bound=IntEnum)
 
 
-def _enum_from_code(enum_type: Type[_E], code: int, label: str) -> _E:
+def _enum_from_code(enum_type: type[_E], code: int, label: str) -> _E:
     code = _coerce_int_code(code, label)
     try:
         return enum_type(code)
@@ -213,7 +213,7 @@ class ExtensionSubtype(IntEnum):
     def as_str(self) -> str:
         """Return the wire-registry EXT subtype name."""
 
-        return "PRIORITY_UPDATE"
+        return self.name
 
     def __str__(self) -> str:
         return self.as_str()

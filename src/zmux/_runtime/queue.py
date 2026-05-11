@@ -8,9 +8,19 @@ combined internal surface used by the rest of the runtime and tests.
 
 from __future__ import annotations
 
-from .tx import __all__ as _TX_ALL
-from .tx import *  # noqa: F403
-from .write_queue import __all__ as _WRITE_QUEUE_ALL
-from .write_queue import *  # noqa: F403
+from typing import Tuple
 
-__all__ = _TX_ALL + _WRITE_QUEUE_ALL
+from . import tx as _tx
+from . import write_queue as _write_queue
+
+
+def _export(module: object) -> Tuple[str, ...]:
+    names = tuple(vars(module).get("__all__", ()))
+    for name in names:
+        globals()[name] = getattr(module, name)
+    return names
+
+
+__all__ = _export(_tx) + _export(_write_queue)
+
+del _export, _tx, _write_queue

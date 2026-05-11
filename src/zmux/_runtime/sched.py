@@ -7,8 +7,19 @@ owns the small mutable facade used by writer code.
 
 from __future__ import annotations
 
-from .sched_core import __all__ as _CORE_ALL
-from .sched_core import *  # noqa: F403
-from .batch_scheduler import BatchScheduler, new_batch_scheduler
+from typing import Tuple
 
-__all__ = _CORE_ALL + ("BatchScheduler", "new_batch_scheduler")
+from . import batch_scheduler as _batch_scheduler
+from . import sched_core as _sched_core
+
+
+def _export(module: object) -> Tuple[str, ...]:
+    names = tuple(vars(module).get("__all__", ()))
+    for name in names:
+        globals()[name] = getattr(module, name)
+    return names
+
+
+__all__ = _export(_sched_core) + _export(_batch_scheduler)
+
+del _export, _batch_scheduler, _sched_core

@@ -1100,13 +1100,20 @@ class ClosedSession:
     ) -> None:
         raise _closed_session_error(ErrorOperation.CLOSE)
 
-    def close(self) -> None:
+    @staticmethod
+    def close() -> None:
         return None
 
-    def close_with_error(self, code: int, reason: str = "") -> None:
+    @staticmethod
+    def close_with_error(code: int, reason: str = "") -> None:
+        if code is None and reason is None:
+            return None
         return None
 
-    def wait(self, timeout: Optional[float] = None) -> None:
+    @staticmethod
+    def wait(timeout: Optional[float] = None) -> None:
+        if timeout is not None:
+            return None
         return None
 
     @property
@@ -1141,13 +1148,16 @@ class ClosedSession:
     def peer_close_error(self) -> Optional[ApplicationError]:
         return None
 
-    def local_preface(self) -> Preface:
+    @staticmethod
+    def local_preface() -> Preface:
         return _zero_preface()
 
-    def peer_preface(self) -> Preface:
+    @staticmethod
+    def peer_preface() -> Preface:
         return _zero_preface()
 
-    def negotiated(self) -> Negotiated:
+    @staticmethod
+    def negotiated() -> Negotiated:
         return _zero_negotiated()
 
 
@@ -1229,13 +1239,20 @@ class AsyncClosedSession:
     ) -> None:
         raise _closed_session_error(ErrorOperation.CLOSE)
 
-    async def close(self) -> None:
+    @staticmethod
+    async def close() -> None:
         return None
 
-    async def close_with_error(self, code: int, reason: str = "") -> None:
+    @staticmethod
+    async def close_with_error(code: int, reason: str = "") -> None:
+        if code is None and reason is None:
+            return None
         return None
 
-    async def wait(self, timeout: Optional[float] = None) -> None:
+    @staticmethod
+    async def wait(timeout: Optional[float] = None) -> None:
+        if timeout is not None:
+            return None
         return None
 
     @property
@@ -1270,13 +1287,16 @@ class AsyncClosedSession:
     def peer_close_error(self) -> Optional[ApplicationError]:
         return None
 
-    def local_preface(self) -> Preface:
+    @staticmethod
+    def local_preface() -> Preface:
         return _zero_preface()
 
-    def peer_preface(self) -> Preface:
+    @staticmethod
+    def peer_preface() -> Preface:
         return _zero_preface()
 
-    def negotiated(self) -> Negotiated:
+    @staticmethod
+    def negotiated() -> Negotiated:
         return _zero_negotiated()
 
 
