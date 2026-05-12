@@ -346,13 +346,14 @@ class Conn:
     @property
     def state(self) -> SessionState:
         with self._lock:
-            return self._state
+            state = self._state
+        return state
 
     @property
     def stats(self) -> SessionStats:
         with self._lock:
             active = self._active_stream_stats_locked()
-            return SessionStats(
+            stats = SessionStats(
                 state=self._state,
                 sent_frames=self._sent_frames,
                 received_frames=self._received_frames,
@@ -369,6 +370,7 @@ class Conn:
                     abort_overflow=self._abort_overflow,
                 ),
             )
+        return stats
 
     @property
     def peer_go_away_error(self) -> Optional[ApplicationError]:
@@ -460,7 +462,7 @@ class Conn:
             )
             self._streams[stream_id] = stream
             self._open_streams = _sat_add(self._open_streams, 1)
-            return stream
+        return stream
 
     def _send_frame(self, frame: Frame) -> None:
         self._check_open(ErrorOperation.WRITE)
@@ -543,28 +545,29 @@ class Conn:
         with self._lock:
             existing = self._streams.get(stream_id)
             if existing is not None:
-                return existing
-            if stream_is_local(self._local_role, stream_id):
-                raise ValueError("peer used locally-owned stream_id %d" % stream_id)
-            bidirectional = stream_is_bidi(stream_id)
-            local_send, local_receive = stream_kind_for_local(self._local_role, stream_id)
-            stream = NativeStream(
-                self,
-                stream_id,
-                opened_locally=False,
-                bidirectional=bidirectional,
-                local_send=local_send,
-                local_receive=local_receive,
-                metadata=metadata,
-                opened_sent=True,
-            )
-            self._streams[stream_id] = stream
-            if bidirectional:
-                self._accept_bidi.append(stream)
+                stream = existing
             else:
-                self._accept_uni.append(stream)
-            self._lock_notify_all()
-            return stream
+                if stream_is_local(self._local_role, stream_id):
+                    raise ValueError("peer used locally-owned stream_id %d" % stream_id)
+                bidirectional = stream_is_bidi(stream_id)
+                local_send, local_receive = stream_kind_for_local(self._local_role, stream_id)
+                stream = NativeStream(
+                    self,
+                    stream_id,
+                    opened_locally=False,
+                    bidirectional=bidirectional,
+                    local_send=local_send,
+                    local_receive=local_receive,
+                    metadata=metadata,
+                    opened_sent=True,
+                )
+                self._streams[stream_id] = stream
+                if bidirectional:
+                    self._accept_bidi.append(stream)
+                else:
+                    self._accept_uni.append(stream)
+                self._lock_notify_all()
+        return stream
 
     def _handle_pong(self, payload: bytes) -> None:
         with self._lock:
@@ -912,21 +915,23 @@ class NativeStream:
                 if self._read_error is not None:
                     raise self._read_error
                 if self._read_finished:
-                    return 0
+                    bytes_read = 0
+                    break
                 remaining = _remaining(deadline)
                 if remaining == 0:
                     raise ReadTimeout()
                 self._cond.wait(remaining)
-            chunk = self._read_buf[0]
-            n = min(len(view), len(chunk))
-            view[:n] = chunk[:n]
-            if n == len(chunk):
-                self._read_buf.popleft()
             else:
-                self._read_buf[0] = chunk[n:]
-            self._read_buffered -= n
-            self._cond.notify_all()
-            return n
+                chunk = self._read_buf[0]
+                bytes_read = min(len(view), len(chunk))
+                view[:bytes_read] = chunk[:bytes_read]
+                if bytes_read == len(chunk):
+                    self._read_buf.popleft()
+                else:
+                    self._read_buf[0] = chunk[bytes_read:]
+                self._read_buffered -= bytes_read
+                self._cond.notify_all()
+        return bytes_read
 
     def read_exact(self, n: int, *, timeout: Optional[float] = None) -> bytes:
         if isinstance(n, bool) or not isinstance(n, int):

@@ -117,6 +117,9 @@ MIN_INBOUND_EXT_BYTE_BUDGET = 256 << 10
 MAX_PENDING_READ_LOOP_PROTOCOL_JOBS = 256
 MAX_REUSABLE_PENDING_READ_LOOP_PROTOCOL_JOBS_CAP = 1024
 _DEFAULT_SETTINGS = default_settings()
+ProtocolAction = Callable[[], object]
+FrameCallback = Callable[[Frame], object]
+PongPayloadFactory = Callable[[bytes], bytes]
 
 
 class ParsedFrameKind(str, Enum):
@@ -793,7 +796,7 @@ class ProtocolTask:
 
     kind: ProtocolTaskKind
     frame: Optional[Frame] = None
-    action: Optional[Callable[[], object]] = None
+    action: Optional[ProtocolAction] = None
     deadline: Optional[float] = None
 
     def __post_init__(self) -> None:
@@ -814,6 +817,9 @@ class ProtocolTask:
             return False
         frame_type = self.frame.frame_type
         return frame_type is FrameType.PONG or frame_type is FrameType.ABORT
+
+
+ProtocolTaskCallback = Callable[[ProtocolTask], object]
 
 
 @dataclass(frozen=True)
@@ -859,7 +865,7 @@ class ReadLoopProtocolQueue:
         return self.enqueue(ProtocolTask(ProtocolTaskKind.QUEUE_FRAME, frame=frame))
 
     def close_write(
-            self, action: Callable[[], object], deadline: Optional[float] = None
+            self, action: ProtocolAction, deadline: Optional[float] = None
     ) -> bool:
         return self.enqueue(
             ProtocolTask(
@@ -872,8 +878,8 @@ class ReadLoopProtocolQueue:
     def drain(
             self,
             *,
-            queue_frame: Optional[Callable[[Frame], object]] = None,
-            close_write: Optional[Callable[[ProtocolTask], object]] = None,
+            queue_frame: Optional[FrameCallback] = None,
+            close_write: Optional[ProtocolTaskCallback] = None,
             max_tasks: Optional[int] = None,
     ) -> int:
         executed = 0
@@ -912,7 +918,7 @@ class ReadLoopFrameDispatcher:
             peer_go_away_uni: Optional[int] = None,
             budgets: Optional[InboundBudgetTracker] = None,
             protocol_queue: Optional[ReadLoopProtocolQueue] = None,
-            pong_payload: Optional[Callable[[bytes], bytes]] = None,
+            pong_payload: Optional[PongPayloadFactory] = None,
     ) -> None:
         self.limits = limits
         self.capabilities = _nonnegative_int(capabilities, "capabilities")

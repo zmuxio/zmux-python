@@ -16,7 +16,7 @@ import time
 from collections.abc import Iterable, MutableSequence, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum, IntEnum
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Protocol, Tuple
 
 from .flow import queue_would_block as _flow_queue_would_block
 from .stream import SendHalfState, effective_deadline
@@ -69,6 +69,11 @@ DEFAULT_URGENCY_RANK = 100
 _POLL_WAIT_CAP_SECONDS = 3600.0
 POLL_WAIT_CAP_SECONDS = _POLL_WAIT_CAP_SECONDS
 PriorityUpdateFields = Tuple[Optional[int], Optional[int]]
+
+
+class BatchOrder(Protocol):
+    def __call__(self, batch: List[object]) -> Iterable[object]:
+        ...
 
 
 class TxPayloadKind(IntEnum):
@@ -193,13 +198,7 @@ def frame_chunk_spans(
     chunk_bytes = 0
     for index, frame in enumerate(frames):
         frame_bytes = frame_buffered_bytes(frame)
-        over_frame_cap = index - start >= max_frames
-        over_byte_cap = (
-                max_bytes > 0
-                and index > start
-                and _saturating_add(chunk_bytes, frame_bytes) > max_bytes
-        )
-        if over_frame_cap or over_byte_cap:
+        if _chunk_over_limit(index, start, chunk_bytes, frame_bytes, max_frames, max_bytes):
             spans.append(ChunkSpan(start, index))
             start = index
             chunk_bytes = 0
@@ -273,7 +272,7 @@ def collect_ready_batch_into(
         batch: Iterable[object],
         lane: object,
         max_items: int,
-        order: Optional[Callable[[List[object]], Iterable[object]]] = None,
+        order: Optional[BatchOrder] = None,
 ) -> List[object]:
     out = batch if isinstance(batch, list) else list(batch)
     max_items = _nonnegative_int(max_items, "max_items")
@@ -477,6 +476,24 @@ class TxFrame:
         self.payload = payload_bytes
         self.payload_len = add_tx_payload_lengths(len(prefix_bytes), len(payload_bytes))
 
+    def _set_parts_payload_view(
+            self,
+            kind: TxPayloadKind,
+            parts: Sequence[ReadableBuffer],
+            idx: int,
+            off: int,
+            length: int,
+            prefix: bytes = b"",
+    ) -> None:
+        trimmed, idx, off = trim_tx_payload_parts(parts, idx, off, length)
+        self.reset_payload_view()
+        self.payload_kind = kind
+        self.payload_prefix = prefix
+        self.payload_parts = trimmed
+        self.payload_part_idx = idx
+        self.payload_part_off = off
+        self.payload_part_len = length
+
     def set_parts_payload(
             self,
             parts: Sequence[ReadableBuffer],
@@ -485,13 +502,7 @@ class TxFrame:
             length: int = 0,
     ) -> None:
         length = checked_tx_payload_length(length)
-        trimmed, idx, off = trim_tx_payload_parts(parts, idx, off, length)
-        self.reset_payload_view()
-        self.payload_kind = TxPayloadKind.PARTS
-        self.payload_parts = trimmed
-        self.payload_part_idx = idx
-        self.payload_part_off = off
-        self.payload_part_len = length
+        self._set_parts_payload_view(TxPayloadKind.PARTS, parts, idx, off, length)
         self.payload_len = length
 
     def set_prefixed_parts_payload(
@@ -504,14 +515,14 @@ class TxFrame:
     ) -> None:
         length = checked_tx_payload_length(length)
         prefix_bytes = _bytes_or_empty(prefix, "prefix")
-        trimmed, idx, off = trim_tx_payload_parts(parts, idx, off, length)
-        self.reset_payload_view()
-        self.payload_kind = TxPayloadKind.PREFIX_PARTS
-        self.payload_prefix = prefix_bytes
-        self.payload_parts = trimmed
-        self.payload_part_idx = idx
-        self.payload_part_off = off
-        self.payload_part_len = length
+        self._set_parts_payload_view(
+            TxPayloadKind.PREFIX_PARTS,
+            parts,
+            idx,
+            off,
+            length,
+            prefix=prefix_bytes,
+        )
         self.payload_len = add_tx_payload_lengths(len(prefix_bytes), length)
 
     def to_frame(self) -> Frame:
@@ -931,15 +942,18 @@ class WriteCompletion:
     @property
     def generation(self) -> int:
         with self._cond:
-            return self._generation
+            generation = self._generation
+        return generation
 
     def done(self) -> bool:
         with self._cond:
-            return self._done
+            done = self._done
+        return done
 
     def try_result(self) -> Optional[WriteCompletionResult]:
         with self._cond:
-            return self._result
+            result = self._result
+        return result
 
     def complete_success(self) -> None:
         self._complete(WriteCompletionResult())
@@ -965,7 +979,11 @@ class WriteCompletion:
                 self._cond.wait(min(remaining, _POLL_WAIT_CAP_SECONDS))
 
     def wait(self, timeout: Optional[float] = None) -> Optional[BaseException]:
-        deadline = None if timeout is None else time.monotonic() + _nonnegative_duration(timeout, "timeout")
+        deadline = (
+            None
+            if timeout is None
+            else time.monotonic() + _nonnegative_duration(timeout, "timeout")
+        )
         with self._cond:
             while self._result is None:
                 if deadline is None:
@@ -975,7 +993,8 @@ class WriteCompletion:
                 if remaining <= 0.0:
                     raise WriteTimeout()
                 self._cond.wait(min(remaining, _POLL_WAIT_CAP_SECONDS))
-            return self._result.error
+            error = self._result.error
+        return error
 
     def _complete(self, result: WriteCompletionResult) -> None:
         with self._cond:
@@ -1472,13 +1491,7 @@ def tx_frame_chunk_spans(
     chunk_bytes = 0
     for index, frame in enumerate(frames):
         frame_bytes = tx_frame_buffered_bytes(frame)
-        over_frame_cap = index - start >= max_frames
-        over_byte_cap = (
-                max_bytes > 0
-                and index > start
-                and _saturating_add(chunk_bytes, frame_bytes) > max_bytes
-        )
-        if over_frame_cap or over_byte_cap:
+        if _chunk_over_limit(index, start, chunk_bytes, frame_bytes, max_frames, max_bytes):
             spans.append(ChunkSpan(start, index))
             start = index
             chunk_bytes = 0
@@ -2054,7 +2067,7 @@ def _try_recv_ready(lane: object) -> tuple[bool, object]:
 
 def _ordered_batch(
         batch: List[object],
-        order: Optional[Callable[[List[object]], Iterable[object]]],
+        order: Optional[BatchOrder],
 ) -> List[object]:
     if order is None:
         return batch
@@ -2132,6 +2145,20 @@ def _chunk_frame_limit(max_frames: int, frame_count: int) -> int:
     if max_frames <= 0:
         return max(1, frame_count)
     return max_frames
+
+
+def _chunk_over_limit(
+        index: int,
+        start: int,
+        chunk_bytes: int,
+        frame_bytes: int,
+        max_frames: int,
+        max_bytes: int,
+) -> bool:
+    return index - start >= max_frames or (
+            index > start
+            and 0 < max_bytes < _saturating_add(chunk_bytes, frame_bytes)
+    )
 
 
 def _coerce_enum(value, enum_type, name: str):

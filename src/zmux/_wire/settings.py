@@ -32,6 +32,7 @@ from ..protocol import (
 )
 
 INLINE_UNKNOWN_SETTING_IDS = 8
+SettingIDSet = Set[int]
 
 __all__ = (
     "INLINE_UNKNOWN_SETTING_IDS",
@@ -245,7 +246,7 @@ class _UnknownSettingTracker:
 
     def __init__(self) -> None:
         self._inline: List[int] = []
-        self._overflow: Optional[Set[int]] = None
+        self._overflow: Optional[SettingIDSet] = None
 
     def insert(self, typ: int) -> bool:
         overflow = self._overflow

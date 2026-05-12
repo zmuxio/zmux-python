@@ -6,7 +6,7 @@ import math
 import secrets
 import threading
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, MutableSequence, Optional, TypeAlias
+from typing import Any, Callable, MutableSequence, Optional
 
 from .protocol import (
     MAX_PREFACE_SETTINGS_BYTES,
@@ -87,7 +87,7 @@ _SETTING_VARINT_FIELDS = (
     "ping_padding_key",
 )
 
-EventHandler: TypeAlias = Callable[[Any], None]
+EventHandler = Callable[[Any], None]
 
 
 @dataclass(frozen=True)
@@ -458,7 +458,7 @@ class OpenOptions:
 _default_config_lock = threading.Lock()
 _default_config_template: Optional[Config] = None
 
-ConfigUpdater: TypeAlias = Callable[[Config], Optional[Config]]
+ConfigUpdater = Callable[[Config], Optional[Config]]
 
 
 def default_settings() -> Settings:
@@ -474,7 +474,8 @@ def default_config() -> Config:
     with _default_config_lock:
         if _default_config_template is None:
             _default_config_template = _builtin_default_config()
-        return replace(_default_config_template)
+        template = _default_config_template
+    return replace(template)
 
 
 def configure_default_config(update: ConfigUpdater) -> None:

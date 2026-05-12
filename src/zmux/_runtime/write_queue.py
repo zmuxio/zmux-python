@@ -22,8 +22,13 @@ from .tx import (
     saturating_add,
 )
 from ..errors import ProtocolError, SessionClosed
+from ..frame import Frame
 
 _WRITE_QUEUE_LANES = (QueueLane.URGENT, QueueLane.ORDINARY)
+QueueCheck = Callable[[], None]
+FrameRemovePredicate = Callable[[Frame, int], bool]
+LaneIndex = Tuple[QueueLane, int]
+WriteJobBatch = Tuple[WriteJob, ...]
 
 
 class WriteQueue:
@@ -73,7 +78,7 @@ class WriteQueue:
             self,
             job: WriteJob,
             deadline: Optional[float],
-            check: Optional[Callable[[], None]] = None,
+            check: Optional[QueueCheck] = None,
             _operation: str = "write",
     ) -> None:
         pending = job
@@ -122,7 +127,7 @@ class WriteQueue:
 
     def stats(self) -> WriterQueueStats:
         with self._cond:
-            return WriterQueueStats(
+            stats = WriterQueueStats(
                 urgent_jobs=len(self._urgent),
                 advisory_jobs=0,
                 ordinary_jobs=len(self._ordinary),
@@ -140,17 +145,20 @@ class WriteQueue:
                 pending_priority_bytes_budget=self.limits.pending_priority_max_bytes,
                 max_batch_frames=self.limits.max_batch_frames,
             )
+        return stats
 
     def data_queued_bytes_for_stream(self, stream_id: int) -> int:
         with self._cond:
-            return self._data_queued_by_stream.get(stream_id, 0)
+            queued = self._data_queued_by_stream.get(stream_id, 0)
+        return queued
 
     def terminal_control_queued_for_stream(self, stream_id: int) -> bool:
         with self._cond:
-            return (
+            queued = (
                     jobs_have_terminal_control_for_stream(self._urgent, stream_id)
                     or jobs_have_terminal_control_for_stream(self._ordinary, stream_id)
             )
+        return queued
 
     def discard_stream(self, stream_id: int) -> StreamDiscardStats:
         return self._discard_stream(stream_id, frame_belongs_to_stream)
@@ -169,20 +177,21 @@ class WriteQueue:
         return self._discard_coalesced(CoalesceKey(CoalesceKind.MAX_DATA, stream_id))
 
     def cancel_tracked_write(self, completion: WriteCompletion) -> Optional[TrackedWriteJob]:
+        tracked = None
         with self._cond:
             found = self._find_tracked_completion_locked(completion)
-            if found is None:
-                return None
-            lane, index = found
-            job = self._remove_lane_job(lane, index)
-            if job is None:
-                return None
-            queued = job.cost_bytes()
-            self._apply_cost_remove(queue_cost_for(lane, job, queued))
-            self._cond.notify_all()
-            return job.tracked if job.kind is WriteJobKind.TRACKED_FRAMES else None
+            if found is not None:
+                lane, index = found
+                job = self._remove_lane_job(lane, index)
+                if job is not None:
+                    queued = job.cost_bytes()
+                    self._apply_cost_remove(queue_cost_for(lane, job, queued))
+                    self._cond.notify_all()
+                    if job.kind is WriteJobKind.TRACKED_FRAMES:
+                        tracked = job.tracked
+        return tracked
 
-    def pop_batch(self, timeout: Optional[float] = None) -> Optional[Tuple[WriteJob, ...]]:
+    def pop_batch(self, timeout: Optional[float] = None) -> Optional[WriteJobBatch]:
         batch = []
         status = self.pop_batch_into(batch, timeout)
         if status is WriteQueuePopStatus.BATCH:
@@ -243,6 +252,7 @@ class WriteQueue:
                     break
             self._cond.notify_all()
             return WriteQueuePopStatus.BATCH
+        raise RuntimeError("unreachable")
 
     def _push(
             self,
@@ -368,7 +378,8 @@ class WriteQueue:
                 pending = merge_coalesced_priority_update(self._lane(lane)[index], pending)
             lane = self._lane_for_locked(pending)
             cost = queue_cost_for(lane, pending, pending.cost_bytes())
-            return self._intrinsic_capacity_message(cost) == str(error)
+            intrinsic = self._intrinsic_capacity_message(cost) == str(error)
+        return intrinsic
 
     def _wait_not_full_locked(self, deadline: Optional[float]) -> None:
         if deadline is None:
@@ -382,7 +393,7 @@ class WriteQueue:
     def _discard_stream(
             self,
             stream_id: int,
-            remove: Callable[[Frame, int], bool],
+            remove: FrameRemovePredicate,
     ) -> StreamDiscardStats:
         if stream_id == 0:
             return StreamDiscardStats()
@@ -392,7 +403,7 @@ class WriteQueue:
                 stats = stats.add(self._discard_stream_from_lane_locked(lane, stream_id, remove))
             if stats.removed_any():
                 self._cond.notify_all()
-            return stats
+        return stats
 
     def _discard_coalesced(self, key: CoalesceKey) -> bool:
         with self._cond:
@@ -409,13 +420,13 @@ class WriteQueue:
                 removed = True
             if removed:
                 self._cond.notify_all()
-            return removed
+        return removed
 
     def _discard_stream_from_lane_locked(
             self,
             lane: QueueLane,
             stream_id: int,
-            remove: Callable[[Frame, int], bool],
+            remove: FrameRemovePredicate,
     ) -> StreamDiscardStats:
         lane_jobs = self._lane(lane)
         if not jobs_have_removable_stream_frame(lane_jobs, stream_id, remove):
@@ -474,7 +485,7 @@ class WriteQueue:
 
     def _find_coalesced_locked(
             self, key: Optional[CoalesceKey]
-    ) -> Optional[Tuple[QueueLane, int]]:
+    ) -> Optional[LaneIndex]:
         if key is None:
             return None
         for lane in _WRITE_QUEUE_LANES:
@@ -486,7 +497,7 @@ class WriteQueue:
 
     def _find_tracked_completion_locked(
             self, completion: WriteCompletion
-    ) -> Optional[Tuple[QueueLane, int]]:
+    ) -> Optional[LaneIndex]:
         for lane in _WRITE_QUEUE_LANES:
             jobs = self._lane(lane)
             for index, job in enumerate(jobs):

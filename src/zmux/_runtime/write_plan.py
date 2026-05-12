@@ -55,6 +55,8 @@ from ..protocol import (
 )
 from ..streams import ReadableBuffer
 
+FrameList = List[Frame]
+
 
 class OpenerVisibilityMark(IntEnum):
     UNCHANGED = 0
@@ -303,7 +305,7 @@ class QueuedWriteCommit:
 
 @dataclass
 class WriteBurstState:
-    frames: List[Frame] = field(default_factory=list)
+    frames: FrameList = field(default_factory=list)
     queued_bytes: int = 0
     commit: QueuedWriteCommit = field(default_factory=QueuedWriteCommit)
     data_frames: int = 0
@@ -316,7 +318,7 @@ class WriteBurstState:
         self.data_frames = _nonnegative_int(self.data_frames, "data_frames")
 
     def init_frame_buffer(
-            self, start: WriteBatchStart, frames: Optional[List[Frame]] = None
+            self, start: WriteBatchStart, frames: Optional[FrameList] = None
     ) -> None:
         self.frames = [] if frames is None else list(_frame_tuple(frames, "frames"))
         self.frames.clear()

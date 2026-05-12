@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional, TypeVar
+from typing import Optional, Type, TypeVar
 
 from .protocol import ErrorCode, MAX_VARINT62
 
@@ -600,7 +600,7 @@ def error_code_name(code: int) -> str:
         return "APPLICATION_ERROR"
 
 
-def find_error(error: BaseException, error_type: type[_E]) -> Optional[_E]:
+def find_error(error: BaseException, error_type: Type[_E]) -> Optional[_E]:
     """Find the first nested exception of ``error_type`` within ``error``."""
 
     for candidate in _iter_error_tree(error):
@@ -739,11 +739,11 @@ def open_limited(error: BaseException) -> bool:
 
 
 def open_expired(error: BaseException) -> bool:
-    message = error_reason(error)
-    return (
-            find_error(error, OpenExpired) is not None
-            or OPEN_EXPIRED_MESSAGE == message
-            or PROVISIONAL_LOCAL_OPEN_EXPIRED_FRAGMENT in message
+    return _matches_type_message_or_fragment(
+        error,
+        OpenExpired,
+        OPEN_EXPIRED_MESSAGE,
+        PROVISIONAL_LOCAL_OPEN_EXPIRED_FRAGMENT,
     )
 
 
@@ -768,11 +768,11 @@ def adapter_unsupported(error: BaseException) -> bool:
 
 
 def priority_update_unavailable(error: BaseException) -> bool:
-    message = error_reason(error)
-    return (
-            find_error(error, PriorityUpdateUnavailable) is not None
-            or message == PRIORITY_UPDATE_UNAVAILABLE_MESSAGE
-            or PRIORITY_UPDATE_UNAVAILABLE_FRAGMENT in message
+    return _matches_type_message_or_fragment(
+        error,
+        PriorityUpdateUnavailable,
+        PRIORITY_UPDATE_UNAVAILABLE_MESSAGE,
+        PRIORITY_UPDATE_UNAVAILABLE_FRAGMENT,
     )
 
 
@@ -838,7 +838,7 @@ def source_exception(error: BaseException) -> Optional[BaseException]:
     return None if found is None else found.source_error
 
 
-def _contains_error_type(error: BaseException, error_type: type[BaseException]) -> bool:
+def _contains_error_type(error: BaseException, error_type: Type[BaseException]) -> bool:
     return find_error(error, error_type) is not None
 
 
@@ -849,6 +849,20 @@ def _message_matches(error: BaseException, expected: str) -> bool:
         if str(candidate) == expected:
             return True
     return False
+
+
+def _matches_type_message_or_fragment(
+        error: BaseException,
+        error_type: Type[BaseException],
+        expected: str,
+        fragment: str,
+) -> bool:
+    message = error_reason(error)
+    return (
+            find_error(error, error_type) is not None
+            or message == expected
+            or fragment in message
+    )
 
 
 def _message_looks_like_timeout(error: BaseException) -> bool:

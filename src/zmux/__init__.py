@@ -34,7 +34,8 @@ _EXPORT_MODULES = (
     "events",
 )
 
-_EXPORT_CACHE: Dict[str, Tuple[str, str]] = {}
+ExportTarget = Tuple[str, str]
+_EXPORT_CACHE: Dict[str, ExportTarget] = {}
 
 
 def __getattr__(name: str):
@@ -51,7 +52,7 @@ def __dir__():
     return sorted(set(globals()) | set(__all__))
 
 
-def _find_export(name: str) -> Optional[Tuple[str, str]]:
+def _find_export(name: str) -> Optional[ExportTarget]:
     cached = _EXPORT_CACHE.get(name)
     if cached is not None:
         return cached

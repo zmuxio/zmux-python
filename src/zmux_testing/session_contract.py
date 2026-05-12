@@ -25,6 +25,7 @@ _MAX_READ_ALL_BYTES = 16 * 1024 * 1024
 _POLL_INTERVAL = 0.01
 
 SessionPairFactory = Callable[[], Any]
+SessionCaseBody = Callable[[Any, Any, float], Awaitable[None]]
 
 
 def run_session_contract(
@@ -73,7 +74,7 @@ async def _run_case(
         name: str,
         pair_factory: SessionPairFactory,
         timeout: float,
-        body: Callable[[Any, Any, float], Awaitable[None]],
+        body: SessionCaseBody,
 ) -> None:
     pair = await _maybe_await(pair_factory())
     client, server = _coerce_pair(pair, name)
