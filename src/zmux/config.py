@@ -6,7 +6,7 @@ import math
 import secrets
 import threading
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, MutableSequence, Optional
+from typing import Any, Callable, MutableSequence, Optional, TypeAlias
 
 from .protocol import (
     MAX_PREFACE_SETTINGS_BYTES,
@@ -87,7 +87,7 @@ _SETTING_VARINT_FIELDS = (
     "ping_padding_key",
 )
 
-EventHandler = Callable[[Any], None]
+EventHandler: TypeAlias = Callable[[Any], None]
 
 
 @dataclass(frozen=True)
@@ -280,7 +280,7 @@ class Config:
     stop_sending_graceful_tail_cap: Optional[int] = None
     graceful_close_drain_timeout: Optional[float] = DEFAULT_CLOSE_DRAIN_TIMEOUT
     go_away_drain_interval: Optional[float] = DEFAULT_GO_AWAY_DRAIN_INTERVAL
-    event_handler: Optional[EventHandler] = None
+    event_handler: EventHandler | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "role", _coerce_role(self.role))
@@ -458,7 +458,7 @@ class OpenOptions:
 _default_config_lock = threading.Lock()
 _default_config_template: Optional[Config] = None
 
-ConfigUpdater = Callable[[Config], Optional[Config]]
+ConfigUpdater: TypeAlias = Callable[[Config], Optional[Config]]
 
 
 def default_settings() -> Settings:

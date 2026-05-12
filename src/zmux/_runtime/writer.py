@@ -14,7 +14,7 @@ import time
 from collections.abc import Iterable, MutableSequence, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Dict, List, Optional, Protocol, Tuple
+from typing import Dict, List, Optional, Protocol, Tuple, TypeAlias
 
 from .queue import (
     MAX_UINT64,
@@ -92,11 +92,11 @@ BULK_SPARSE_COALESCE_SECONDS = 0.002
 LATENCY_HOT_COALESCE_SECONDS = 0.002
 DEFAULT_HOT_COALESCE_SECONDS = 0.003
 BULK_HOT_COALESCE_SECONDS = 0.004
-StreamValueMap = Dict[int, Tuple[object, int]]
-StreamMetaMap = Dict[int, StreamMeta]
-OptionalScheduler = Optional[BatchScheduler]
-OptionalBatchConfig = Optional[BatchConfig]
-OptionalStreamMetaMap = Optional[StreamMetaMap]
+StreamValueMap: TypeAlias = Dict[int, Tuple[object, int]]
+StreamMetaMap: TypeAlias = Dict[int, StreamMeta]
+OptionalScheduler: TypeAlias = BatchScheduler | None
+OptionalBatchConfig: TypeAlias = BatchConfig | None
+OptionalStreamMetaMap: TypeAlias = StreamMetaMap | None
 
 
 class DequeuedWriteWorkKind(IntEnum):
@@ -168,7 +168,7 @@ class StreamValueAccumulator:
     cap_hint: int = 0
     _single_stream: object = None
     _single_value: int = 0
-    _values: Optional[StreamValueMap] = None
+    _values: StreamValueMap | None = None
     _order: List[int] = field(default_factory=list)
 
     def promote(self) -> None:

@@ -13,9 +13,9 @@ import threading
 import unittest
 from copy import deepcopy
 from pathlib import Path, PureWindowsPath
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, TypeAlias, Union
 
-PathLike = Union[str, os.PathLike]
+PathLike: TypeAlias = Union[str, os.PathLike[str]]
 
 _FIXTURE_ENV = "ZMUX_FIXTURE_DIR"
 _REQUIRED_FIXTURE_FILES = ("wire_valid.ndjson", "wire_invalid.ndjson")
@@ -27,7 +27,7 @@ _JSON_CACHE: Dict[str, Any] = {}
 _CACHE_LOCK = threading.RLock()
 
 
-def locate_fixture_dir(search_from: Optional[PathLike] = None) -> Path:
+def locate_fixture_dir(search_from: PathLike | None = None) -> Path:
     """Return the nearest valid fixture directory or raise ``SkipTest``.
 
     The default search follows the Go helper by accepting ``testdata/fixtures``
@@ -43,7 +43,7 @@ def locate_fixture_dir(search_from: Optional[PathLike] = None) -> Path:
     raise unittest.SkipTest("wire fixtures not found in testdata/fixtures")
 
 
-def load_fixture_ndjson(name: PathLike, fixture_dir: Optional[PathLike] = None) -> List[Any]:
+def load_fixture_ndjson(name: PathLike, fixture_dir: PathLike | None = None) -> List[Any]:
     """Load an NDJSON fixture file by name from the located fixture directory."""
 
     return load_ndjson(_fixture_path(name, fixture_dir))
@@ -69,7 +69,7 @@ def load_ndjson(path: PathLike) -> List[Any]:
     return _clone_json_value(fixtures)
 
 
-def read_fixture_json(name: PathLike, fixture_dir: Optional[PathLike] = None) -> Any:
+def read_fixture_json(name: PathLike, fixture_dir: PathLike | None = None) -> Any:
     """Read a JSON fixture file by name from the located fixture directory."""
 
     return read_json(_fixture_path(name, fixture_dir))
@@ -104,7 +104,7 @@ def clear_fixture_caches() -> None:
         _JSON_CACHE.clear()
 
 
-def _cached_fixture_dir(search_from: Optional[PathLike]) -> Optional[Path]:
+def _cached_fixture_dir(search_from: PathLike | None) -> Optional[Path]:
     global _FIXTURE_DIR
     if search_from is not None:
         return _locate_fixture_dir(Path(search_from))
@@ -137,7 +137,7 @@ def _locate_fixture_dir(search_from: Path) -> Optional[Path]:
     return None
 
 
-def _fixture_path(name: PathLike, fixture_dir: Optional[PathLike]) -> Path:
+def _fixture_path(name: PathLike, fixture_dir: PathLike | None) -> Path:
     name_path = Path(name)
     windows_name = PureWindowsPath(os.fspath(name))
     if (

@@ -12,7 +12,7 @@ stable symbols, so ``import zmux`` stays cheap while ``zmux.FrameType`` and
 from __future__ import annotations
 
 from importlib import import_module as _import_module
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple, TypeAlias
 
 __version__ = "0.1.0"
 
@@ -34,7 +34,7 @@ _EXPORT_MODULES = (
     "events",
 )
 
-ExportTarget = Tuple[str, str]
+ExportTarget: TypeAlias = Tuple[str, str]
 _EXPORT_CACHE: Dict[str, ExportTarget] = {}
 
 
@@ -52,7 +52,7 @@ def __dir__():
     return sorted(set(globals()) | set(__all__))
 
 
-def _find_export(name: str) -> Optional[ExportTarget]:
+def _find_export(name: str) -> ExportTarget | None:
     cached = _EXPORT_CACHE.get(name)
     if cached is not None:
         return cached

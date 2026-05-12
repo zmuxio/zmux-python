@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional, Type
+from typing import Any, Optional
 
 from .half import require_bool
 from ..errors import SessionClosed, error_code
@@ -278,7 +278,7 @@ def _coerce_session_state(value: Any) -> SessionState:
     raise TypeError("session state must be a SessionState or string")
 
 
-def coerce_enum(value: Any, enum_type: Type[Enum], name: str):
+def coerce_enum(value: Any, enum_type: type[Enum], name: str):
     if isinstance(value, enum_type):
         return value
     if isinstance(value, bool):

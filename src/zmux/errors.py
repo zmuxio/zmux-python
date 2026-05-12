@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional, Type, TypeVar
+from typing import Optional, TypeVar
 
 from .protocol import ErrorCode, MAX_VARINT62
 
@@ -600,7 +600,7 @@ def error_code_name(code: int) -> str:
         return "APPLICATION_ERROR"
 
 
-def find_error(error: BaseException, error_type: Type[_E]) -> Optional[_E]:
+def find_error(error: BaseException, error_type: type[_E]) -> Optional[_E]:
     """Find the first nested exception of ``error_type`` within ``error``."""
 
     for candidate in _iter_error_tree(error):
@@ -739,7 +739,7 @@ def open_limited(error: BaseException) -> bool:
 
 
 def open_expired(error: BaseException) -> bool:
-    return _matches_type_message_or_fragment(
+    return _matches_named_error_fragment(
         error,
         OpenExpired,
         OPEN_EXPIRED_MESSAGE,
@@ -748,15 +748,11 @@ def open_expired(error: BaseException) -> bool:
 
 
 def open_info_unavailable(error: BaseException) -> bool:
-    return find_error(error, OpenInfoUnavailable) is not None or _message_matches(
-        error, OPEN_INFO_UNAVAILABLE_MESSAGE
-    )
+    return _matches_named_error(error, OpenInfoUnavailable, OPEN_INFO_UNAVAILABLE_MESSAGE)
 
 
 def open_metadata_too_large(error: BaseException) -> bool:
-    return find_error(error, OpenMetadataTooLarge) is not None or _message_matches(
-        error, OPEN_METADATA_TOO_LARGE_MESSAGE
-    )
+    return _matches_named_error(error, OpenMetadataTooLarge, OPEN_METADATA_TOO_LARGE_MESSAGE)
 
 
 def adapter_unsupported(error: BaseException) -> bool:
@@ -768,7 +764,7 @@ def adapter_unsupported(error: BaseException) -> bool:
 
 
 def priority_update_unavailable(error: BaseException) -> bool:
-    return _matches_type_message_or_fragment(
+    return _matches_named_error_fragment(
         error,
         PriorityUpdateUnavailable,
         PRIORITY_UPDATE_UNAVAILABLE_MESSAGE,
@@ -777,15 +773,11 @@ def priority_update_unavailable(error: BaseException) -> bool:
 
 
 def priority_update_too_large(error: BaseException) -> bool:
-    return find_error(error, PriorityUpdateTooLarge) is not None or _message_matches(
-        error, PRIORITY_UPDATE_TOO_LARGE_MESSAGE
-    )
+    return _matches_named_error(error, PriorityUpdateTooLarge, PRIORITY_UPDATE_TOO_LARGE_MESSAGE)
 
 
 def empty_metadata_update(error: BaseException) -> bool:
-    return find_error(error, EmptyMetadataUpdate) is not None or _message_matches(
-        error, EMPTY_METADATA_UPDATE_MESSAGE
-    )
+    return _matches_named_error(error, EmptyMetadataUpdate, EMPTY_METADATA_UPDATE_MESSAGE)
 
 
 def keepalive_timeout(error: BaseException) -> bool:
@@ -838,7 +830,7 @@ def source_exception(error: BaseException) -> Optional[BaseException]:
     return None if found is None else found.source_error
 
 
-def _contains_error_type(error: BaseException, error_type: Type[BaseException]) -> bool:
+def _contains_error_type(error: BaseException, error_type: type[BaseException]) -> bool:
     return find_error(error, error_type) is not None
 
 
@@ -851,9 +843,17 @@ def _message_matches(error: BaseException, expected: str) -> bool:
     return False
 
 
-def _matches_type_message_or_fragment(
+def _matches_named_error(
         error: BaseException,
-        error_type: Type[BaseException],
+        error_type: type[BaseException],
+        expected: str,
+) -> bool:
+    return _contains_error_type(error, error_type) or _message_matches(error, expected)
+
+
+def _matches_named_error_fragment(
+        error: BaseException,
+        error_type: type[BaseException],
         expected: str,
         fragment: str,
 ) -> bool:

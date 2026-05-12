@@ -6,7 +6,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import MutableSequence
-from typing import Callable, Deque, Optional, Tuple
+from typing import Callable, Deque, Optional, Tuple, TypeAlias
 
 from .tx import *
 from .tx import (
@@ -25,10 +25,10 @@ from ..errors import ProtocolError, SessionClosed
 from ..frame import Frame
 
 _WRITE_QUEUE_LANES = (QueueLane.URGENT, QueueLane.ORDINARY)
-QueueCheck = Callable[[], None]
-FrameRemovePredicate = Callable[[Frame, int], bool]
-LaneIndex = Tuple[QueueLane, int]
-WriteJobBatch = Tuple[WriteJob, ...]
+QueueCheck: TypeAlias = Callable[[], None]
+FrameRemovePredicate: TypeAlias = Callable[[Frame, int], bool]
+LaneIndex: TypeAlias = Tuple[QueueLane, int]
+WriteJobBatch: TypeAlias = Tuple[WriteJob, ...]
 
 
 class WriteQueue:
@@ -78,7 +78,7 @@ class WriteQueue:
             self,
             job: WriteJob,
             deadline: Optional[float],
-            check: Optional[QueueCheck] = None,
+            check: QueueCheck | None = None,
             _operation: str = "write",
     ) -> None:
         pending = job
@@ -191,7 +191,7 @@ class WriteQueue:
                         tracked = job.tracked
         return tracked
 
-    def pop_batch(self, timeout: Optional[float] = None) -> Optional[WriteJobBatch]:
+    def pop_batch(self, timeout: Optional[float] = None) -> WriteJobBatch | None:
         batch = []
         status = self.pop_batch_into(batch, timeout)
         if status is WriteQueuePopStatus.BATCH:
@@ -485,7 +485,7 @@ class WriteQueue:
 
     def _find_coalesced_locked(
             self, key: Optional[CoalesceKey]
-    ) -> Optional[LaneIndex]:
+    ) -> LaneIndex | None:
         if key is None:
             return None
         for lane in _WRITE_QUEUE_LANES:
@@ -497,7 +497,7 @@ class WriteQueue:
 
     def _find_tracked_completion_locked(
             self, completion: WriteCompletion
-    ) -> Optional[LaneIndex]:
+    ) -> LaneIndex | None:
         for lane in _WRITE_QUEUE_LANES:
             jobs = self._lane(lane)
             for index, job in enumerate(jobs):

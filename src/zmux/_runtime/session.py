@@ -16,7 +16,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import IntEnum
 from threading import RLock
-from typing import Any, Callable, Deque, Dict, Generic, List, Optional, TypeVar
+from typing import Any, Callable, Dict, Generic, List, Optional, TypeVar
 
 from .control import MIN_PENDING_CONTROL_BUDGET, MIN_PENDING_PRIORITY_BUDGET
 from .flow import repo_default_urgent_lane_cap
@@ -1527,7 +1527,7 @@ class SparseQueue(Generic[QueueT]):
     """List-backed sparse queue with Go-compatible head/count compaction."""
 
     compact_min_head: int = PROVISIONAL_QUEUE_COMPACT_MIN_HEAD
-    items: List[Optional[QueueT]] = field(default_factory=list)
+    items: list[QueueT | None] = field(default_factory=list)
     head: int = 0
     count: int = 0
     init: bool = True
@@ -1550,7 +1550,7 @@ class SparseQueue(Generic[QueueT]):
         self.init = True
         return idx
 
-    def head_item(self) -> Optional[QueueT]:
+    def head_item(self) -> QueueT | None:
         if self.count == 0:
             return None
         self.head = self._advance_head(self.head)
@@ -1558,7 +1558,7 @@ class SparseQueue(Generic[QueueT]):
             return None
         return self.items[self.head]
 
-    def tail_item(self) -> Optional[QueueT]:
+    def tail_item(self) -> QueueT | None:
         if self.count == 0:
             return None
         for idx in range(len(self.items) - 1, self.head - 1, -1):
@@ -1567,7 +1567,7 @@ class SparseQueue(Generic[QueueT]):
                 return item
         return None
 
-    def remove_index(self, idx: int) -> Optional[QueueT]:
+    def remove_index(self, idx: int) -> QueueT | None:
         if idx < 0 or idx >= len(self.items) or self.count == 0:
             return None
         item = self.items[idx]
@@ -1581,7 +1581,7 @@ class SparseQueue(Generic[QueueT]):
             self.head = self._advance_head(self.head)
         return item
 
-    def pop_head(self) -> Optional[QueueT]:
+    def pop_head(self) -> QueueT | None:
         item = self.head_item()
         if item is None:
             return None
@@ -1589,7 +1589,7 @@ class SparseQueue(Generic[QueueT]):
         self.maybe_compact()
         return item
 
-    def pop_tail(self) -> Optional[QueueT]:
+    def pop_tail(self) -> QueueT | None:
         if self.count == 0:
             return None
         for idx in range(len(self.items) - 1, self.head - 1, -1):
@@ -1600,7 +1600,7 @@ class SparseQueue(Generic[QueueT]):
                 return item
         return None
 
-    def clear(self, visit: Optional[Callable[[QueueT], None]] = None) -> None:
+    def clear(self, visit: Callable[[QueueT], None] | None = None) -> None:
         if visit is not None:
             for item in self.items:
                 if item is not None:
@@ -1668,10 +1668,10 @@ class IndexedQueue(Generic[QueueT]):
         idx = self.state.append(item)
         self.set_index(item, idx)
 
-    def head_item(self) -> Optional[QueueT]:
+    def head_item(self) -> QueueT | None:
         return self.state.head_item()
 
-    def tail_item(self) -> Optional[QueueT]:
+    def tail_item(self) -> QueueT | None:
         return self.state.tail_item()
 
     def holds(self, item: QueueT, current_index: int) -> bool:
@@ -1695,7 +1695,7 @@ class IndexedQueue(Generic[QueueT]):
         self.state.maybe_compact()
         return removed is not None
 
-    def clear(self, visit: Optional[Callable[[QueueT], None]] = None) -> None:
+    def clear(self, visit: Callable[[QueueT], None] | None = None) -> None:
         def clear_index(item: QueueT) -> None:
             self.set_index(item, -1)
             if visit is not None:
@@ -1817,9 +1817,9 @@ class LocalOpenTracker:
 class EventDispatcher:
     """Synchronous event emitter with re-entrant queueing and exception capture."""
 
-    handler: Optional[Callable[[Event], None]] = None
+    handler: Callable[[Event], None] | None = None
     emitting: bool = False
-    queue: Deque[Event] = field(default_factory=deque)
+    queue: deque[Event] = field(default_factory=deque)
     dropped_handler_exceptions: int = 0
     _lock: RLock = field(default_factory=RLock, init=False, repr=False, compare=False)
 
