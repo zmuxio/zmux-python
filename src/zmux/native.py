@@ -17,7 +17,7 @@ from ._state.stream_id import (
     stream_is_local,
     stream_kind_for_local,
 )
-from .config import Config, OpenOptions, clone_config
+from .config import Config, Limits, OpenOptions, clone_config
 from .errors import (
     AcceptTimeout,
     ApplicationError,
@@ -70,21 +70,21 @@ from .transports import DEFAULT_READ_CHUNK, SocketTransport, ZmuxSocketAddress, 
 def open(transport: object, config: Optional[Config] = None) -> "Conn":
     """Establish a native ZMux session on a reliable ordered byte stream."""
 
-    return Conn._establish(_coerce_transport(transport), clone_config(config))
+    return Conn.establish(_coerce_transport(transport), clone_config(config))
 
 
 def client(transport: object, config: Optional[Config] = None) -> "Conn":
     """Establish a native initiator-role ZMux session."""
 
     cfg = replace(clone_config(config), role=Role.INITIATOR, tie_breaker_nonce=0)
-    return Conn._establish(_coerce_transport(transport), cfg)
+    return Conn.establish(_coerce_transport(transport), cfg)
 
 
 def server(transport: object, config: Optional[Config] = None) -> "Conn":
     """Establish a native responder-role ZMux session."""
 
     cfg = replace(clone_config(config), role=Role.RESPONDER, tie_breaker_nonce=0)
-    return Conn._establish(_coerce_transport(transport), cfg)
+    return Conn.establish(_coerce_transport(transport), cfg)
 
 
 class Conn:
@@ -182,7 +182,7 @@ class Conn:
         self._reader_thread.start()
 
     @classmethod
-    def _establish(cls, transport: object, config: Config) -> "Conn":
+    def establish(cls, transport: object, config: Config) -> "Conn":
         io = _FrameIO(transport)
         local = config.local_preface()
         try:
@@ -194,6 +194,8 @@ class Conn:
             _best_effort_close(io)
             raise
         return cls(transport, io, config, local, peer, negotiated)
+
+    _establish = establish
 
     def __enter__(self) -> "Conn":
         return self
@@ -380,6 +382,14 @@ class Conn:
     def peer_close_error(self) -> Optional[ApplicationError]:
         return self._peer_close_error
 
+    @property
+    def config(self) -> Config:
+        return self._config
+
+    @property
+    def peer_limits(self) -> Limits:
+        return self._peer_limits
+
     def local_preface(self) -> Preface:
         return self._local_preface
 
@@ -388,6 +398,12 @@ class Conn:
 
     def negotiated(self) -> Negotiated:
         return self._negotiated
+
+    def send_frame(self, frame: Frame) -> None:
+        self._send_frame(frame)
+
+    def emit_stream_opened(self, stream: "NativeStream") -> None:
+        self._emit_stream_opened(stream)
 
     def _accept(
         self, queue: Deque["NativeStream"], timeout: Optional[float]
@@ -530,14 +546,14 @@ class Conn:
         parsed = parse_data_payload_view(frame.payload, frame.flags)
         stream = self._get_or_create_peer_stream(frame.stream_id, parsed.metadata.to_owned())
         if parsed.app_data:
-            stream._receive_data(parsed.app_data)
+            stream.receive_data(parsed.app_data)
             with self._lock:
                 self._received_data_bytes = _sat_add(
                     self._received_data_bytes,
                     len(parsed.app_data),
                 )
         if frame.flags & FRAME_FLAG_FIN:
-            stream._receive_fin()
+            stream.receive_fin()
 
     def _get_or_create_peer_stream(
         self, stream_id: int, metadata: StreamMetadata
@@ -629,7 +645,7 @@ class Conn:
             direction=ErrorDirection.WRITE,
             termination_kind=TerminationKind.STOPPED,
         )
-        stream._stop_write(app)
+        stream.stop_write(app)
 
     def _handle_reset(self, stream_id: int, payload: bytes) -> None:
         stream = self._streams.get(stream_id)
@@ -637,7 +653,7 @@ class Conn:
             return
         code, reason = parse_error_payload(payload)
         self._note_reason(self._reset_reasons, code, "_reset_overflow")
-        stream._reset_read(
+        stream.reset_read(
             ApplicationError(
                 code,
                 reason,
@@ -655,7 +671,7 @@ class Conn:
             return
         code, reason = parse_error_payload(payload)
         self._note_reason(self._abort_reasons, code, "_abort_overflow")
-        stream._abort(
+        stream.abort(
             ApplicationError(
                 code,
                 reason,
@@ -673,7 +689,7 @@ class Conn:
             return
         stream = self._streams.get(stream_id)
         if stream is not None:
-            stream._apply_metadata_update(metadata)
+            stream.apply_metadata_update(metadata)
 
     def _finish(
         self,
@@ -692,7 +708,7 @@ class Conn:
             self._lock_notify_all()
             self._closed_event.set()
         for stream in streams:
-            stream._session_closed(error)
+            stream.session_closed(error)
         for done, _, _ in list(self._pings.values()):
             done.set()
         if close_transport:
@@ -1010,7 +1026,7 @@ class NativeStream:
         payload = build_error_payload(
             _application_code(code),
             "",
-            self._session._peer_limits.max_control_payload_bytes,
+            self._session.peer_limits.max_control_payload_bytes,
         )
         with self._cond:
             if self._read_closed:
@@ -1021,7 +1037,7 @@ class NativeStream:
             self._read_buffered = 0
             self._cond.notify_all()
         self._ensure_opened_before_terminal()
-        self._session._send_frame(Frame(FrameType.STOP_SENDING, self._stream_id, 0, payload))
+        self._session.send_frame(Frame(FrameType.STOP_SENDING, self._stream_id, 0, payload))
 
     def close_write(self, *, timeout: Optional[float] = None) -> None:
         if self._write_closed:
@@ -1033,10 +1049,10 @@ class NativeStream:
         payload = build_error_payload(
             _application_code(code),
             "",
-            self._session._peer_limits.max_control_payload_bytes,
+            self._session.peer_limits.max_control_payload_bytes,
         )
         self._ensure_opened_before_terminal()
-        self._session._send_frame(Frame(FrameType.RESET, self._stream_id, 0, payload))
+        self._session.send_frame(Frame(FrameType.RESET, self._stream_id, 0, payload))
         with self._cond:
             self._write_closed = True
             self._write_error = WriteClosed()
@@ -1061,11 +1077,11 @@ class NativeStream:
             self._open_info = metadata.open_info
             return
         payload = build_priority_update_payload(
-            self._session._negotiated.capabilities,
+            self._session.negotiated().capabilities,
             update,
-            self._session._peer_limits.max_extension_payload_bytes,
+            self._session.peer_limits.max_extension_payload_bytes,
         )
-        self._session._send_frame(Frame(FrameType.EXT, self._stream_id, 0, payload))
+        self._session.send_frame(Frame(FrameType.EXT, self._stream_id, 0, payload))
         self._metadata = metadata
 
     def close(self) -> None:
@@ -1089,10 +1105,10 @@ class NativeStream:
         payload = build_error_payload(
             app_code,
             "" if reason is None else str(reason),
-            self._session._peer_limits.max_control_payload_bytes,
+            self._session.peer_limits.max_control_payload_bytes,
         )
         self._ensure_opened_before_terminal()
-        self._session._send_frame(Frame(FrameType.ABORT, self._stream_id, 0, payload))
+        self._session.send_frame(Frame(FrameType.ABORT, self._stream_id, 0, payload))
         app = ApplicationError(
             app_code,
             "" if reason is None else str(reason),
@@ -1117,11 +1133,11 @@ class NativeStream:
             first_flags = 0
             if first:
                 prefix = build_open_metadata_prefix(
-                    self._session._negotiated.capabilities,
+                    self._session.negotiated().capabilities,
                     self._metadata.priority,
                     self._metadata.group,
                     self._metadata.open_info,
-                    self._session._peer_limits.max_frame_payload,
+                    self._session.peer_limits.max_frame_payload,
                 )
                 if prefix:
                     first_flags |= FRAME_FLAG_OPEN_METADATA
@@ -1131,7 +1147,7 @@ class NativeStream:
             while first or remaining or fin:
                 if _remaining(deadline) == 0:
                     raise WriteTimeout()
-                max_payload = self._session._peer_limits.max_frame_payload
+                max_payload = self._session.peer_limits.max_frame_payload
                 room = max_payload - len(prefix)
                 if room < 0:
                     raise ValueError("open metadata exceeds peer max_frame_payload")
@@ -1141,10 +1157,10 @@ class NativeStream:
                 is_final = fin and not remaining
                 flags = first_flags | (FRAME_FLAG_FIN if is_final else 0)
                 payload = prefix + chunk.tobytes()
-                self._session._send_frame(Frame(FrameType.DATA, self._stream_id, flags, payload))
+                self._session.send_frame(Frame(FrameType.DATA, self._stream_id, flags, payload))
                 if first:
                     self._opened_sent = True
-                    self._session._emit_stream_opened(self)
+                    self._session.emit_stream_opened(self)
                 first = False
                 prefix = b""
                 first_flags = 0
@@ -1160,16 +1176,37 @@ class NativeStream:
             return
         self._send_data(memoryview(b""), fin=False, timeout=None)
         if not self._opened_sent:
-            self._session._send_frame(Frame(FrameType.DATA, self._stream_id, 0, b""))
+            self._session.send_frame(Frame(FrameType.DATA, self._stream_id, 0, b""))
             self._opened_sent = True
-            self._session._emit_stream_opened(self)
+            self._session.emit_stream_opened(self)
+
+    def receive_data(self, data: memoryview) -> None:
+        self._receive_data(data)
+
+    def receive_fin(self) -> None:
+        self._receive_fin()
+
+    def stop_write(self, error: BaseException) -> None:
+        self._stop_write(error)
+
+    def reset_read(self, error: BaseException) -> None:
+        self._reset_read(error)
+
+    def abort(self, error: BaseException) -> None:
+        self._abort(error)
+
+    def session_closed(self, error: Optional[BaseException]) -> None:
+        self._session_closed(error)
+
+    def apply_metadata_update(self, metadata: StreamMetadata) -> None:
+        self._apply_metadata_update(metadata)
 
     def _receive_data(self, data: memoryview) -> None:
         view = memoryview(data)
         if not view:
             return
         with self._cond:
-            limit = self._session._config.per_stream_queued_data_hwm or 256 * 1024
+            limit = self._session.config.per_stream_queued_data_hwm or 256 * 1024
             while (
                 limit
                 and self._read_buffered + len(view) > limit

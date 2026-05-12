@@ -186,7 +186,7 @@ class BatchScratch:
     recorded_group_head: list = field(default_factory=list)
     last_build_cap_hint: int = 0
 
-    def clear(self) -> None:
+    def _drop_build_refs(self) -> None:
         self.group_order = []
         self.groups = []
         self.group_state = {}
@@ -211,6 +211,9 @@ class BatchScratch:
         self.transient_group_finish = {}
         self.transient_group_last_served = {}
         self.tie_pref_streams = {}
+
+    def clear(self) -> None:
+        self._drop_build_refs()
         self.ordered = []
         self.selected = []
         self.recorded_group_head = []
@@ -248,30 +251,7 @@ class BatchScratch:
         self.last_build_cap_hint = 0
 
     def clear_build_refs(self) -> None:
-        self.group_order = []
-        self.groups = []
-        self.group_state = {}
-        self.group_queues = []
-        self.group_queue_count = 0
-        self.group_queue_entries = []
-        self.group_queue_entry_count = 0
-        self.stream_order = {}
-        self.stream_order_entries = []
-        self.stream_order_entry_count = 0
-        self.queued_bytes = {}
-        self.stream_meta = {}
-        self.prepared_streams = {}
-        self.bypass_selections = {}
-        self.interactive_active_streams = []
-        self.bulk_active_streams = []
-        self.interactive_candidates = []
-        self.bulk_candidates = []
-        self.transient_stream_finish = {}
-        self.transient_stream_last_served = {}
-        self.transient_group_virtual = {}
-        self.transient_group_finish = {}
-        self.transient_group_last_served = {}
-        self.tie_pref_streams = {}
+        self._drop_build_refs()
 
 
 @dataclass
@@ -692,54 +672,67 @@ def stream_order_map(state: Optional[BatchState], cap_hint: int) -> Dict[GroupKe
     return scratch.stream_order
 
 
+def _recycle_scratch_lists(
+        state: Optional[BatchState],
+        values,
+        entries_attr: str,
+) -> None:
+    if state is None:
+        return
+    entries = getattr(state.scratch, entries_attr)
+    for scratch_list in values:
+        if batch_scratch_oversized(len(scratch_list), state.scratch.last_build_cap_hint):
+            continue
+        scratch_list.clear()
+        entries.append(scratch_list)
+
+
+def _next_scratch_list(
+        state: Optional[BatchState],
+        entries_attr: str,
+        count_attr: str,
+) -> list:
+    if state is None:
+        return []
+    scratch = state.scratch
+    count = getattr(scratch, count_attr)
+    entries = getattr(scratch, entries_attr)
+    if count >= len(entries):
+        return []
+    out = entries[count]
+    setattr(scratch, count_attr, count + 1)
+    out.clear()
+    return out
+
+
 def recycle_group_queue_entry_lists(
         state: Optional[BatchState],
         queues: Dict[int, list],
 ) -> None:
-    if state is None:
-        return
-    for queue in queues.values():
-        if batch_scratch_oversized(len(queue), state.scratch.last_build_cap_hint):
-            continue
-        queue.clear()
-        state.scratch.group_queue_entries.append(queue)
+    _recycle_scratch_lists(state, queues.values(), "group_queue_entries")
 
 
 def next_group_queue_entry_list(state: Optional[BatchState]) -> list:
-    if state is None:
-        return []
-    scratch = state.scratch
-    if scratch.group_queue_entry_count >= len(scratch.group_queue_entries):
-        return []
-    out = scratch.group_queue_entries[scratch.group_queue_entry_count]
-    scratch.group_queue_entry_count += 1
-    out.clear()
-    return out
+    return _next_scratch_list(
+        state,
+        "group_queue_entries",
+        "group_queue_entry_count",
+    )
 
 
 def recycle_stream_order_lists(
         state: Optional[BatchState],
         orders: Dict[GroupKey, list],
 ) -> None:
-    if state is None:
-        return
-    for order in orders.values():
-        if batch_scratch_oversized(len(order), state.scratch.last_build_cap_hint):
-            continue
-        order.clear()
-        state.scratch.stream_order_entries.append(order)
+    _recycle_scratch_lists(state, orders.values(), "stream_order_entries")
 
 
 def next_stream_order_list(state: Optional[BatchState]) -> list:
-    if state is None:
-        return []
-    scratch = state.scratch
-    if scratch.stream_order_entry_count >= len(scratch.stream_order_entries):
-        return []
-    out = scratch.stream_order_entries[scratch.stream_order_entry_count]
-    scratch.stream_order_entry_count += 1
-    out.clear()
-    return out
+    return _next_scratch_list(
+        state,
+        "stream_order_entries",
+        "stream_order_entry_count",
+    )
 
 
 def queued_bytes_map(state: Optional[BatchState]) -> Dict[int, int]:
@@ -777,41 +770,55 @@ def bypass_selections_map(state: Optional[BatchState], cap_hint: int) -> Dict[in
     return _scratch_map(state, "bypass_selections", cap_hint)
 
 
-def active_stream_list(state: Optional[BatchState], bulk: bool, cap_hint: int) -> list:
+def _bulk_scratch_list(
+        state: Optional[BatchState],
+        bulk: bool,
+        cap_hint: int,
+        interactive_attr: str,
+        bulk_attr: str,
+) -> list:
     if state is None:
         return []
     bulk = _require_bool(bulk, "bulk")
     cap_hint = _uint64(cap_hint, "cap_hint")
-    scratch_list = (
-        state.scratch.bulk_active_streams
-        if bulk
-        else state.scratch.interactive_active_streams
-    )
+    attr = bulk_attr if bulk else interactive_attr
+    scratch_list = getattr(state.scratch, attr)
     if batch_scratch_oversized(len(scratch_list), cap_hint):
         scratch_list = []
-        if bulk:
-            state.scratch.bulk_active_streams = scratch_list
-        else:
-            state.scratch.interactive_active_streams = scratch_list
+        setattr(state.scratch, attr, scratch_list)
     scratch_list.clear()
     return scratch_list
 
 
-def group_candidate_list(state: Optional[BatchState], bulk: bool, cap_hint: int) -> list:
-    if state is None:
-        return []
-    bulk = _require_bool(bulk, "bulk")
-    cap_hint = _uint64(cap_hint, "cap_hint")
-    scratch_list = (
-        state.scratch.bulk_candidates if bulk else state.scratch.interactive_candidates
+def active_stream_list(state: Optional[BatchState], bulk: bool, cap_hint: int) -> list:
+    return _bulk_scratch_list(
+        state,
+        bulk,
+        cap_hint,
+        "interactive_active_streams",
+        "bulk_active_streams",
     )
-    if batch_scratch_oversized(len(scratch_list), cap_hint):
+
+
+def group_candidate_list(state: Optional[BatchState], bulk: bool, cap_hint: int) -> list:
+    return _bulk_scratch_list(
+        state,
+        bulk,
+        cap_hint,
+        "interactive_candidates",
+        "bulk_candidates",
+    )
+
+
+def _bool_scratch_list(state: Optional[BatchState], n: int, attr: str) -> list:
+    if state is None:
+        return [False] * _uint64(n, "n")
+    n = _uint64(n, "n")
+    scratch_list = getattr(state.scratch, attr)
+    if batch_scratch_oversized(len(scratch_list), n):
         scratch_list = []
-        if bulk:
-            state.scratch.bulk_candidates = scratch_list
-        else:
-            state.scratch.interactive_candidates = scratch_list
-    scratch_list.clear()
+        setattr(state.scratch, attr, scratch_list)
+    scratch_list[:] = [False] * n
     return scratch_list
 
 
@@ -862,23 +869,11 @@ def ordered_list(state: Optional[BatchState], cap_hint: int) -> list:
 
 
 def selected_list(state: Optional[BatchState], n: int) -> list:
-    if state is None:
-        return [False] * _uint64(n, "n")
-    n = _uint64(n, "n")
-    if batch_scratch_oversized(len(state.scratch.selected), n):
-        state.scratch.selected = []
-    state.scratch.selected[:] = [False] * n
-    return state.scratch.selected
+    return _bool_scratch_list(state, n, "selected")
 
 
 def recorded_group_head_list(state: Optional[BatchState], n: int) -> list:
-    if state is None:
-        return [False] * _uint64(n, "n")
-    n = _uint64(n, "n")
-    if batch_scratch_oversized(len(state.scratch.recorded_group_head), n):
-        state.scratch.recorded_group_head = []
-    state.scratch.recorded_group_head[:] = [False] * n
-    return state.scratch.recorded_group_head
+    return _bool_scratch_list(state, n, "recorded_group_head")
 
 
 def service_tag(cost: int, weight: int) -> int:
@@ -1051,23 +1046,35 @@ def better_class_candidate(
     assert left is not None and right is not None
     if left.eligible != right.eligible:
         return left.eligible
-    if left.eligible:
-        left_primary = scaled_class_tag(left, hint, left.group_finish)
-        right_primary = scaled_class_tag(right, hint, right.group_finish)
-    else:
-        left_primary = scaled_class_tag(left, hint, left.group_start)
-        right_primary = scaled_class_tag(right, hint, right.group_start)
+    left_primary, right_primary = _scaled_candidate_tag_pair(
+        left,
+        right,
+        hint,
+        prefer_finish=left.eligible,
+    )
     if left_primary != right_primary:
         return left_primary < right_primary
-    if left.eligible:
-        left_secondary = scaled_class_tag(left, hint, left.group_start)
-        right_secondary = scaled_class_tag(right, hint, right.group_start)
-    else:
-        left_secondary = scaled_class_tag(left, hint, left.group_finish)
-        right_secondary = scaled_class_tag(right, hint, right.group_finish)
+    left_secondary, right_secondary = _scaled_candidate_tag_pair(
+        left,
+        right,
+        hint,
+        prefer_finish=not left.eligible,
+    )
     if left_secondary != right_secondary:
         return left_secondary < right_secondary
     return better_group_candidate(prefs, left, right)
+
+
+def _scaled_candidate_tag_pair(
+        left: WFQGroupCandidate,
+        right: WFQGroupCandidate,
+        hint: SchedulerHint,
+        *,
+        prefer_finish: bool,
+) -> tuple[int, int]:
+    left_tag = left.group_finish if prefer_finish else left.group_start
+    right_tag = right.group_finish if prefer_finish else right.group_start
+    return scaled_class_tag(left, hint, left_tag), scaled_class_tag(right, hint, right_tag)
 
 
 def scaled_class_tag(
@@ -1990,14 +1997,64 @@ def transient_batch_state(state: Optional[BatchState], cap_hint: int = 0) -> Bat
     )
 
 
+def _group_retained_value(
+        group_key: GroupKey,
+        transient_values: Dict[GroupKey, int],
+        state_values: Dict[GroupKey, int],
+) -> int:
+    if is_transient_group_key(group_key):
+        return transient_values.get(group_key, 0)
+    return state_values.get(group_key, 0)
+
+
+def _set_group_retained_value(
+        group_key: GroupKey,
+        value: int,
+        transient_values: Dict[GroupKey, int],
+        state_values: Dict[GroupKey, int],
+) -> None:
+    value = _uint64(value, "value")
+    if is_transient_group_key(group_key):
+        transient_values[group_key] = value
+    else:
+        state_values[group_key] = value
+
+
+def _stream_retained_value(
+        stream_id: int,
+        transient_values: Dict[int, int],
+        state_values: Dict[int, int],
+) -> int:
+    stream_id = _uint64(stream_id, "stream_id")
+    if is_synthetic_stream_key(stream_id):
+        return transient_values.get(stream_id, 0)
+    return state_values.get(stream_id, 0)
+
+
+def _set_stream_retained_value(
+        stream_id: int,
+        value: int,
+        transient_values: Dict[int, int],
+        state_values: Dict[int, int],
+) -> None:
+    stream_id = _uint64(stream_id, "stream_id")
+    value = _uint64(value, "value")
+    if is_synthetic_stream_key(stream_id):
+        transient_values[stream_id] = value
+    else:
+        state_values[stream_id] = value
+
+
 def group_virtual_time(
         state: BatchState,
         transient: BatchTransientState,
         group_key: GroupKey,
 ) -> int:
-    if is_transient_group_key(group_key):
-        return transient.group_virtual.get(group_key, 0)
-    return state.group_virtual_time.get(group_key, 0)
+    return _group_retained_value(
+        group_key,
+        transient.group_virtual,
+        state.group_virtual_time,
+    )
 
 
 def set_group_virtual_time(
@@ -2006,11 +2063,12 @@ def set_group_virtual_time(
         group_key: GroupKey,
         value: int,
 ) -> None:
-    value = _uint64(value, "value")
-    if is_transient_group_key(group_key):
-        transient.group_virtual[group_key] = value
-    else:
-        state.group_virtual_time[group_key] = value
+    _set_group_retained_value(
+        group_key,
+        value,
+        transient.group_virtual,
+        state.group_virtual_time,
+    )
 
 
 def group_finish_tag(
@@ -2018,9 +2076,11 @@ def group_finish_tag(
         transient: BatchTransientState,
         group_key: GroupKey,
 ) -> int:
-    if is_transient_group_key(group_key):
-        return transient.group_finish.get(group_key, 0)
-    return state.group_finish_tag.get(group_key, 0)
+    return _group_retained_value(
+        group_key,
+        transient.group_finish,
+        state.group_finish_tag,
+    )
 
 
 def set_group_finish_tag(
@@ -2029,11 +2089,12 @@ def set_group_finish_tag(
         group_key: GroupKey,
         value: int,
 ) -> None:
-    value = _uint64(value, "value")
-    if is_transient_group_key(group_key):
-        transient.group_finish[group_key] = value
-    else:
-        state.group_finish_tag[group_key] = value
+    _set_group_retained_value(
+        group_key,
+        value,
+        transient.group_finish,
+        state.group_finish_tag,
+    )
 
 
 def group_last_served(
@@ -2041,9 +2102,11 @@ def group_last_served(
         transient: BatchTransientState,
         group_key: GroupKey,
 ) -> int:
-    if is_transient_group_key(group_key):
-        return transient.group_last_served.get(group_key, 0)
-    return state.group_last_service.get(group_key, 0)
+    return _group_retained_value(
+        group_key,
+        transient.group_last_served,
+        state.group_last_service,
+    )
 
 
 def set_group_last_served(
@@ -2052,11 +2115,12 @@ def set_group_last_served(
         group_key: GroupKey,
         value: int,
 ) -> None:
-    value = _uint64(value, "value")
-    if is_transient_group_key(group_key):
-        transient.group_last_served[group_key] = value
-    else:
-        state.group_last_service[group_key] = value
+    _set_group_retained_value(
+        group_key,
+        value,
+        transient.group_last_served,
+        state.group_last_service,
+    )
 
 
 def stream_finish_tag(
@@ -2064,10 +2128,11 @@ def stream_finish_tag(
         transient: BatchTransientState,
         stream_id: int,
 ) -> int:
-    stream_id = _uint64(stream_id, "stream_id")
-    if is_synthetic_stream_key(stream_id):
-        return transient.stream_finish.get(stream_id, 0)
-    return state.stream_finish_tag.get(stream_id, 0)
+    return _stream_retained_value(
+        stream_id,
+        transient.stream_finish,
+        state.stream_finish_tag,
+    )
 
 
 def set_stream_finish_tag(
@@ -2076,12 +2141,12 @@ def set_stream_finish_tag(
         stream_id: int,
         value: int,
 ) -> None:
-    stream_id = _uint64(stream_id, "stream_id")
-    value = _uint64(value, "value")
-    if is_synthetic_stream_key(stream_id):
-        transient.stream_finish[stream_id] = value
-    else:
-        state.stream_finish_tag[stream_id] = value
+    _set_stream_retained_value(
+        stream_id,
+        value,
+        transient.stream_finish,
+        state.stream_finish_tag,
+    )
 
 
 def stream_last_served(
@@ -2089,10 +2154,11 @@ def stream_last_served(
         transient: BatchTransientState,
         stream_id: int,
 ) -> int:
-    stream_id = _uint64(stream_id, "stream_id")
-    if is_synthetic_stream_key(stream_id):
-        return transient.stream_last_served.get(stream_id, 0)
-    return state.stream_last_service.get(stream_id, 0)
+    return _stream_retained_value(
+        stream_id,
+        transient.stream_last_served,
+        state.stream_last_service,
+    )
 
 
 def set_stream_last_served(
@@ -2101,12 +2167,12 @@ def set_stream_last_served(
         stream_id: int,
         value: int,
 ) -> None:
-    stream_id = _uint64(stream_id, "stream_id")
-    value = _uint64(value, "value")
-    if is_synthetic_stream_key(stream_id):
-        transient.stream_last_served[stream_id] = value
-    else:
-        state.stream_last_service[stream_id] = value
+    _set_stream_retained_value(
+        stream_id,
+        value,
+        transient.stream_last_served,
+        state.stream_last_service,
+    )
 
 
 def commit_wfq_selection(
@@ -2400,7 +2466,7 @@ def order_batch_indices(
 def _urgent_item_key(item: BatchItem, index: int) -> tuple[int, int, int, int]:
     req = item.request
     scoped = 0 if req.stream_scoped else 1
-    return (req.urgency_rank, scoped, req.stream_id if req.stream_scoped else 0, index)
+    return req.urgency_rank, scoped, req.stream_id if req.stream_scoped else 0, index
 
 
 def _urgent_item_precedes(
