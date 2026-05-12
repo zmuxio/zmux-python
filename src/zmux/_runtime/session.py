@@ -136,7 +136,7 @@ from ..payload import StreamMetadata, build_error_payload
 from ..preface import Negotiated, Preface
 from ..protocol import ErrorCode, FrameType, MAX_VARINT62, Role
 
-T = TypeVar("T")
+QueueT = TypeVar("QueueT")
 
 MAX_UINT64 = (1 << 64) - 1
 
@@ -377,8 +377,8 @@ def retained_bucket_stats(count: int, unit: int) -> tuple[int, int]:
     count = _nonnegative_int(count, "count")
     unit = _nonnegative_int(unit, "unit")
     if count == 0 or unit == 0:
-        return (0, 0)
-    return (count, saturating_mul(count, unit))
+        return 0, 0
+    return count, saturating_mul(count, unit)
 
 
 def truncate_string_to_bytes(value: str, limit: int) -> str:
@@ -1205,10 +1205,12 @@ class SessionRuntimeState:
             ),
         )
 
-    def provisional_count(self) -> int:
+    @staticmethod
+    def provisional_count() -> int:
         return 0
 
-    def accept_backlog_count(self) -> int:
+    @staticmethod
+    def accept_backlog_count() -> int:
         return 0
 
     def note_reset_reason(self, code: int) -> None:
@@ -1375,8 +1377,9 @@ class SessionRuntimeState:
                 ),
                 aggregate_late_data_bytes=self.ingress.aggregate_late_data,
                 aggregate_late_data_at_cap=(
-                        self.ingress.aggregate_late_data_cap > 0
-                        and self.ingress.aggregate_late_data >= self.ingress.aggregate_late_data_cap
+                        0
+                        < self.ingress.aggregate_late_data_cap
+                        <= self.ingress.aggregate_late_data
                 ),
                 retained_state_bytes=retained_breakdown.total_bytes,
                 retained_buckets=retained_buckets,
@@ -1520,11 +1523,11 @@ class SessionRuntimeState:
 
 
 @dataclass
-class SparseQueue(Generic[T]):
+class SparseQueue(Generic[QueueT]):
     """List-backed sparse queue with Go-compatible head/count compaction."""
 
     compact_min_head: int = PROVISIONAL_QUEUE_COMPACT_MIN_HEAD
-    items: List[Optional[T]] = field(default_factory=list)
+    items: List[Optional[QueueT]] = field(default_factory=list)
     head: int = 0
     count: int = 0
     init: bool = True
@@ -1538,7 +1541,7 @@ class SparseQueue(Generic[T]):
     def __len__(self) -> int:
         return self.count
 
-    def append(self, item: T) -> int:
+    def append(self, item: QueueT) -> int:
         idx = len(self.items)
         self.items.append(item)
         self.count += 1
@@ -1547,7 +1550,7 @@ class SparseQueue(Generic[T]):
         self.init = True
         return idx
 
-    def head_item(self) -> Optional[T]:
+    def head_item(self) -> Optional[QueueT]:
         if self.count == 0:
             return None
         self.head = self._advance_head(self.head)
@@ -1555,7 +1558,7 @@ class SparseQueue(Generic[T]):
             return None
         return self.items[self.head]
 
-    def tail_item(self) -> Optional[T]:
+    def tail_item(self) -> Optional[QueueT]:
         if self.count == 0:
             return None
         for idx in range(len(self.items) - 1, self.head - 1, -1):
@@ -1564,7 +1567,7 @@ class SparseQueue(Generic[T]):
                 return item
         return None
 
-    def remove_index(self, idx: int) -> Optional[T]:
+    def remove_index(self, idx: int) -> Optional[QueueT]:
         if idx < 0 or idx >= len(self.items) or self.count == 0:
             return None
         item = self.items[idx]
@@ -1578,7 +1581,7 @@ class SparseQueue(Generic[T]):
             self.head = self._advance_head(self.head)
         return item
 
-    def pop_head(self) -> Optional[T]:
+    def pop_head(self) -> Optional[QueueT]:
         item = self.head_item()
         if item is None:
             return None
@@ -1586,7 +1589,7 @@ class SparseQueue(Generic[T]):
         self.maybe_compact()
         return item
 
-    def pop_tail(self) -> Optional[T]:
+    def pop_tail(self) -> Optional[QueueT]:
         if self.count == 0:
             return None
         for idx in range(len(self.items) - 1, self.head - 1, -1):
@@ -1597,7 +1600,7 @@ class SparseQueue(Generic[T]):
                 return item
         return None
 
-    def clear(self, visit: Optional[Callable[[T], None]] = None) -> None:
+    def clear(self, visit: Optional[Callable[[QueueT], None]] = None) -> None:
         if visit is not None:
             for item in self.items:
                 if item is not None:
@@ -1653,30 +1656,30 @@ class QueueItem:
 
 
 @dataclass
-class IndexedQueue(Generic[T]):
-    state: SparseQueue[T]
-    get_index: Callable[[T], int]
-    set_index: Callable[[T, int], None]
+class IndexedQueue(Generic[QueueT]):
+    state: SparseQueue[QueueT]
+    get_index: Callable[[QueueT], int]
+    set_index: Callable[[QueueT, int], None]
 
-    def append(self, item: T) -> None:
+    def append(self, item: QueueT) -> None:
         current = self.get_index(item)
         if self.holds(item, current):
             return
         idx = self.state.append(item)
         self.set_index(item, idx)
 
-    def head_item(self) -> Optional[T]:
+    def head_item(self) -> Optional[QueueT]:
         return self.state.head_item()
 
-    def tail_item(self) -> Optional[T]:
+    def tail_item(self) -> Optional[QueueT]:
         return self.state.tail_item()
 
-    def holds(self, item: T, current_index: int) -> bool:
+    def holds(self, item: QueueT, current_index: int) -> bool:
         if current_index < 0 or current_index >= len(self.state.items):
             return False
         return self.state.items[current_index] is item
 
-    def remove(self, item: T) -> bool:
+    def remove(self, item: QueueT) -> bool:
         idx = self.get_index(item)
         if not self.holds(item, idx):
             idx = -1
@@ -1692,8 +1695,8 @@ class IndexedQueue(Generic[T]):
         self.state.maybe_compact()
         return removed is not None
 
-    def clear(self, visit: Optional[Callable[[T], None]] = None) -> None:
-        def clear_index(item: T) -> None:
+    def clear(self, visit: Optional[Callable[[QueueT], None]] = None) -> None:
+        def clear_index(item: QueueT) -> None:
             self.set_index(item, -1)
             if visit is not None:
                 visit(item)

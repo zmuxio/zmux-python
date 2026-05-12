@@ -19,9 +19,7 @@ from typing import (
     Optional,
     Protocol,
     Sequence,
-    TypeAlias,
     Tuple,
-    Union,
     runtime_checkable,
 )
 
@@ -46,7 +44,7 @@ MAX_RETAINED_IO_BUFFER = 64 * 1024
 _MIN_SOCKET_TIMEOUT = 1e-6
 _UNSET = object()
 
-Address: TypeAlias = object
+Address = object
 
 
 @dataclass(frozen=True)
@@ -130,10 +128,10 @@ class ReadHalf(SyncByteReceiveStream, Protocol):
     def set_read_deadline(self, deadline: Deadline) -> None:
         """Set an implementation-defined absolute read deadline."""
 
-    def local_addr(self) -> Optional[Address]:
+    def local_addr(self) -> Optional[object]:
         """Return the local endpoint address."""
 
-    def remote_addr(self) -> Optional[Address]:
+    def remote_addr(self) -> Optional[object]:
         """Return the peer endpoint address."""
 
 
@@ -147,10 +145,10 @@ class WriteHalf(SyncByteSendStream, Protocol):
     def set_write_deadline(self, deadline: Deadline) -> None:
         """Set an implementation-defined absolute write deadline."""
 
-    def local_addr(self) -> Optional[Address]:
+    def local_addr(self) -> Optional[object]:
         """Return the local endpoint address."""
 
-    def remote_addr(self) -> Optional[Address]:
+    def remote_addr(self) -> Optional[object]:
         """Return the peer endpoint address."""
 
 
@@ -204,8 +202,8 @@ class BasicDuplexTransport:
             writer: object,
             *,
             closer: Optional[object] = None,
-            local_addr: Optional[Address] = None,
-            remote_addr: Optional[Address] = None,
+            local_addr: Optional[object] = None,
+            remote_addr: Optional[object] = None,
             gathering_writer: Optional[object] = None,
             control: Optional[DuplexTransportControl] = None,
     ) -> None:
@@ -312,13 +310,13 @@ class BasicDuplexTransport:
     def set_write_timeout(self, timeout: Optional[float]) -> None:
         self.set_write_deadline(deadline_after(timeout))
 
-    def local_addr(self) -> Optional[Address]:
+    def local_addr(self) -> Optional[object]:
         if self._local_addr is not None:
             return self._local_addr
         addr = _local_addr(self._reader)
         return addr if addr is not None else _local_addr(self._writer)
 
-    def remote_addr(self) -> Optional[Address]:
+    def remote_addr(self) -> Optional[object]:
         if self._remote_addr is not None:
             return self._remote_addr
         addr = _remote_addr(self._reader)
@@ -433,13 +431,13 @@ class SocketTransport:
     def set_write_timeout(self, timeout: Optional[float]) -> None:
         self.set_write_deadline(deadline_after(timeout))
 
-    def local_addr(self) -> Optional[Address]:
+    def local_addr(self) -> Optional[object]:
         try:
             return self._sock.getsockname()
         except OSError:
             return None
 
-    def remote_addr(self) -> Optional[Address]:
+    def remote_addr(self) -> Optional[object]:
         try:
             return self._sock.getpeername()
         except OSError:
@@ -457,8 +455,8 @@ class SocketTransport:
     def _set_deadline(
             self,
             *,
-            read: Union[Deadline, object] = _UNSET,
-            write: Union[Deadline, object] = _UNSET,
+            read: object = _UNSET,
+            write: object = _UNSET,
     ) -> None:
         with self._lock:
             if self._closed:
@@ -507,8 +505,8 @@ class JoinedTransport:
             read_half: Optional[object],
             write_half: Optional[object],
             *,
-            local_addr: Optional[Address] = None,
-            remote_addr: Optional[Address] = None,
+            local_addr: Optional[object] = None,
+            remote_addr: Optional[object] = None,
     ) -> None:
         self._condition = threading.Condition(threading.RLock())
         self._read_half = read_half
@@ -532,14 +530,18 @@ class JoinedTransport:
     def read_half(self) -> Optional[object]:
         with self._condition:
             if self._closed or self._read_paused:
-                return None
-            return self._read_half
+                read_half = None
+            else:
+                read_half = self._read_half
+        return read_half
 
     def write_half(self) -> Optional[object]:
         with self._condition:
             if self._closed or self._write_paused:
-                return None
-            return self._write_half
+                write_half = None
+            else:
+                write_half = self._write_half
+        return write_half
 
     def read(self, max_bytes: int = DEFAULT_READ_CHUNK) -> bytes:
         max_bytes = _check_max_bytes(max_bytes)
@@ -659,71 +661,17 @@ class JoinedTransport:
         self.set_write_deadline(deadline_after(timeout))
 
     def set_read_deadline(self, deadline: Deadline) -> None:
-        deadline = _validate_deadline(deadline)
-        with self._condition:
-            if self._closed:
-                raise SessionClosed()
-            previous_deadline = self._read_deadline
-            self._read_deadline = deadline
-            self._read_deadline_gen = _next_generation(self._read_deadline_gen)
-            generation = self._read_deadline_gen
-            read_half = self._read_half
-            if read_half is not None:
-                self._active_read_deadline_ops += 1
-            self._condition.notify_all()
-
-        if read_half is None:
-            return
-        failed = False
-        try:
-            _set_read_deadline(read_half, deadline)
-        except BaseException:
-            failed = True
-            raise
-        finally:
-            with self._condition:
-                if self._active_read_deadline_ops > 0:
-                    self._active_read_deadline_ops -= 1
-                if failed and self._read_deadline_gen == generation:
-                    self._read_deadline = previous_deadline
-                    self._read_deadline_gen = _next_generation(self._read_deadline_gen)
-                self._condition.notify_all()
+        self._set_half_deadline(deadline, read_side=True)
 
     def set_write_deadline(self, deadline: Deadline) -> None:
-        deadline = _validate_deadline(deadline)
-        with self._condition:
-            if self._closed:
-                raise SessionClosed()
-            previous_deadline = self._write_deadline
-            self._write_deadline = deadline
-            self._write_deadline_gen = _next_generation(self._write_deadline_gen)
-            generation = self._write_deadline_gen
-            write_half = self._write_half
-            if write_half is not None:
-                self._active_write_deadline_ops += 1
-            self._condition.notify_all()
+        self._set_half_deadline(deadline, read_side=False)
 
-        if write_half is None:
-            return
-        failed = False
-        try:
-            _set_write_deadline(write_half, deadline)
-        except BaseException:
-            failed = True
-            raise
-        finally:
-            with self._condition:
-                if self._active_write_deadline_ops > 0:
-                    self._active_write_deadline_ops -= 1
-                if failed and self._write_deadline_gen == generation:
-                    self._write_deadline = previous_deadline
-                    self._write_deadline_gen = _next_generation(self._write_deadline_gen)
-                self._condition.notify_all()
-
-    def supports_read_deadline(self) -> bool:
+    @staticmethod
+    def supports_read_deadline() -> bool:
         return True
 
-    def supports_write_deadline(self) -> bool:
+    @staticmethod
+    def supports_write_deadline() -> bool:
         return True
 
     def pause_read(self, timeout: Optional[float] = None) -> "PausedReadHalf":
@@ -752,6 +700,7 @@ class JoinedTransport:
                             self._read_paused = False
                             self._condition.notify_all()
                         raise
+        raise RuntimeError("unreachable")
 
     def pause_write(self, timeout: Optional[float] = None) -> "PausedWriteHalf":
         deadline = deadline_after(timeout)
@@ -779,8 +728,9 @@ class JoinedTransport:
                             self._write_paused = False
                             self._condition.notify_all()
                         raise
+        raise RuntimeError("unreachable")
 
-    def local_addr(self) -> Address:
+    def local_addr(self) -> object:
         with self._condition:
             read_half = self._read_half
             write_half = self._write_half
@@ -793,7 +743,7 @@ class JoinedTransport:
             return addr
         return fallback if fallback is not None else ZmuxSocketAddress.local_pending()
 
-    def remote_addr(self) -> Address:
+    def remote_addr(self) -> object:
         with self._condition:
             read_half = self._read_half
             write_half = self._write_half
@@ -822,6 +772,7 @@ class JoinedTransport:
                     self._active_read_ops += 1
                     return read_half
                 self._wait_for_read_resume()
+        raise RuntimeError("unreachable")
 
     def _leave_read(self) -> None:
         with self._condition:
@@ -839,6 +790,60 @@ class JoinedTransport:
                     self._active_write_ops += 1
                     return write_half
                 self._wait_for_write_resume()
+        raise RuntimeError("unreachable")
+
+    def _set_half_deadline(self, deadline: Deadline, *, read_side: bool) -> None:
+        deadline = _validate_deadline(deadline)
+        with self._condition:
+            if self._closed:
+                raise SessionClosed()
+            if read_side:
+                previous_deadline = self._read_deadline
+                self._read_deadline = deadline
+                self._read_deadline_gen = _next_generation(self._read_deadline_gen)
+                generation = self._read_deadline_gen
+                half = self._read_half
+                if half is not None:
+                    self._active_read_deadline_ops += 1
+            else:
+                previous_deadline = self._write_deadline
+                self._write_deadline = deadline
+                self._write_deadline_gen = _next_generation(self._write_deadline_gen)
+                generation = self._write_deadline_gen
+                half = self._write_half
+                if half is not None:
+                    self._active_write_deadline_ops += 1
+            self._condition.notify_all()
+
+        if half is None:
+            return
+
+        failed = False
+        try:
+            if read_side:
+                _set_read_deadline(half, deadline)
+            else:
+                _set_write_deadline(half, deadline)
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            with self._condition:
+                if read_side:
+                    if self._active_read_deadline_ops > 0:
+                        self._active_read_deadline_ops -= 1
+                    if failed and self._read_deadline_gen == generation:
+                        self._read_deadline = previous_deadline
+                        self._read_deadline_gen = _next_generation(self._read_deadline_gen)
+                else:
+                    if self._active_write_deadline_ops > 0:
+                        self._active_write_deadline_ops -= 1
+                    if failed and self._write_deadline_gen == generation:
+                        self._write_deadline = previous_deadline
+                        self._write_deadline_gen = _next_generation(
+                            self._write_deadline_gen
+                        )
+                self._condition.notify_all()
 
     def _leave_write(self) -> None:
         with self._condition:
@@ -925,8 +930,8 @@ def join(
         read_half: object,
         write_half: object,
         *,
-        local_addr: Optional[Address] = None,
-        remote_addr: Optional[Address] = None,
+        local_addr: Optional[object] = None,
+        remote_addr: Optional[object] = None,
 ) -> JoinedTransport:
     """Join independent read and write halves into a full-duplex transport."""
 
@@ -949,7 +954,8 @@ class PausedReadHalf:
 
     def current(self) -> Optional[object]:
         with self._lock:
-            return self._current
+            current = self._current
+        return current
 
     def set(self, next_half: Optional[object]) -> Optional[object]:
         with self._lock:
@@ -957,7 +963,7 @@ class PausedReadHalf:
                 raise RuntimeError("paused read half already resumed")
             previous = self._current
             self._current = next_half
-            return previous
+        return previous
 
     def resume(self) -> None:
         with self._lock:
@@ -981,7 +987,8 @@ class PausedReadHalf:
     @property
     def resumed(self) -> bool:
         with self._lock:
-            return self._resumed
+            resumed = self._resumed
+        return resumed
 
 
 class PausedWriteHalf:
@@ -995,7 +1002,8 @@ class PausedWriteHalf:
 
     def current(self) -> Optional[object]:
         with self._lock:
-            return self._current
+            current = self._current
+        return current
 
     def set(self, next_half: Optional[object]) -> Optional[object]:
         with self._lock:
@@ -1003,7 +1011,7 @@ class PausedWriteHalf:
                 raise RuntimeError("paused write half already resumed")
             previous = self._current
             self._current = next_half
-            return previous
+        return previous
 
     def resume(self) -> None:
         with self._lock:
@@ -1027,7 +1035,8 @@ class PausedWriteHalf:
     @property
     def resumed(self) -> bool:
         with self._lock:
-            return self._resumed
+            resumed = self._resumed
+        return resumed
 
 
 class FileReadHalf:
@@ -1037,8 +1046,8 @@ class FileReadHalf:
             self,
             fileobj: object,
             *,
-            local_addr: Optional[Address] = None,
-            remote_addr: Optional[Address] = None,
+            local_addr: Optional[object] = None,
+            remote_addr: Optional[object] = None,
     ) -> None:
         if fileobj is None:
             raise NilConnection()
@@ -1061,10 +1070,10 @@ class FileReadHalf:
     def set_read_timeout(self, timeout: Optional[float]) -> None:
         self.set_read_deadline(deadline_after(timeout))
 
-    def local_addr(self) -> Optional[Address]:
+    def local_addr(self) -> Optional[object]:
         return self._local_addr
 
-    def remote_addr(self) -> Optional[Address]:
+    def remote_addr(self) -> Optional[object]:
         return self._remote_addr
 
     def close_identity(self) -> object:
@@ -1078,8 +1087,8 @@ class FileWriteHalf:
             self,
             fileobj: object,
             *,
-            local_addr: Optional[Address] = None,
-            remote_addr: Optional[Address] = None,
+            local_addr: Optional[object] = None,
+            remote_addr: Optional[object] = None,
     ) -> None:
         if fileobj is None:
             raise NilConnection()
@@ -1107,10 +1116,10 @@ class FileWriteHalf:
     def set_write_timeout(self, timeout: Optional[float]) -> None:
         self.set_write_deadline(deadline_after(timeout))
 
-    def local_addr(self) -> Optional[Address]:
+    def local_addr(self) -> Optional[object]:
         return self._local_addr
 
-    def remote_addr(self) -> Optional[Address]:
+    def remote_addr(self) -> Optional[object]:
         return self._remote_addr
 
     def close_identity(self) -> object:
@@ -1459,7 +1468,7 @@ def _raise_close_errors(errors: Sequence[BaseException]) -> None:
     raise combined from errors[0]
 
 
-def _local_addr(half: Optional[object]) -> Optional[Address]:
+def _local_addr(half: Optional[object]) -> Optional[object]:
     if half is None:
         return None
     for name in ("local_addr", "local_address", "getsockname"):
@@ -1475,7 +1484,7 @@ def _local_addr(half: Optional[object]) -> Optional[Address]:
     return None
 
 
-def _remote_addr(half: Optional[object]) -> Optional[Address]:
+def _remote_addr(half: Optional[object]) -> Optional[object]:
     if half is None:
         return None
     for name in ("remote_addr", "peer_addr", "remote_address", "getpeername"):

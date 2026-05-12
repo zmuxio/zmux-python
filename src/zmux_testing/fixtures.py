@@ -13,9 +13,9 @@ import threading
 import unittest
 from copy import deepcopy
 from pathlib import Path, PureWindowsPath
-from typing import Any, Dict, List, Optional, TypeAlias, Union
+from typing import Any, Dict, List, Optional, Union
 
-PathLike: TypeAlias = Union[str, os.PathLike[str]]
+PathLike = Union[str, os.PathLike]
 
 _FIXTURE_ENV = "ZMUX_FIXTURE_DIR"
 _REQUIRED_FIXTURE_FILES = ("wire_valid.ndjson", "wire_invalid.ndjson")
@@ -111,7 +111,8 @@ def _cached_fixture_dir(search_from: Optional[PathLike]) -> Optional[Path]:
     with _FIXTURE_DIR_LOCK:
         if _FIXTURE_DIR is None:
             _FIXTURE_DIR = _locate_fixture_dir(Path.cwd())
-        return _FIXTURE_DIR
+        fixture_dir = _FIXTURE_DIR
+    return fixture_dir
 
 
 def _locate_fixture_dir(search_from: Path) -> Optional[Path]:
