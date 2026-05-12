@@ -875,53 +875,51 @@ class JoinedTransport:
             )
         self._condition.wait(remaining)
 
-    def _resume_read(self, paused: "PausedReadHalf") -> None:
-        while True:
-            current = paused._current
-            with self._condition:
-                if paused._resumed:
-                    return
-                if self._closed:
-                    paused._resumed = True
-                    raise SessionClosed()
-                deadline = self._read_deadline
-                generation = self._read_deadline_gen
-            if current is not None:
-                _set_read_deadline(current, deadline)
-            with self._condition:
-                if self._closed:
-                    paused._resumed = True
-                    raise SessionClosed()
-                if current is not None and self._read_deadline_gen != generation:
-                    continue
-                self._read_half = current
-                self._read_paused = False
-                paused._resumed = True
-                self._condition.notify_all()
-                return
+    def resume_read_half(self, paused: "PausedReadHalf") -> None:
+        self._resume_paused_half(paused, read_side=True)
 
-    def _resume_write(self, paused: "PausedWriteHalf") -> None:
+    def resume_write_half(self, paused: "PausedWriteHalf") -> None:
+        self._resume_paused_half(paused, read_side=False)
+
+    def _resume_paused_half(
+            self,
+            paused: "PausedReadHalf | PausedWriteHalf",
+            *,
+            read_side: bool,
+    ) -> None:
         while True:
-            current = paused._current
+            current = paused.current()
             with self._condition:
-                if paused._resumed:
+                if paused.resumed:
                     return
                 if self._closed:
-                    paused._resumed = True
+                    paused.mark_resumed()
                     raise SessionClosed()
-                deadline = self._write_deadline
-                generation = self._write_deadline_gen
+                deadline = self._read_deadline if read_side else self._write_deadline
+                generation = (
+                    self._read_deadline_gen if read_side else self._write_deadline_gen
+                )
             if current is not None:
-                _set_write_deadline(current, deadline)
+                if read_side:
+                    _set_read_deadline(current, deadline)
+                else:
+                    _set_write_deadline(current, deadline)
             with self._condition:
                 if self._closed:
-                    paused._resumed = True
+                    paused.mark_resumed()
                     raise SessionClosed()
-                if current is not None and self._write_deadline_gen != generation:
+                current_generation = (
+                    self._read_deadline_gen if read_side else self._write_deadline_gen
+                )
+                if current is not None and current_generation != generation:
                     continue
-                self._write_half = current
-                self._write_paused = False
-                paused._resumed = True
+                if read_side:
+                    self._read_half = current
+                    self._read_paused = False
+                else:
+                    self._write_half = current
+                    self._write_paused = False
+                paused.mark_resumed()
                 self._condition.notify_all()
                 return
 
@@ -969,7 +967,7 @@ class PausedReadHalf:
         with self._lock:
             if self._resumed:
                 return
-            self._owner._resume_read(self)
+            self._owner.resume_read_half(self)
             self._current = None
 
     def __enter__(self) -> "PausedReadHalf":
@@ -989,6 +987,10 @@ class PausedReadHalf:
         with self._lock:
             resumed = self._resumed
         return resumed
+
+    def mark_resumed(self) -> None:
+        with self._lock:
+            self._resumed = True
 
 
 class PausedWriteHalf:
@@ -1017,7 +1019,7 @@ class PausedWriteHalf:
         with self._lock:
             if self._resumed:
                 return
-            self._owner._resume_write(self)
+            self._owner.resume_write_half(self)
             self._current = None
 
     def __enter__(self) -> "PausedWriteHalf":
@@ -1037,6 +1039,10 @@ class PausedWriteHalf:
         with self._lock:
             resumed = self._resumed
         return resumed
+
+    def mark_resumed(self) -> None:
+        with self._lock:
+            self._resumed = True
 
 
 class FileReadHalf:

@@ -2567,6 +2567,7 @@ __all__ = (
     "INTERACTIVE_BURST_LIMIT",
     "MAX_EXPLICIT_GROUPS",
     "MAX_SIGNED_INT64",
+    "MAX_UINT64",
     "SYNTHETIC_STREAM_KEY_BIT",
     "WFQ_TAG_SCALE",
     "BatchTiePrefs",

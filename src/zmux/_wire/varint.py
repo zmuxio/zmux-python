@@ -12,6 +12,7 @@ from .errors import (
     frame_size_error,
     protocol_error,
 )
+from .io import read_exact_bytes
 from ..errors import (
     ErrorDirection,
     ErrorOperation,
@@ -319,62 +320,12 @@ def validate_decoded_varint(value: int, length: int) -> Tuple[int, int]:
 
 
 def _read_exact(reader: BinaryIO, size: int) -> bytes:
-    if size <= 0:
-        return b""
-
-    chunks = None
-    remaining = size
-    while remaining:
-        try:
-            chunk = reader.read(remaining)
-        except InterruptedError:
-            continue
-        except OSError as exc:
-            raise _transport_read_error(exc) from exc
-        if chunk is None:
-            exc = BlockingIOError("non-blocking reader returned no data")
-            raise _transport_read_error(exc) from exc
-        view = _read_chunk_view(chunk)
-        chunk_len = len(view)
-        if chunk_len == 0:
-            raise _wire_error(ERR_TRUNCATED_VARINT)
-        if chunk_len > remaining:
-            exc = OSError("reader returned more bytes than requested")
-            raise _transport_read_error(exc) from exc
-        if chunk_len == remaining and chunks is None and isinstance(chunk, bytes):
-            return chunk
-        chunk_bytes = view.tobytes()
-        if chunk_len == remaining and chunks is None:
-            return chunk_bytes
-        if chunks is None:
-            chunks = [chunk_bytes]
-        else:
-            chunks.append(chunk_bytes)
-        remaining -= chunk_len
-    return b"".join(chunks or ())
-
-
-def _read_chunk_view(chunk: object) -> memoryview:
-    if isinstance(chunk, (bool, int, str)):
-        exc = OSError("reader returned non-bytes data")
-        raise _transport_read_error(exc) from exc
-    try:
-        view = memoryview(chunk)
-    except TypeError as exc:
-        error = OSError("reader returned non-bytes data")
-        raise _transport_read_error(error) from exc
-    if (
-            view.ndim == 1
-            and view.itemsize == 1
-            and view.format in ("B", "b", "c")
-            and view.contiguous
-    ):
-        return view
-    try:
-        return view.cast("B")
-    except (TypeError, ValueError) as exc:
-        error = OSError("reader returned non-byte data")
-        raise _transport_read_error(error) from exc
+    return read_exact_bytes(
+        reader,
+        size,
+        lambda: _wire_error(ERR_TRUNCATED_VARINT),
+        _transport_read_error,
+    )
 
 
 def _require_int(value: int, name: str) -> int:
