@@ -13,7 +13,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import BinaryIO, Callable, Deque, Optional, TypeAlias
+from typing import BinaryIO, Callable, Deque, Optional
 
 from .flow import (
     aggregate_late_data_cap,
@@ -117,9 +117,9 @@ MIN_INBOUND_EXT_BYTE_BUDGET = 256 << 10
 MAX_PENDING_READ_LOOP_PROTOCOL_JOBS = 256
 MAX_REUSABLE_PENDING_READ_LOOP_PROTOCOL_JOBS_CAP = 1024
 _DEFAULT_SETTINGS = default_settings()
-ProtocolAction: TypeAlias = Callable[[], object]
-FrameCallback: TypeAlias = Callable[[Frame], object]
-PongPayloadFactory: TypeAlias = Callable[[bytes], bytes]
+ProtocolAction = Callable[[], object]
+FrameCallback = Callable[[Frame], object]
+PongPayloadFactory = Callable[[bytes], bytes]
 
 
 class ParsedFrameKind(str, Enum):
@@ -819,7 +819,7 @@ class ProtocolTask:
         return frame_type is FrameType.PONG or frame_type is FrameType.ABORT
 
 
-ProtocolTaskCallback: TypeAlias = Callable[[ProtocolTask], object]
+ProtocolTaskCallback = Callable[[ProtocolTask], object]
 
 
 @dataclass(frozen=True)
@@ -878,8 +878,8 @@ class ReadLoopProtocolQueue:
     def drain(
             self,
             *,
-            queue_frame: FrameCallback | None = None,
-            close_write: ProtocolTaskCallback | None = None,
+            queue_frame: Optional[FrameCallback] = None,
+            close_write: Optional[ProtocolTaskCallback] = None,
             max_tasks: Optional[int] = None,
     ) -> int:
         executed = 0
@@ -918,7 +918,7 @@ class ReadLoopFrameDispatcher:
             peer_go_away_uni: Optional[int] = None,
             budgets: Optional[InboundBudgetTracker] = None,
             protocol_queue: Optional[ReadLoopProtocolQueue] = None,
-            pong_payload: PongPayloadFactory | None = None,
+            pong_payload: Optional[PongPayloadFactory] = None,
     ) -> None:
         self.limits = limits
         self.capabilities = _nonnegative_int(capabilities, "capabilities")
