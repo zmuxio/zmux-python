@@ -437,6 +437,25 @@ class AioquicSession:
     def negotiated() -> Negotiated:
         return _empty_negotiated()
 
+    @property
+    def connection(self) -> object:
+        return self._connection
+
+    def finish_stream(self, kind: "_ActiveKind") -> None:
+        self._finish_stream(kind)
+
+    def note_sent(self, size: int) -> None:
+        self._note_sent(size)
+
+    def note_received(self, size: int) -> None:
+        self._note_received(size)
+
+    def note_reset(self, code: int) -> None:
+        self._note_reset(code)
+
+    def note_abort(self, code: int) -> None:
+        self._note_abort(code)
+
     async def _create_stream(
             self, bidirectional: bool, timeout: Optional[float]
     ) -> Tuple[Optional[object], object]:

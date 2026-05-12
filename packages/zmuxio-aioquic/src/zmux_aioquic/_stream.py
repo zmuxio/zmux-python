@@ -201,7 +201,7 @@ class _StreamBase:
                 cancel_write = True
         if cancel_read:
             await _cancel_read(
-                self._session._connection,
+                self._session.connection,
                 self._reader,
                 self._writer,
                 self._stream_id,
@@ -209,10 +209,10 @@ class _StreamBase:
             )
         if cancel_write:
             await _cancel_write(
-                self._session._connection, self._writer, self._stream_id, code
+                self._session.connection, self._writer, self._stream_id, code
             )
         if cancel_read or cancel_write:
-            self._session._note_abort(code)
+            self._session.note_abort(code)
         self._maybe_finish_active()
 
     @property
@@ -248,7 +248,7 @@ class _StreamBase:
             )
             self._maybe_finish_active()
         else:
-            self._session._note_received(len(data))
+            self._session.note_received(len(data))
         return data
 
     async def readinto(
@@ -296,7 +296,7 @@ class _StreamBase:
                 self._read_error = error
                 raise error
             chunks.extend(chunk)
-        self._session._note_received(len(chunks))
+        self._session.note_received(len(chunks))
         return bytes(chunks)
 
     async def close_read(self) -> None:
@@ -313,7 +313,7 @@ class _StreamBase:
             self._read_closed = True
             self._read_error = ApplicationError(code)
         await _cancel_read(
-            self._session._connection,
+            self._session.connection,
             self._reader,
             self._writer,
             self._stream_id,
@@ -341,7 +341,7 @@ class _StreamBase:
         await self._ensure_open_prelude(timeout=self._remaining_write_timeout(start, timeout))
         self._require_writable()
         await self._write_view(view, timeout=_remaining_timeout(start, timeout))
-        self._session._note_sent(len(view))
+        self._session.note_sent(len(view))
         return len(view)
 
     async def write_all(
@@ -377,7 +377,7 @@ class _StreamBase:
             await self._write_bytes(payload, timeout=_remaining_timeout(start, timeout))
         else:
             await self._write_views(views, timeout=_remaining_timeout(start, timeout))
-        self._session._note_sent(total)
+        self._session.note_sent(total)
         return total
 
     async def write_final(
@@ -401,7 +401,7 @@ class _StreamBase:
         if view:
             await self._write_view(view, timeout=_remaining_timeout(start, timeout))
             written = len(view)
-            self._session._note_sent(written)
+            self._session.note_sent(written)
         await self._close_write_unlocked(start, timeout)
         return written
 
@@ -433,7 +433,7 @@ class _StreamBase:
         else:
             await self._write_views(views, timeout=_remaining_timeout(start, timeout))
         if total:
-            self._session._note_sent(total)
+            self._session.note_sent(total)
         await self._close_write_unlocked(start, timeout)
         return total
 
@@ -482,8 +482,8 @@ class _StreamBase:
                 raise self._write_error or WriteClosed()
             self._write_closed = True
             self._write_error = ApplicationError(code)
-        await _cancel_write(self._session._connection, self._writer, self._stream_id, code)
-        self._session._note_reset(code)
+        await _cancel_write(self._session.connection, self._writer, self._stream_id, code)
+        self._session.note_reset(code)
         self._maybe_finish_active()
 
     async def update_metadata(self, update: MetadataUpdate) -> None:
@@ -636,7 +636,7 @@ class _StreamBase:
                 self._writer is None or self._write_closed
         ):
             self._active_finished = True
-            self._session._finish_stream(self._active_kind)
+            self._session.finish_stream(self._active_kind)
 
 
 class AioquicStream(_StreamBase):
