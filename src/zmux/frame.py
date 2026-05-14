@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import BinaryIO
+from typing import BinaryIO, Optional, Tuple
 
 from .config import Limits
 from .errors import ErrorDirection, ErrorOperation, ErrorScope, TransportError
@@ -70,7 +70,7 @@ class Frame:
 
         append_frame(dst, self)
 
-    def validate(self, limits: Limits | None = None, inbound: bool = False) -> None:
+    def validate(self, limits: Optional[Limits] = None, inbound: bool = False) -> None:
         """Validate this frame envelope and payload."""
 
         from ._wire.frame import validate_frame
@@ -78,7 +78,7 @@ class Frame:
         validate_frame(self, limits, inbound)
 
     @classmethod
-    def parse(cls, src: bytes, limits: Limits | None = None) -> tuple["Frame", int]:
+    def parse(cls, src: bytes, limits: Optional[Limits] = None) -> Tuple["Frame", int]:
         """Parse and copy one frame from ``src``."""
 
         from ._wire.frame import parse_frame
@@ -132,7 +132,7 @@ class FrameView:
         body_len = frame_length_for_payload(varint_len(self.stream_id), len(self.payload))
         return varint_len(body_len) + body_len
 
-    def validate(self, limits: Limits | None = None, inbound: bool = False) -> None:
+    def validate(self, limits: Optional[Limits] = None, inbound: bool = False) -> None:
         """Validate this borrowed frame."""
 
         from ._wire.frame import validate_frame_view
@@ -140,7 +140,7 @@ class FrameView:
         validate_frame_view(self, limits, inbound)
 
 
-def parse_frame(src: bytes, limits: Limits | None = None) -> tuple[Frame, int]:
+def parse_frame(src: bytes, limits: Optional[Limits] = None) -> Tuple[Frame, int]:
     """Parse and copy one complete frame from ``src``."""
 
     from ._wire.frame import parse_frame as _parse_frame
@@ -149,8 +149,8 @@ def parse_frame(src: bytes, limits: Limits | None = None) -> tuple[Frame, int]:
 
 
 def parse_frame_view(
-        src: bytes, limits: Limits | None = None
-) -> tuple[FrameView, int]:
+        src: bytes, limits: Optional[Limits] = None
+) -> Tuple[FrameView, int]:
     """Parse one frame and borrow its payload."""
 
     from ._wire.frame import parse_frame_view as _parse_frame_view
@@ -158,7 +158,7 @@ def parse_frame_view(
     return _parse_frame_view(src, limits)
 
 
-def read_frame(reader: BinaryIO, limits: Limits | None = None) -> Frame:
+def read_frame(reader: BinaryIO, limits: Optional[Limits] = None) -> Frame:
     """Read and parse one frame from ``reader``."""
 
     from ._wire.frame import read_frame as _read_frame
@@ -166,7 +166,9 @@ def read_frame(reader: BinaryIO, limits: Limits | None = None) -> Frame:
     return _read_frame(reader, limits)
 
 
-def write_frame(writer: BinaryIO, frame: Frame, limits: Limits | None = None) -> None:
+def write_frame(
+        writer: BinaryIO, frame: Frame, limits: Optional[Limits] = None
+) -> None:
     """Validate and write one complete frame to a binary stream."""
 
     from ._wire.frame import (
@@ -202,7 +204,7 @@ def marshal_frame(frame: Frame) -> bytes:
 
 
 def validate_frame(
-        frame: Frame, limits: Limits | None = None, inbound: bool = False
+        frame: Frame, limits: Optional[Limits] = None, inbound: bool = False
 ) -> None:
     """Validate one frame."""
 
@@ -211,7 +213,7 @@ def validate_frame(
     _validate_frame(frame, limits, inbound)
 
 
-def normalize_limits(limits: Limits | None) -> Limits:
+def normalize_limits(limits: Optional[Limits]) -> Limits:
     """Replace zero limit fields with defaults."""
 
     from ._wire.frame import normalize_limits as _normalize_limits

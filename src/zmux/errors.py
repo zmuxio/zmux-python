@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional, TypeVar
+from typing import Optional, Type, TypeVar
 
 from .protocol import ErrorCode, MAX_VARINT62
 
@@ -600,7 +600,7 @@ def error_code_name(code: int) -> str:
         return "APPLICATION_ERROR"
 
 
-def find_error(error: BaseException, error_type: type[_E]) -> Optional[_E]:
+def find_error(error: BaseException, error_type: Type[_E]) -> Optional[_E]:
     """Find the first nested exception of ``error_type`` within ``error``."""
 
     for candidate in _iter_error_tree(error):
@@ -830,7 +830,7 @@ def source_exception(error: BaseException) -> Optional[BaseException]:
     return None if found is None else found.source_error
 
 
-def _contains_error_type(error: BaseException, error_type: type[BaseException]) -> bool:
+def _contains_error_type(error: BaseException, error_type: Type[BaseException]) -> bool:
     return find_error(error, error_type) is not None
 
 
@@ -845,7 +845,7 @@ def _message_matches(error: BaseException, expected: str) -> bool:
 
 def _matches_named_error(
         error: BaseException,
-        error_type: type[BaseException],
+        error_type: Type[BaseException],
         expected: str,
 ) -> bool:
     return _contains_error_type(error, error_type) or _message_matches(error, expected)
@@ -853,7 +853,7 @@ def _matches_named_error(
 
 def _matches_named_error_fragment(
         error: BaseException,
-        error_type: type[BaseException],
+        error_type: Type[BaseException],
         expected: str,
         fragment: str,
 ) -> bool:

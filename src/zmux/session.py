@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType, TracebackType
-from typing import Mapping, Optional, Protocol, runtime_checkable
+from typing import Mapping, Optional, Protocol, Type, runtime_checkable
 
 from .config import OpenOptions, Settings
 from .errors import (
@@ -805,7 +805,7 @@ class Session(Protocol):
 
     def __exit__(
             self,
-            exc_type: Optional[type[BaseException]],
+            exc_type: Optional[Type[BaseException]],
             exc: Optional[BaseException],
             tb: Optional[TracebackType],
     ) -> None:
@@ -925,7 +925,7 @@ class AsyncSession(Protocol):
 
     async def __aexit__(
             self,
-            exc_type: Optional[type[BaseException]],
+            exc_type: Optional[Type[BaseException]],
             exc: Optional[BaseException],
             tb: Optional[TracebackType],
     ) -> None:
@@ -1048,7 +1048,7 @@ class ClosedSession:
 
     def __exit__(
             self,
-            exc_type: Optional[type[BaseException]],
+            exc_type: Optional[Type[BaseException]],
             exc: Optional[BaseException],
             tb: Optional[TracebackType],
     ) -> None:
@@ -1185,7 +1185,7 @@ class AsyncClosedSession:
 
     async def __aexit__(
             self,
-            exc_type: Optional[type[BaseException]],
+            exc_type: Optional[Type[BaseException]],
             exc: Optional[BaseException],
             tb: Optional[TracebackType],
     ) -> None:

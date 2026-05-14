@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import IntEnum, IntFlag
-from typing import TypeVar
+from typing import Tuple, Type, TypeVar
 
 MAGIC = b"ZMUX"
 PREFACE_VERSION = 1
@@ -15,11 +15,11 @@ MAX_VARINT_LEN = 8
 _E = TypeVar("_E", bound=IntEnum)
 
 
-def _enum_codes(*members: int) -> tuple[int, ...]:
+def _enum_codes(*members: int) -> Tuple[int, ...]:
     return tuple(int(member) for member in members)
 
 
-def _enum_from_code(enum_type: type[_E], code: int, label: str) -> _E:
+def _enum_from_code(enum_type: Type[_E], code: int, label: str) -> _E:
     code = _coerce_int_code(code, label)
     try:
         return enum_type(code)

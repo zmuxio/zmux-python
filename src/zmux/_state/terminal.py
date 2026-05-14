@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import Type
 
 from .flow import ignore_late_non_opening_control
 from .half import (
@@ -351,7 +352,7 @@ def _set_bool_field(instance: object, name: str) -> None:
     object.__setattr__(instance, name, require_bool(getattr(instance, name), name))
 
 
-def _set_enum_field(instance: object, name: str, enum_type: type[IntEnum]) -> None:
+def _set_enum_field(instance: object, name: str, enum_type: Type[IntEnum]) -> None:
     object.__setattr__(
         instance,
         name,

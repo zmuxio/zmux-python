@@ -16,7 +16,7 @@ import time
 from collections.abc import Iterable, MutableSequence, Sequence
 from dataclasses import dataclass, field, replace
 from enum import Enum, IntEnum
-from typing import Callable, Dict, List, Optional, Protocol, Tuple, TypeAlias
+from typing import Callable, Dict, List, Optional, Protocol, Tuple
 
 from .flow import queue_would_block as _flow_queue_would_block
 from .stream import SendHalfState, effective_deadline
@@ -68,9 +68,6 @@ QUEUED_WRITE_DISCARDED_MESSAGE = "zmux: queued write was discarded"
 DEFAULT_URGENCY_RANK = 100
 _POLL_WAIT_CAP_SECONDS = 3600.0
 POLL_WAIT_CAP_SECONDS = _POLL_WAIT_CAP_SECONDS
-PriorityUpdateFields: TypeAlias = Tuple[Optional[int], Optional[int]]
-
-
 class BatchOrder(Protocol):
     def __call__(self, batch: List[object]) -> Iterable[object]:
         ...
@@ -1835,7 +1832,9 @@ def merged_priority_update_payload(old_payload: bytes, new_payload: bytes) -> Op
     return bytes(out)
 
 
-def priority_update_fields(payload: bytes) -> PriorityUpdateFields | None:
+def priority_update_fields(
+        payload: bytes
+) -> Optional[Tuple[Optional[int], Optional[int]]]:
     try:
         metadata, valid = parse_priority_update_payload(payload)
     except Exception:

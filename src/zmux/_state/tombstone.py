@@ -13,7 +13,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Optional
+from typing import Optional, Type
 
 from .half import RecvHalfState, SendHalfState, coerce_enum, require_bool
 from .terminal import TerminalErrorChoice, terminal_error_priority
@@ -1151,7 +1151,7 @@ def _set_bool_field(instance: object, name: str) -> None:
     object.__setattr__(instance, name, require_bool(getattr(instance, name), name))
 
 
-def _set_enum_field(instance: object, name: str, enum_type: type[IntEnum]) -> None:
+def _set_enum_field(instance: object, name: str, enum_type: Type[IntEnum]) -> None:
     object.__setattr__(
         instance,
         name,

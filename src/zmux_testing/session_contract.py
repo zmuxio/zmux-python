@@ -15,7 +15,7 @@ import math
 import time
 from collections.abc import Awaitable
 from numbers import Real
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Optional, Protocol, Tuple
 
 import zmux
 
@@ -24,8 +24,15 @@ _READ_CHUNK = 64 * 1024
 _MAX_READ_ALL_BYTES = 16 * 1024 * 1024
 _POLL_INTERVAL = 0.01
 
-SessionPairFactory = Callable[[], Any]
-SessionCaseBody = Callable[[Any, Any, float], Awaitable[None]]
+
+class SessionPairFactory(Protocol):
+    def __call__(self) -> Any:
+        ...
+
+
+class SessionCaseBody(Protocol):
+    def __call__(self, client: Any, server: Any, timeout: float) -> Awaitable[None]:
+        ...
 
 
 def run_session_contract(

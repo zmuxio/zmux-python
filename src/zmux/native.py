@@ -9,7 +9,7 @@ import time
 from collections import deque
 from dataclasses import replace
 from types import TracebackType
-from typing import Deque, Iterable, Optional
+from typing import Deque, Iterable, Optional, Type
 
 from ._state.stream_id import (
     first_local_stream_id,
@@ -202,7 +202,7 @@ class Conn:
 
     def __exit__(
         self,
-        exc_type: Optional[type[BaseException]],
+        exc_type: Optional[Type[BaseException]],
         exc: Optional[BaseException],
         tb: Optional[TracebackType],
     ) -> None:
@@ -858,7 +858,7 @@ class NativeStream:
 
     def __exit__(
         self,
-        exc_type: Optional[type[BaseException]],
+        exc_type: Optional[Type[BaseException]],
         exc: Optional[BaseException],
         tb: Optional[TracebackType],
     ) -> None:

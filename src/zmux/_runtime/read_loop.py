@@ -13,7 +13,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import BinaryIO, Callable, Deque, Optional
+from typing import BinaryIO, Deque, Optional, Protocol
 
 from .flow import (
     aggregate_late_data_cap,
@@ -117,9 +117,21 @@ MIN_INBOUND_EXT_BYTE_BUDGET = 256 << 10
 MAX_PENDING_READ_LOOP_PROTOCOL_JOBS = 256
 MAX_REUSABLE_PENDING_READ_LOOP_PROTOCOL_JOBS_CAP = 1024
 _DEFAULT_SETTINGS = default_settings()
-ProtocolAction = Callable[[], object]
-FrameCallback = Callable[[Frame], object]
-PongPayloadFactory = Callable[[bytes], bytes]
+
+
+class ProtocolAction(Protocol):
+    def __call__(self) -> object:
+        ...
+
+
+class FrameCallback(Protocol):
+    def __call__(self, frame: Frame) -> object:
+        ...
+
+
+class PongPayloadFactory(Protocol):
+    def __call__(self, payload: bytes) -> bytes:
+        ...
 
 
 class ParsedFrameKind(str, Enum):
@@ -819,7 +831,9 @@ class ProtocolTask:
         return frame_type is FrameType.PONG or frame_type is FrameType.ABORT
 
 
-ProtocolTaskCallback = Callable[[ProtocolTask], object]
+class ProtocolTaskCallback(Protocol):
+    def __call__(self, task: ProtocolTask) -> object:
+        ...
 
 
 @dataclass(frozen=True)

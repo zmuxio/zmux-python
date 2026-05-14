@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import MutableSequence
-from typing import Dict, Iterator, List, Optional, Set, Tuple, TypeAlias
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 from .varint import append_varint, encode_varint_into, parse_varint, varint_len
 from ..config import Settings, default_settings
@@ -32,8 +32,6 @@ from ..protocol import (
 )
 
 INLINE_UNKNOWN_SETTING_IDS = 8
-SettingIDSet: TypeAlias = Set[int]
-
 __all__ = (
     "INLINE_UNKNOWN_SETTING_IDS",
     "append_setting_varint_tlv",
@@ -246,7 +244,7 @@ class _UnknownSettingTracker:
 
     def __init__(self) -> None:
         self._inline: List[int] = []
-        self._overflow: SettingIDSet | None = None
+        self._overflow: Optional[Set[int]] = None
 
     def insert(self, typ: int) -> bool:
         overflow = self._overflow

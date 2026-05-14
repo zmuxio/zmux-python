@@ -13,7 +13,7 @@ import sys
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Callable, List, Optional, Tuple, TypeAlias
+from typing import Callable, List, Optional, Tuple
 
 from .flow import MAX_UINT64, saturating_add, saturating_mul_div_floor
 from .write_policy import (
@@ -54,9 +54,6 @@ from ..protocol import (
     SchedulerHint,
 )
 from ..streams import ReadableBuffer
-
-FrameList: TypeAlias = List[Frame]
-
 
 class OpenerVisibilityMark(IntEnum):
     UNCHANGED = 0
@@ -305,7 +302,7 @@ class QueuedWriteCommit:
 
 @dataclass
 class WriteBurstState:
-    frames: FrameList = field(default_factory=list)
+    frames: List[Frame] = field(default_factory=list)
     queued_bytes: int = 0
     commit: QueuedWriteCommit = field(default_factory=QueuedWriteCommit)
     data_frames: int = 0
@@ -318,7 +315,7 @@ class WriteBurstState:
         self.data_frames = _nonnegative_int(self.data_frames, "data_frames")
 
     def init_frame_buffer(
-            self, start: WriteBatchStart, frames: FrameList | None = None
+            self, start: WriteBatchStart, frames: Optional[List[Frame]] = None
     ) -> None:
         self.frames = [] if frames is None else list(_frame_tuple(frames, "frames"))
         self.frames.clear()
@@ -508,7 +505,7 @@ def writable_data_bytes(
     return bounded_write_chunk(remaining, session_available, stream_available, frame_payload_room)
 
 
-FrameBuilder: TypeAlias = Callable[[int, int], Frame]
+FrameBuilder = Callable[[int, int], Frame]
 
 
 def build_prepared_write_step(

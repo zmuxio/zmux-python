@@ -14,7 +14,7 @@ import time
 from collections.abc import Iterable, MutableSequence, Sequence
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Dict, List, Optional, Protocol, Tuple, TypeAlias
+from typing import Dict, List, Optional, Protocol, Tuple
 
 from .queue import (
     MAX_UINT64,
@@ -92,11 +92,8 @@ BULK_SPARSE_COALESCE_SECONDS = 0.002
 LATENCY_HOT_COALESCE_SECONDS = 0.002
 DEFAULT_HOT_COALESCE_SECONDS = 0.003
 BULK_HOT_COALESCE_SECONDS = 0.004
-StreamValueMap: TypeAlias = Dict[int, Tuple[object, int]]
-StreamMetaMap: TypeAlias = Dict[int, StreamMeta]
-OptionalScheduler: TypeAlias = BatchScheduler | None
-OptionalBatchConfig: TypeAlias = BatchConfig | None
-OptionalStreamMetaMap: TypeAlias = StreamMetaMap | None
+StreamValueMap = Dict[int, Tuple[object, int]]
+StreamMetaMap = Dict[int, StreamMeta]
 
 
 class DequeuedWriteWorkKind(IntEnum):
@@ -168,7 +165,7 @@ class StreamValueAccumulator:
     cap_hint: int = 0
     _single_stream: object = None
     _single_value: int = 0
-    _values: StreamValueMap | None = None
+    _values: Optional[Dict[int, Tuple[object, int]]] = None
     _order: List[int] = field(default_factory=list)
 
     def promote(self) -> None:
@@ -745,9 +742,9 @@ def collect_ready_batch(
         lane: QueueLane,
         *,
         max_frames: int = MAX_WRITE_BATCH_FRAMES,
-        scheduler: OptionalScheduler = None,
-        config: OptionalBatchConfig = None,
-        stream_meta: OptionalStreamMetaMap = None,
+        scheduler: Optional[BatchScheduler] = None,
+        config: Optional[BatchConfig] = None,
+        stream_meta: Optional[Dict[int, StreamMeta]] = None,
 ) -> Tuple[QueuedWriteRequest, ...]:
     max_frames = max(1, _nonnegative_int(max_frames, "max_frames"))
     batch = [first]
@@ -768,9 +765,9 @@ def order_write_batch(
         batch: Sequence[QueuedWriteRequest],
         lane: QueueLane,
         *,
-        scheduler: OptionalScheduler = None,
-        config: OptionalBatchConfig = None,
-        stream_meta: OptionalStreamMetaMap = None,
+        scheduler: Optional[BatchScheduler] = None,
+        config: Optional[BatchConfig] = None,
+        stream_meta: Optional[Dict[int, StreamMeta]] = None,
 ) -> Tuple[QueuedWriteRequest, ...]:
     lane = _coerce_enum(lane, QueueLane, "lane")
     batch = _request_tuple(batch, "batch")
@@ -796,9 +793,9 @@ def batch_order(
         batch: Sequence[QueuedWriteRequest],
         lane: QueueLane,
         *,
-        scheduler: OptionalScheduler = None,
-        config: OptionalBatchConfig = None,
-        stream_meta: OptionalStreamMetaMap = None,
+        scheduler: Optional[BatchScheduler] = None,
+        config: Optional[BatchConfig] = None,
+        stream_meta: Optional[Dict[int, StreamMeta]] = None,
 ) -> Tuple[int, ...]:
     lane = _coerce_enum(lane, QueueLane, "lane")
     batch = _request_tuple(batch, "batch")
@@ -880,7 +877,7 @@ def data_batch_items(
         config: BatchConfig,
         stream_meta: StreamMetaMap,
         *,
-        scheduler: OptionalScheduler = None,
+        scheduler: Optional[BatchScheduler] = None,
 ) -> Tuple[BatchItem, ...]:
     batch = _request_tuple(batch, "batch")
     config = _coerce_batch_config(config)
@@ -931,7 +928,7 @@ def _batch_group_key(
         stream_id: int,
         group: int,
         group_fair: bool,
-        scheduler: OptionalScheduler,
+        scheduler: Optional[BatchScheduler],
         explicit_groups: Dict[int, None],
 ) -> GroupKey:
     if scheduler is not None:
