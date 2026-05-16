@@ -5,10 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import BinaryIO, Tuple
 
+from ._validation import require_varint62 as _require_varint62
 from .config import Settings
 from .errors import ErrorDirection, ErrorOperation, ErrorScope, TransportError
 from .protocol import (
-    MAX_VARINT62,
     capabilities_can_carry_group_in_update,
     capabilities_can_carry_group_on_open,
     capabilities_can_carry_open_info,
@@ -231,16 +231,6 @@ def _require_byte(value: int, field_name: str) -> int:
         raise TypeError("%s must be an integer" % field_name)
     if value < 0 or value > 0xFF:
         raise ValueError("%s must fit in one byte" % field_name)
-    return int(value)
-
-
-def _require_varint62(value: int, field_name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError("%s must be an integer" % field_name)
-    if value < 0:
-        raise ValueError("%s must be >= 0" % field_name)
-    if value > MAX_VARINT62:
-        raise ValueError("%s must be within varint62 range" % field_name)
     return int(value)
 
 

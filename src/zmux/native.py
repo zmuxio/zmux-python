@@ -11,6 +11,7 @@ from dataclasses import replace
 from types import TracebackType
 from typing import Deque, Iterable, Optional
 
+from ._buffers import byte_view
 from ._state.stream_id import (
     first_local_stream_id,
     stream_is_bidi,
@@ -1382,13 +1383,7 @@ def _bytes_like(value: object, label: str) -> bytes:
 def _readable_view(data: object) -> memoryview:
     if isinstance(data, (bool, int)):
         raise TypeError("data must be bytes-like")
-    view = memoryview(data)
-    if view.ndim == 1 and view.itemsize == 1 and view.format in ("B", "b", "c"):
-        return view
-    try:
-        return view.cast("B")
-    except TypeError:
-        return memoryview(view.tobytes())
+    return byte_view(data)
 
 
 def _writable_view(data: object) -> memoryview:

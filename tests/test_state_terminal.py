@@ -93,34 +93,66 @@ class TerminalStateTransitionTests(unittest.TestCase):
         )
 
     def test_local_terminal_actions_match_half_presence_and_terminal_states(self):
-        send_cases = (
-            (False, SendHalfState.UNKNOWN, LocalSendAction.NOT_WRITABLE),
-            (False, SendHalfState.ABSENT, LocalSendAction.NOT_WRITABLE),
-            (True, SendHalfState.UNKNOWN, LocalSendAction.APPLY),
-            (True, SendHalfState.OPEN, LocalSendAction.APPLY),
-            (True, SendHalfState.STOP_SEEN, LocalSendAction.APPLY),
-            (True, SendHalfState.FIN, LocalSendAction.CLOSED),
-            (True, SendHalfState.RESET, LocalSendAction.TERMINAL),
-            (True, SendHalfState.ABORTED, LocalSendAction.TERMINAL),
-        )
-        for local_send, send_half, want in send_cases:
-            with self.subTest(local_send=local_send, send_half=send_half):
-                self.assertEqual(local_close_write_action(local_send, send_half), want)
-                self.assertEqual(local_reset_action(local_send, send_half), want)
+        def expand(groups):
+            for present, states, want in groups:
+                for half_state in states:
+                    yield present, half_state, want
 
-        recv_cases = (
-            (False, RecvHalfState.UNKNOWN, LocalRecvAction.NOT_READABLE),
-            (False, RecvHalfState.ABSENT, LocalRecvAction.NOT_READABLE),
-            (True, RecvHalfState.UNKNOWN, LocalRecvAction.APPLY),
-            (True, RecvHalfState.OPEN, LocalRecvAction.APPLY),
-            (True, RecvHalfState.FIN, LocalRecvAction.CLOSED),
-            (True, RecvHalfState.STOP_SENT, LocalRecvAction.CLOSED),
-            (True, RecvHalfState.RESET, LocalRecvAction.TERMINAL),
-            (True, RecvHalfState.ABORTED, LocalRecvAction.TERMINAL),
+        action_tables = (
+            (
+                "send",
+                (local_close_write_action, local_reset_action),
+                expand((
+                    (
+                        False,
+                        (SendHalfState.UNKNOWN, SendHalfState.ABSENT),
+                        LocalSendAction.NOT_WRITABLE,
+                    ),
+                    (
+                        True,
+                        (SendHalfState.UNKNOWN, SendHalfState.OPEN, SendHalfState.STOP_SEEN),
+                        LocalSendAction.APPLY,
+                    ),
+                    (True, (SendHalfState.FIN,), LocalSendAction.CLOSED),
+                    (
+                        True,
+                        (SendHalfState.RESET, SendHalfState.ABORTED),
+                        LocalSendAction.TERMINAL,
+                    ),
+                )),
+            ),
+            (
+                "receive",
+                (local_close_read_action,),
+                expand((
+                    (
+                        False,
+                        (RecvHalfState.UNKNOWN, RecvHalfState.ABSENT),
+                        LocalRecvAction.NOT_READABLE,
+                    ),
+                    (
+                        True,
+                        (RecvHalfState.UNKNOWN, RecvHalfState.OPEN),
+                        LocalRecvAction.APPLY,
+                    ),
+                    (
+                        True,
+                        (RecvHalfState.FIN, RecvHalfState.STOP_SENT),
+                        LocalRecvAction.CLOSED,
+                    ),
+                    (
+                        True,
+                        (RecvHalfState.RESET, RecvHalfState.ABORTED),
+                        LocalRecvAction.TERMINAL,
+                    ),
+                )),
+            ),
         )
-        for local_receive, recv_half, want in recv_cases:
-            with self.subTest(local_receive=local_receive, recv_half=recv_half):
-                self.assertEqual(local_close_read_action(local_receive, recv_half), want)
+        for label, callbacks, cases in action_tables:
+            for present, half_state, want in cases:
+                for callback in callbacks:
+                    with self.subTest(label=label, half_state=half_state):
+                        self.assertEqual(callback(present, half_state), want)
 
         self.assertEqual(
             local_abort_action_for_stream(SendHalfState.OPEN, RecvHalfState.OPEN),
@@ -349,19 +381,23 @@ class TerminalStateTransitionTests(unittest.TestCase):
         )
 
     def test_runtime_stream_reexports_state_terminal_primitives(self):
-        self.assertIs(runtime_stream.TerminalErrorChoice, TerminalErrorChoice)
-        self.assertIs(runtime_stream.LocalSendAction, LocalSendAction)
-        self.assertIs(runtime_stream.LocalRecvAction, LocalRecvAction)
-        self.assertIs(runtime_stream.LocalAbortAction, LocalAbortAction)
-        self.assertIs(runtime_stream.StopSendingOutcome, StopSendingOutcome)
-        self.assertIs(runtime_stream.PeerDataOutcome, PeerDataOutcome)
-        self.assertIs(runtime_stream.PeerDataPlan, PeerDataPlan)
-        self.assertIs(runtime_stream.session_close_transition, session_close_transition)
-        self.assertIs(runtime_stream.plan_peer_stop_sending, plan_peer_stop_sending)
-        self.assertIs(runtime_stream.plan_peer_reset, plan_peer_reset)
-        self.assertIs(runtime_stream.plan_peer_abort, plan_peer_abort)
-        self.assertIs(runtime_stream.read_error_choice, read_error_choice)
-        self.assertIs(runtime_stream.terminal_error_priority, terminal_error_priority)
+        for name in (
+                "TerminalErrorChoice",
+                "LocalSendAction",
+                "LocalRecvAction",
+                "LocalAbortAction",
+                "StopSendingOutcome",
+                "PeerDataOutcome",
+                "PeerDataPlan",
+                "session_close_transition",
+                "plan_peer_stop_sending",
+                "plan_peer_reset",
+                "plan_peer_abort",
+                "read_error_choice",
+                "terminal_error_priority",
+        ):
+            with self.subTest(name=name):
+                self.assertIs(getattr(runtime_stream, name), globals()[name])
 
     def test_terminal_helpers_reject_python_invalid_bool_shapes(self):
         with self.assertRaises(TypeError):

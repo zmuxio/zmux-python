@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Callable, List, Optional, Tuple
 
+from ._frames import frame_tuple as _frame_tuple
 from .flow import MAX_UINT64, saturating_add, saturating_mul_div_floor
 from .write_policy import (
     DEFAULT_FRAGMENT_TIME_BUDGET,
@@ -54,6 +55,11 @@ from ..protocol import (
     SchedulerHint,
 )
 from ..streams import ReadableBuffer
+from .._validation import (
+    coerce_int_enum as _coerce_enum,
+    require_bool as _shared_require_bool,
+    require_nonnegative_int as _nonnegative_int,
+)
 
 FrameBuffer = List[Frame]
 
@@ -581,41 +587,12 @@ def _buffer_byte_len(data: ReadableBuffer) -> int:
     return len(view)
 
 
-def _frame_tuple(frames: Iterable[Frame], name: str) -> Tuple[Frame, ...]:
-    if isinstance(frames, Frame):
-        raise TypeError("%s must be a sequence of Frame objects" % name)
-    try:
-        values = tuple(frames)
-    except TypeError as exc:
-        raise TypeError("%s must be a sequence of Frame objects" % name) from exc
-    for frame in values:
-        if not isinstance(frame, Frame):
-            raise TypeError("%s must contain only Frame objects" % name)
-    return values
-
-
 def _coerce_scheduler_hint(hint: SchedulerHint) -> SchedulerHint:
     if isinstance(hint, SchedulerHint):
         return hint
     if isinstance(hint, bool) or not isinstance(hint, int):
         raise TypeError("hint must be a SchedulerHint or integer")
     return SchedulerHint.from_code(hint)
-
-
-def _coerce_enum(value, enum_type, name: str):
-    if isinstance(value, enum_type):
-        return value
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError("%s must be a %s or integer" % (name, enum_type.__name__))
-    return enum_type(value)
-
-
-def _nonnegative_int(value: int, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError("%s must be an integer" % name)
-    if value < 0:
-        raise ValueError("%s must be >= 0" % name)
-    return value
 
 
 def _signed_int(value: int, name: str) -> int:
@@ -625,9 +602,7 @@ def _signed_int(value: int, name: str) -> int:
 
 
 def _require_bool(value: bool, name: str) -> bool:
-    if not isinstance(value, bool):
-        raise TypeError("%s must be a boolean" % name)
-    return value
+    return _shared_require_bool(value, name, noun="boolean")
 
 
 __all__ = (

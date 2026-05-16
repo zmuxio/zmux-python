@@ -33,6 +33,7 @@ __all__ = (
     "encoded_len_from_first",
     "pack_varint",
     "parse_varint",
+    "parse_varints",
     "read_varint",
     "validate_decoded_varint",
     "varint_len",
@@ -215,6 +216,22 @@ def parse_varint(data: bytes, offset: int = 0, limit: Optional[int] = None) -> T
         raise _wire_error(ERR_TRUNCATED_VARINT)
     value = decode_varint_value(data, offset, length)
     return validate_decoded_varint(value, length)
+
+
+def parse_varints(
+        data: bytes, offset: int, limit: int, count: int
+) -> Tuple[Tuple[int, ...], int]:
+    """Parse ``count`` consecutive canonical varint62 values."""
+
+    count = _require_int(count, "count")
+    if count < 0:
+        raise ValueError("count must be >= 0")
+    values = []
+    for _ in range(count):
+        value, consumed = parse_varint(data, offset, limit)
+        values.append(value)
+        offset += consumed
+    return tuple(values), offset
 
 
 def read_varint(reader: BinaryIO) -> Tuple[int, int]:

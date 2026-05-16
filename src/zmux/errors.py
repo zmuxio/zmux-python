@@ -5,6 +5,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Optional, Type, TypeVar
 
+from ._validation import require_varint62 as _require_error_code
 from .protocol import ErrorCode, MAX_VARINT62
 
 OPEN_INFO_UNAVAILABLE_MESSAGE = "zmux: open_info requires negotiated open_metadata"
@@ -930,16 +931,6 @@ def _termination_kind_from_exception(error: BaseException) -> TerminationKind:
     if isinstance(error, InterruptedError):
         return TerminationKind.INTERRUPTED
     return TerminationKind.UNKNOWN
-
-
-def _require_error_code(value: int, field_name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError("%s must be an integer" % field_name)
-    if value < 0:
-        raise ValueError("%s must be >= 0" % field_name)
-    if value > MAX_VARINT62:
-        raise ValueError("%s must be within varint62 range" % field_name)
-    return int(value)
 
 
 def _coerce_enum(value, enum_type, field_name: str):

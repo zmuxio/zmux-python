@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Dict
 
+from ._containers import pop_attrs
 from .sched_core import (
     FALLBACK_GROUP_BUCKET,
     MAX_EXPLICIT_GROUPS,
@@ -22,6 +23,22 @@ from .sched_core import (
     scrub_idle_retained_batch_state,
     uint64,
     varint62,
+)
+
+_GROUP_BATCH_STATE_ATTRS = (
+    "group_virtual_time",
+    "group_finish_tag",
+    "group_last_service",
+    "group_lag",
+    "preferred_stream_head",
+)
+_STREAM_BATCH_STATE_ATTRS = (
+    "stream_finish_tag",
+    "stream_last_service",
+    "stream_lag",
+    "stream_class",
+    "stream_last_seen_batch",
+    "small_burst_disarmed",
 )
 
 
@@ -111,12 +128,7 @@ class BatchScheduler(object):
         binding = self.stream_groups.pop(stream_id, None)
         if binding is not None and binding.bucket:
             self.untrack_explicit_group(binding.bucket)
-        self.state.stream_finish_tag.pop(stream_id, None)
-        self.state.stream_last_service.pop(stream_id, None)
-        self.state.stream_lag.pop(stream_id, None)
-        self.state.stream_class.pop(stream_id, None)
-        self.state.stream_last_seen_batch.pop(stream_id, None)
-        self.state.small_burst_disarmed.pop(stream_id, None)
+        pop_attrs(self.state, _STREAM_BATCH_STATE_ATTRS, stream_id)
         self._drop_group_state(GroupKey.stream(stream_id))
         self.maybe_clear_idle_head_state()
 
@@ -136,11 +148,7 @@ class BatchScheduler(object):
         release_idle_batch_state_storage(self.state)
 
     def _drop_group_state(self, group_key: GroupKey) -> None:
-        self.state.group_virtual_time.pop(group_key, None)
-        self.state.group_finish_tag.pop(group_key, None)
-        self.state.group_last_service.pop(group_key, None)
-        self.state.group_lag.pop(group_key, None)
-        self.state.preferred_stream_head.pop(group_key, None)
+        pop_attrs(self.state, _GROUP_BATCH_STATE_ATTRS, group_key)
         if (
                 self.state.has_preferred_group_head
                 and self.state.preferred_group_head == group_key

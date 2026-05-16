@@ -9,7 +9,6 @@ halves.
 
 from __future__ import annotations
 
-import math
 import socket
 import threading
 import time
@@ -23,6 +22,8 @@ from typing import (
     runtime_checkable,
 )
 
+from ._buffers import byte_view
+from ._validation import optional_seconds
 from .errors import (
     ErrorDirection,
     ErrorOperation,
@@ -1144,14 +1145,7 @@ def deadline_after(timeout: Optional[float]) -> Deadline:
 
 
 def _validate_deadline(deadline: object) -> Deadline:
-    if deadline is None:
-        return None
-    if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
-        raise TypeError("deadline must be a timestamp or None")
-    value = float(deadline)
-    if math.isnan(value) or math.isinf(value):
-        return None
-    return value
+    return optional_seconds(deadline, "deadline", description="a timestamp")
 
 
 def _remaining(deadline: Deadline) -> Optional[float]:
@@ -1324,13 +1318,7 @@ def _write_vectored_views_to_half(half: object, vectors: Tuple[memoryview, ...])
 
 
 def _byte_view(data: ReadableBuffer) -> memoryview:
-    view = memoryview(data)
-    if view.ndim == 1 and view.itemsize == 1 and view.format in ("B", "b", "c"):
-        return view
-    try:
-        return view.cast("B")
-    except TypeError:
-        return memoryview(view.tobytes())
+    return byte_view(data)
 
 
 def _writable_byte_view(buffer: WritableBuffer) -> memoryview:

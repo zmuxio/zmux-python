@@ -332,14 +332,26 @@ class StreamDeadlineAndWritePlanTests(unittest.TestCase):
 
     def test_checked_total_and_part_advance(self):
         parts = (b"ab", b"", b"cde")
-        self.assertEqual(checked_total_part_len(parts, 8), 5)
         with self.assertRaises(zmux.FrameSizeError):
             checked_total_part_len((b"abc", b"de"), 4)
-        self.assertEqual(advance_parts(parts, 0, 0, 3), (2, 1))
-        self.assertEqual(advance_parts(parts, 2, 1, 9), (3, 0))
+        self.assertEqual(
+            (
+                checked_total_part_len(parts, 8),
+                advance_parts(parts, 0, 0, 3),
+                advance_parts(parts, 2, 1, 9),
+            ),
+            (5, (2, 1), (3, 0)),
+        )
 
 
 class StreamTerminalPlanTests(unittest.TestCase):
+    def read_closed_error(self, state):
+        return state.terminal.read_error(
+            local_receive=state.local_receive,
+            local_read_stop=state.half.local_read_stop,
+            recv_half=state.half.effective_recv_half(),
+        )
+
     def test_unidirectional_sides_derive_from_opener_and_direction(self):
         local_uni = StreamRuntimeState(
             stream_id=2,
@@ -579,22 +591,14 @@ class StreamTerminalPlanTests(unittest.TestCase):
     def test_read_closed_error_source_matches_terminal_cause(self):
         stopped = StreamRuntimeState(stream_id=4, id_set=True)
         stopped.commit_local_read_stop(42)
-        stop_error = stopped.terminal.read_error(
-            local_receive=stopped.local_receive,
-            local_read_stop=stopped.half.local_read_stop,
-            recv_half=stopped.half.effective_recv_half(),
-        )
+        stop_error = self.read_closed_error(stopped)
         self.assertIsInstance(stop_error, zmux.ReadClosed)
         self.assertEqual(stop_error.source, zmux.ErrorSource.LOCAL)
         self.assertEqual(stop_error.termination_kind, zmux.TerminationKind.STOPPED)
 
         finished = StreamRuntimeState(stream_id=4, id_set=True)
         finished.half.mark_recv_fin()
-        fin_error = finished.terminal.read_error(
-            local_receive=finished.local_receive,
-            local_read_stop=finished.half.local_read_stop,
-            recv_half=finished.half.effective_recv_half(),
-        )
+        fin_error = self.read_closed_error(finished)
         self.assertIsInstance(fin_error, zmux.ReadClosed)
         self.assertEqual(fin_error.source, zmux.ErrorSource.REMOTE)
         self.assertEqual(fin_error.termination_kind, zmux.TerminationKind.GRACEFUL)

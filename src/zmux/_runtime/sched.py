@@ -7,19 +7,10 @@ owns the small mutable facade used by writer code.
 
 from __future__ import annotations
 
-from typing import Tuple
-
 from . import batch_scheduler as _batch_scheduler
 from . import sched_core as _sched_core
+from ._facade import export_modules
 
+__all__ = export_modules(globals(), _sched_core, _batch_scheduler)
 
-def _export(module: object) -> Tuple[str, ...]:
-    names = tuple(vars(module).get("__all__", ()))
-    for name in names:
-        globals()[name] = getattr(module, name)
-    return names
-
-
-__all__ = _export(_sched_core) + _export(_batch_scheduler)
-
-del _export, _batch_scheduler, _sched_core
+del export_modules, _batch_scheduler, _sched_core

@@ -17,21 +17,25 @@ from zmux._state.half import (
 
 class StreamHalfStatePrimitiveTests(unittest.TestCase):
     def test_half_state_values_match_go_iota_order(self):
-        self.assertEqual(SendHalfState.UNKNOWN, 0)
-        self.assertEqual(SendHalfState.ABSENT, 1)
-        self.assertEqual(SendHalfState.OPEN, 2)
-        self.assertEqual(SendHalfState.STOP_SEEN, 3)
-        self.assertEqual(SendHalfState.FIN, 4)
-        self.assertEqual(SendHalfState.RESET, 5)
-        self.assertEqual(SendHalfState.ABORTED, 6)
-
-        self.assertEqual(RecvHalfState.UNKNOWN, 0)
-        self.assertEqual(RecvHalfState.ABSENT, 1)
-        self.assertEqual(RecvHalfState.OPEN, 2)
-        self.assertEqual(RecvHalfState.FIN, 3)
-        self.assertEqual(RecvHalfState.STOP_SENT, 4)
-        self.assertEqual(RecvHalfState.RESET, 5)
-        self.assertEqual(RecvHalfState.ABORTED, 6)
+        cases = (
+            (SendHalfState.UNKNOWN, 0),
+            (SendHalfState.ABSENT, 1),
+            (SendHalfState.OPEN, 2),
+            (SendHalfState.STOP_SEEN, 3),
+            (SendHalfState.FIN, 4),
+            (SendHalfState.RESET, 5),
+            (SendHalfState.ABORTED, 6),
+            (RecvHalfState.UNKNOWN, 0),
+            (RecvHalfState.ABSENT, 1),
+            (RecvHalfState.OPEN, 2),
+            (RecvHalfState.FIN, 3),
+            (RecvHalfState.STOP_SENT, 4),
+            (RecvHalfState.RESET, 5),
+            (RecvHalfState.ABORTED, 6),
+        )
+        for state, value in cases:
+            with self.subTest(state=state):
+                self.assertEqual(state, value)
 
     def test_base_and_normalized_halves_match_go_reference(self):
         self.assertEqual(base_send_half_state(True), SendHalfState.OPEN)

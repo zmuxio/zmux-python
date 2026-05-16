@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .._validation import (
+    require_bool as _require_bool,
+    require_nonnegative_int as _nonnegative_int,
+)
 from ..config import Settings, default_settings
 from ..protocol import MAX_VARINT62
 
@@ -475,20 +479,6 @@ def plan_lane_release_wake(
         control=memory_wake or control_released,
         memory_wake=memory_wake,
     )
-
-
-def _nonnegative_int(value: int, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError("%s must be an integer" % name)
-    if value < 0:
-        raise ValueError("%s must be >= 0" % name)
-    return value
-
-
-def _require_bool(value: bool, name: str) -> bool:
-    if not isinstance(value, bool):
-        raise TypeError("%s must be a bool" % name)
-    return value
 
 
 __all__ = (

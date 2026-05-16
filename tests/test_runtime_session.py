@@ -237,15 +237,19 @@ class RuntimeSessionPolicyTests(unittest.TestCase):
             negotiated,
         )
 
-        self.assertEqual(zeroed.per_stream_queued_data_hwm, baseline.per_stream_queued_data_hwm)
-        self.assertEqual(zeroed.session_queued_data_hwm, baseline.session_queued_data_hwm)
-        self.assertEqual(zeroed.urgent_queued_bytes_cap, baseline.urgent_queued_bytes_cap)
-        self.assertEqual(zeroed.pending_control_bytes_budget, baseline.pending_control_bytes_budget)
-        self.assertEqual(zeroed.pending_priority_bytes_budget, baseline.pending_priority_bytes_budget)
-        self.assertEqual(zeroed.accept_backlog_limit, baseline.accept_backlog_limit)
-        self.assertEqual(zeroed.accept_backlog_bytes_limit, baseline.accept_backlog_bytes_limit)
-        self.assertEqual(zeroed.tombstone_limit, baseline.tombstone_limit)
-        self.assertEqual(zeroed.aggregate_late_data_cap, baseline.aggregate_late_data_cap)
+        for attr in (
+                "per_stream_queued_data_hwm",
+                "session_queued_data_hwm",
+                "urgent_queued_bytes_cap",
+                "pending_control_bytes_budget",
+                "pending_priority_bytes_budget",
+                "accept_backlog_limit",
+                "accept_backlog_bytes_limit",
+                "tombstone_limit",
+                "aggregate_late_data_cap",
+        ):
+            with self.subTest(attr=attr):
+                self.assertEqual(getattr(zeroed, attr), getattr(baseline, attr))
 
     def test_adaptive_session_timers_match_rust_edges(self):
         self.assertEqual(go_away_drain_interval(0.010, 0.0), 0.010)
@@ -388,11 +392,12 @@ class RuntimeSessionPingTests(unittest.TestCase):
         )
 
         wire_echo, padded = build_padded_ping_echo(liveness, local, peer, b"hi", 7)
-        self.assertTrue(padded)
         ping_payload = build_ping_payload(wire_echo, 7)
-        self.assertTrue(has_ping_padding_tag(ping_payload, key))
         reply = pong_payload_for_ping(liveness, local, peer, ping_payload)
-        self.assertGreaterEqual(len(reply), len(ping_payload))
+        self.assertEqual(
+            (padded, has_ping_padding_tag(ping_payload, key), len(reply) >= len(ping_payload)),
+            (True, True, True),
+        )
 
         liveness.begin_ping_payload(ping_payload, sent_at=1.0, accepts_padded_pong=True)
         self.assertTrue(liveness.handle_pong_payload(ping_payload + b"pad", now=1.5))

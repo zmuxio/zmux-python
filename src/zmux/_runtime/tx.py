@@ -18,6 +18,13 @@ from dataclasses import dataclass, field, replace
 from enum import Enum, IntEnum
 from typing import Callable, Dict, List, Optional, Protocol, Tuple
 
+from .._validation import (
+    require_bool as _require_bool,
+    require_nonnegative_duration as _nonnegative_duration,
+    require_nonnegative_int as _nonnegative_int,
+    require_stream_id as _require_stream_id,
+    require_varint62 as _require_varint62,
+)
 from .flow import queue_would_block as _flow_queue_would_block
 from .stream import SendHalfState, effective_deadline
 from .write_plan import OpenerVisibilityMark
@@ -47,7 +54,6 @@ from ..protocol import (
     METADATA_STREAM_PRIORITY,
     ErrorCode,
     FrameType,
-    MAX_VARINT62,
 )
 from ..streams import ReadableBuffer
 
@@ -2091,28 +2097,6 @@ def _byte(value: int, name: str) -> int:
     return value
 
 
-def _require_stream_id(stream_id: int) -> int:
-    stream_id = _require_varint62(stream_id, "stream_id")
-    if stream_id == 0:
-        raise ValueError("stream_id must be non-zero")
-    return stream_id
-
-
-def _require_varint62(value: int, name: str) -> int:
-    value = _nonnegative_int(value, name)
-    if value > MAX_VARINT62:
-        raise ValueError("%s must be within varint62 range" % name)
-    return value
-
-
-def _nonnegative_int(value: int, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError("%s must be an integer" % name)
-    if value < 0:
-        raise ValueError("%s must be >= 0" % name)
-    return int(value)
-
-
 def _saturating_add(left: int, right: int) -> int:
     left = _nonnegative_int(left, "left")
     right = _nonnegative_int(right, "right")
@@ -2122,21 +2106,6 @@ def _saturating_add(left: int, right: int) -> int:
 def _next_generation(current: int) -> int:
     value = (_nonnegative_int(current, "current") + 1) & MAX_UINT64
     return 1 if value == 0 else value
-
-
-def _nonnegative_duration(value: float, name: str) -> float:
-    if isinstance(value, bool):
-        raise TypeError("%s must be a duration in seconds" % name)
-    duration = float(value)
-    if duration < 0:
-        raise ValueError("%s must be >= 0" % name)
-    return duration
-
-
-def _require_bool(value: bool, name: str) -> bool:
-    if not isinstance(value, bool):
-        raise TypeError("%s must be a bool" % name)
-    return value
 
 
 def _chunk_frame_limit(max_frames: int, frame_count: int) -> int:

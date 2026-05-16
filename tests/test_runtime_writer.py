@@ -231,11 +231,16 @@ class RuntimeWriterEncodingTests(unittest.TestCase):
         self.assertIs(error.source_error, writer.error)
         self.assertIs(error.__cause__, writer.error)
         self.assertEqual(error.code, int(zmux.ErrorCode.INTERNAL))
-        self.assertEqual(error.scope, ErrorScope.SESSION)
-        self.assertEqual(error.operation, ErrorOperation.WRITE)
-        self.assertEqual(error.source, ErrorSource.TRANSPORT)
-        self.assertEqual(error.direction, ErrorDirection.BOTH)
-        self.assertEqual(error.termination_kind, TerminationKind.SESSION_TERMINATION)
+        self.assertEqual(
+            (error.scope, error.operation, error.source, error.direction, error.termination_kind),
+            (
+                ErrorScope.SESSION,
+                ErrorOperation.WRITE,
+                ErrorSource.TRANSPORT,
+                ErrorDirection.BOTH,
+                TerminationKind.SESSION_TERMINATION,
+            ),
+        )
         self.assertEqual(writer.flushes, 0)
 
 

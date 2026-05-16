@@ -86,6 +86,19 @@ from zmux.varint import (
 
 
 class PackageSurfaceTest(unittest.TestCase):
+    def assert_protocol_read_error(self, error, message):
+        self.assertEqual(str(error), message)
+        self.assertEqual(
+            (error.code, error.scope, error.operation, error.source, error.direction),
+            (
+                int(ErrorCode.PROTOCOL),
+                ErrorScope.SESSION,
+                ErrorOperation.READ,
+                ErrorSource.REMOTE,
+                ErrorDirection.READ,
+            ),
+        )
+
     def test_distribution_import_surface(self) -> None:
         self.assertEqual(zmux.__version__, "0.1.0")
         self.assertEqual(len(zmux.__all__), len(set(zmux.__all__)))
@@ -114,11 +127,9 @@ class PackageSurfaceTest(unittest.TestCase):
         self.assertEqual(zmux.default_settings().max_frame_payload, 16384)
         self.assertEqual(zmux.encode_varint(64), b"\x40\x40")
         self.assertEqual(zmux.parse_varint(b"\x40\x40"), (64, 2))
-        self.assertTrue(callable(zmux.write_frame))
-        self.assertTrue(callable(zmux.join))
-        self.assertTrue(callable(zmux.open))
-        self.assertTrue(callable(zmux.client))
-        self.assertTrue(callable(zmux.server))
+        for name in ("write_frame", "join", "open", "client", "server"):
+            with self.subTest(name=name):
+                self.assertTrue(callable(getattr(zmux, name)))
         self.assertFalse(hasattr(zmux, "open_session"))
         self.assertFalse(hasattr(zmux, "open_async_session"))
         self.assertIs(zmux.WritableBuffer, __import__("zmux.streams").streams.WritableBuffer)
@@ -264,12 +275,24 @@ class PackageSurfaceTest(unittest.TestCase):
         self.assertIs(event.error_details, event.error)
         self.assertTrue(event.error_has_code)
         self.assertEqual(event.error_code(-1), int(ErrorCode.STREAM_CLOSED))
-        self.assertEqual(event.error_operation, ErrorOperation.UNKNOWN)
-        self.assertEqual(event.error_reason, zmux.STREAM_CLOSED_MESSAGE)
-        self.assertEqual(event.error_scope, ErrorScope.UNKNOWN)
-        self.assertEqual(event.error_source, ErrorSource.UNKNOWN)
-        self.assertEqual(event.error_direction, ErrorDirection.UNKNOWN)
-        self.assertEqual(event.error_termination_kind, TerminationKind.UNKNOWN)
+        self.assertEqual(
+            (
+                event.error_operation,
+                event.error_reason,
+                event.error_scope,
+                event.error_source,
+                event.error_direction,
+                event.error_termination_kind,
+            ),
+            (
+                ErrorOperation.UNKNOWN,
+                zmux.STREAM_CLOSED_MESSAGE,
+                ErrorScope.UNKNOWN,
+                ErrorSource.UNKNOWN,
+                ErrorDirection.UNKNOWN,
+                TerminationKind.UNKNOWN,
+            ),
+        )
         self.assertFalse(event.error_timeout)
         self.assertFalse(event.error_interrupted)
 
@@ -730,11 +753,22 @@ class PackageSurfaceTest(unittest.TestCase):
             direction=ErrorDirection.WRITE,
             termination_kind=TerminationKind.RESET,
         )
-        self.assertEqual(detailed_app.scope, ErrorScope.STREAM)
-        self.assertEqual(detailed_app.operation, ErrorOperation.WRITE)
-        self.assertEqual(detailed_app.source, ErrorSource.REMOTE)
-        self.assertEqual(detailed_app.direction, ErrorDirection.WRITE)
-        self.assertEqual(detailed_app.termination_kind, TerminationKind.RESET)
+        self.assertEqual(
+            (
+                detailed_app.scope,
+                detailed_app.operation,
+                detailed_app.source,
+                detailed_app.direction,
+                detailed_app.termination_kind,
+            ),
+            (
+                ErrorScope.STREAM,
+                ErrorOperation.WRITE,
+                ErrorSource.REMOTE,
+                ErrorDirection.WRITE,
+                TerminationKind.RESET,
+            ),
+        )
         self.assertEqual(detailed_app.clone().termination_kind, TerminationKind.RESET)
 
         try:
@@ -1117,13 +1151,9 @@ class PackageSurfaceTest(unittest.TestCase):
         overrun = b"\x04\x02\x01"
         with self.assertRaises(ProtocolError) as raised:
             parse_settings_tlv(overrun)
-        error = raised.exception
-        self.assertEqual(str(error), "tlv value overruns containing payload")
-        self.assertEqual(error.code, int(ErrorCode.PROTOCOL))
-        self.assertEqual(error.scope, ErrorScope.SESSION)
-        self.assertEqual(error.operation, ErrorOperation.READ)
-        self.assertEqual(error.source, ErrorSource.REMOTE)
-        self.assertEqual(error.direction, ErrorDirection.READ)
+        self.assert_protocol_read_error(
+            raised.exception, "tlv value overruns containing payload"
+        )
 
         huge_value_length = bytearray()
         append_varint(huge_value_length, SETTING_PREFACE_PADDING)
@@ -2176,13 +2206,9 @@ class PackageSurfaceTest(unittest.TestCase):
 
         with self.assertRaises(ProtocolError) as raised:
             parse_tlvs(b"\x01\x02\xaa")
-        error = raised.exception
-        self.assertEqual(str(error), "tlv value overruns containing payload")
-        self.assertEqual(error.code, int(ErrorCode.PROTOCOL))
-        self.assertEqual(error.scope, ErrorScope.SESSION)
-        self.assertEqual(error.operation, ErrorOperation.READ)
-        self.assertEqual(error.source, ErrorSource.REMOTE)
-        self.assertEqual(error.direction, ErrorDirection.READ)
+        self.assert_protocol_read_error(
+            raised.exception, "tlv value overruns containing payload"
+        )
 
         with self.assertRaises(ProtocolError) as raised:
             parse_tlvs(b"\x40\x01\x00")

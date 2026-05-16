@@ -18,6 +18,7 @@ from enum import IntEnum
 from threading import RLock
 from typing import Any, Callable, Dict, Generic, Optional, TypeVar
 
+from .._validation import require_varint62
 from .control import MIN_PENDING_CONTROL_BUDGET, MIN_PENDING_PRIORITY_BUDGET
 from .flow import repo_default_urgent_lane_cap
 from .keepalive import (
@@ -1997,13 +1998,7 @@ def _strict_nonnegative_int(value: int, name: str) -> int:
 
 
 def _require_varint62(value: int, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError("%s must be an integer" % name)
-    if value < 0:
-        raise ValueError("%s must be >= 0" % name)
-    if value > MAX_VARINT62:
-        raise ValueError("%s must be within varint62 range" % name)
-    return value
+    return require_varint62(value, name)
 
 
 def _nonnegative_float(value: float, name: str) -> float:

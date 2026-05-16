@@ -68,6 +68,12 @@ from zmux.protocol import MAX_VARINT62, SchedulerHint
 
 
 class RuntimeSchedulerPolicyTests(unittest.TestCase):
+    def assert_empty_containers(self, owner, names):
+        for name in names:
+            value = getattr(owner, name)
+            with self.subTest(name=name):
+                self.assertEqual(value, type(value)())
+
     def test_weights_and_feedback_windows_follow_go_scheduler_policy(self):
         max_payload = 1024
 
@@ -402,16 +408,21 @@ class RuntimeSchedulerPolicyTests(unittest.TestCase):
 
         self.assertEqual(scheduler.state.root_virtual_time, 0)
         self.assertEqual(scheduler.state.service_seq, 0)
-        self.assertEqual(scheduler.state.group_virtual_time, {})
-        self.assertEqual(scheduler.state.group_finish_tag, {})
-        self.assertEqual(scheduler.state.group_last_service, {})
-        self.assertEqual(scheduler.state.group_lag, {})
-        self.assertEqual(scheduler.state.stream_finish_tag, {})
-        self.assertEqual(scheduler.state.stream_last_service, {})
-        self.assertEqual(scheduler.state.stream_lag, {})
-        self.assertEqual(scheduler.state.stream_class, {})
-        self.assertEqual(scheduler.state.stream_last_seen_batch, {})
-        self.assertEqual(scheduler.state.small_burst_disarmed, {})
+        self.assert_empty_containers(
+            scheduler.state,
+            (
+                "group_virtual_time",
+                "group_finish_tag",
+                "group_last_service",
+                "group_lag",
+                "stream_finish_tag",
+                "stream_last_service",
+                "stream_lag",
+                "stream_class",
+                "stream_last_seen_batch",
+                "small_burst_disarmed",
+            ),
+        )
         self.assertFalse(scheduler.state.has_preferred_group_head)
         self.assertEqual(scheduler.state.preferred_stream_head, {})
         self.assertEqual(scheduler.state.scratch.groups, [])
@@ -1026,20 +1037,25 @@ class RuntimeSchedulerPolicyTests(unittest.TestCase):
         prepare_batch_scratch_for_build(state, 1)
 
         self.assertEqual(state.scratch.last_build_cap_hint, 1)
-        self.assertEqual(state.scratch.groups, [])
-        self.assertEqual(state.scratch.group_queues, [])
-        self.assertEqual(state.scratch.prepared_streams, {})
-        self.assertEqual(state.scratch.bypass_selections, {})
-        self.assertEqual(state.scratch.interactive_active_streams, [])
-        self.assertEqual(state.scratch.bulk_active_streams, [])
-        self.assertEqual(state.scratch.interactive_candidates, [])
-        self.assertEqual(state.scratch.bulk_candidates, [])
-        self.assertEqual(state.scratch.transient_stream_finish, {})
-        self.assertEqual(state.scratch.transient_stream_last_served, {})
-        self.assertEqual(state.scratch.transient_group_virtual, {})
-        self.assertEqual(state.scratch.transient_group_finish, {})
-        self.assertEqual(state.scratch.transient_group_last_served, {})
-        self.assertEqual(state.scratch.tie_pref_streams, {})
+        self.assert_empty_containers(
+            state.scratch,
+            (
+                "groups",
+                "group_queues",
+                "prepared_streams",
+                "bypass_selections",
+                "interactive_active_streams",
+                "bulk_active_streams",
+                "interactive_candidates",
+                "bulk_candidates",
+                "transient_stream_finish",
+                "transient_stream_last_served",
+                "transient_group_virtual",
+                "transient_group_finish",
+                "transient_group_last_served",
+                "tie_pref_streams",
+            ),
+        )
 
     def test_selected_list_reuse_resets_previous_marks(self):
         state = BatchState()

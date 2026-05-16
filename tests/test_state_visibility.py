@@ -339,17 +339,18 @@ class LocalOpenVisibilityTests(unittest.TestCase):
             )
 
     def test_runtime_stream_reexports_state_visibility_primitives(self):
-        self.assertIs(runtime_stream.LocalOpenPhase, LocalOpenPhase)
-        self.assertIs(runtime_stream.LocalOpenVisibility, LocalOpenVisibility)
-        self.assertIs(runtime_stream.should_enqueue_accepted, should_enqueue_accepted)
-        self.assertIs(runtime_stream.should_finalize_peer_active, should_finalize_peer_active)
-        self.assertIs(runtime_stream.should_flush_priority_update, should_flush_priority_update)
-        self.assertIs(runtime_stream.should_flush_stream_blocked, should_flush_stream_blocked)
-        self.assertIs(runtime_stream.should_flush_stream_max_data, should_flush_stream_max_data)
-        self.assertIs(
-            runtime_stream.should_reclaim_unseen_local_stream,
-            should_reclaim_unseen_local_stream,
-        )
+        for name in (
+                "LocalOpenPhase",
+                "LocalOpenVisibility",
+                "should_enqueue_accepted",
+                "should_finalize_peer_active",
+                "should_flush_priority_update",
+                "should_flush_stream_blocked",
+                "should_flush_stream_max_data",
+                "should_reclaim_unseen_local_stream",
+        ):
+            with self.subTest(name=name):
+                self.assertIs(getattr(runtime_stream, name), globals()[name])
 
 
 if __name__ == "__main__":

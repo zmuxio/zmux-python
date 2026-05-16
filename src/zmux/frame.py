@@ -5,9 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import BinaryIO, Optional, Tuple
 
+from ._validation import require_varint62 as _require_varint62
 from .config import Limits
 from .errors import ErrorDirection, ErrorOperation, ErrorScope, TransportError
-from .protocol import FRAME_FLAG_MASK, MAX_VARINT62, FrameType
+from .protocol import FRAME_FLAG_MASK, FrameType
 
 
 @dataclass(frozen=True)
@@ -235,16 +236,6 @@ def _coerce_frame_type(value: FrameType) -> FrameType:
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError("frame_type must be a FrameType or integer")
     return FrameType.from_code(value)
-
-
-def _require_varint62(value: int, field_name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError("%s must be an integer" % field_name)
-    if value < 0:
-        raise ValueError("%s must be >= 0" % field_name)
-    if value > MAX_VARINT62:
-        raise ValueError("%s must be within varint62 range" % field_name)
-    return int(value)
 
 
 def _require_flags(value: int) -> int:

@@ -270,15 +270,19 @@ class StreamTombstonePrimitiveTests(unittest.TestCase):
         )
 
     def test_runtime_stream_reexports_state_tombstone_primitives(self):
-        self.assertIs(runtime_stream.LateDataAction, LateDataAction)
-        self.assertIs(runtime_stream.TerminalKind, TerminalKind)
-        self.assertIs(runtime_stream.TerminalLateDataResult, TerminalLateDataResult)
-        self.assertIs(runtime_stream.StreamTombstone, StreamTombstone)
-        self.assertIs(runtime_stream.build_stream_tombstone, build_stream_tombstone)
-        self.assertIs(runtime_stream.should_compact_terminal, should_compact_terminal)
-        self.assertIs(runtime_stream.tombstone_late_data_action, tombstone_late_data_action)
-        self.assertIs(runtime_stream.tombstone_terminal_code, tombstone_terminal_code)
-        self.assertIs(runtime_stream.tombstone_terminal_kind, tombstone_terminal_kind)
+        for name in (
+                "LateDataAction",
+                "TerminalKind",
+                "TerminalLateDataResult",
+                "StreamTombstone",
+                "build_stream_tombstone",
+                "should_compact_terminal",
+                "tombstone_late_data_action",
+                "tombstone_terminal_code",
+                "tombstone_terminal_kind",
+        ):
+            with self.subTest(name=name):
+                self.assertIs(getattr(runtime_stream, name), globals()[name])
 
 
 class TerminalBookkeepingTests(unittest.TestCase):

@@ -8,7 +8,6 @@ deadline math, read/write action admission, and terminal frame planning.
 
 from __future__ import annotations
 
-import math
 import time
 from collections import deque
 from collections.abc import MutableSequence, Sequence
@@ -16,8 +15,17 @@ from dataclasses import dataclass, field
 from enum import IntEnum, IntFlag
 from typing import Optional
 
+from ._frames import frame_tuple as _frame_tuple
 from .read_loop import saturating_add
 from .write_plan import advance_parts, checked_total_part_len
+from .._validation import (
+    coerce_int_enum as _coerce_enum,
+    optional_seconds,
+    require_bool as _shared_require_bool,
+    require_nonnegative_int as _nonnegative_int,
+    require_stream_id as _require_stream_id,
+    require_varint62 as _require_varint62,
+)
 from .._state.flow import (
     PeerStreamControlAction,
     ignore_late_non_opening_control,
@@ -116,7 +124,6 @@ from ..protocol import (
     FRAME_FLAG_FIN,
     FRAME_FLAG_OPEN_METADATA,
     FrameType,
-    MAX_VARINT62,
 )
 from ..streams import ReadableBuffer
 
@@ -1639,28 +1646,20 @@ def read_chunk_overhead_bytes(retained: int, data_len: int) -> int:
 
 
 def normalize_deadline(deadline: Optional[float]) -> Optional[float]:
-    if deadline is None:
-        return None
-    if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
-        raise TypeError("deadline must be a timestamp or None")
-    value = float(deadline)
-    if math.isnan(value) or math.isinf(value):
-        return None
-    return value
+    return optional_seconds(deadline, "deadline", description="a timestamp")
 
 
 def timeout_to_deadline(
         timeout_seconds: Optional[float], now: Optional[float] = None
 ) -> Optional[float]:
+    timeout_seconds = optional_seconds(
+        timeout_seconds,
+        "timeout",
+        description="a number",
+        clamp_negative=True,
+    )
     if timeout_seconds is None:
         return None
-    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
-        raise TypeError("timeout must be a number or None")
-    timeout_seconds = float(timeout_seconds)
-    if math.isnan(timeout_seconds) or math.isinf(timeout_seconds):
-        return None
-    if timeout_seconds < 0.0:
-        timeout_seconds = 0.0
     return _monotonic_now(now) + timeout_seconds
 
 
@@ -1814,41 +1813,6 @@ def _payload_bytes(payload: ReadableBuffer, name: str) -> bytes:
         raise TypeError("%s must be bytes-like" % name) from exc
 
 
-def _frame_tuple(frames: Sequence[Frame], name: str) -> tuple[Frame, ...]:
-    if isinstance(frames, Frame):
-        raise TypeError("%s must be a sequence of Frame objects" % name)
-    try:
-        values = tuple(frames)
-    except TypeError as exc:
-        raise TypeError("%s must be a sequence of Frame objects" % name) from exc
-    for frame in values:
-        if not isinstance(frame, Frame):
-            raise TypeError("%s must contain only Frame objects" % name)
-    return values
-
-
-def _require_stream_id(stream_id: int) -> int:
-    stream_id = _require_varint62(stream_id, "stream_id")
-    if stream_id == 0:
-        raise ValueError("stream_id must be non-zero")
-    return stream_id
-
-
-def _require_varint62(value: int, name: str) -> int:
-    value = _nonnegative_int(value, name)
-    if value > MAX_VARINT62:
-        raise ValueError("%s must be within varint62 range" % name)
-    return value
-
-
-def _nonnegative_int(value: int, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError("%s must be an integer" % name)
-    if value < 0:
-        raise ValueError("%s must be >= 0" % name)
-    return value
-
-
 def _signed_int(value: int, name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError("%s must be an integer" % name)
@@ -1856,9 +1820,7 @@ def _signed_int(value: int, name: str) -> int:
 
 
 def _require_bool(value: bool, name: str) -> bool:
-    if not isinstance(value, bool):
-        raise TypeError("%s must be a boolean" % name)
-    return value
+    return _shared_require_bool(value, name, noun="boolean")
 
 
 def _monotonic_now(now: Optional[float]) -> float:
@@ -1867,14 +1829,6 @@ def _monotonic_now(now: Optional[float]) -> float:
     if isinstance(now, bool) or not isinstance(now, (int, float)):
         raise TypeError("now must be a timestamp")
     return float(now)
-
-
-def _coerce_enum(value, enum_type, name: str):
-    if isinstance(value, enum_type):
-        return value
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError("%s must be a %s or integer" % (name, enum_type.__name__))
-    return enum_type(value)
 
 
 __all__ = (

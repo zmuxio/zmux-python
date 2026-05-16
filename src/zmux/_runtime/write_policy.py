@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from .._validation import require_nonnegative_int as _nonnegative_int
 from .flow import saturating_mul_div_floor
 from ..config import default_settings
 from ..protocol import SchedulerHint
@@ -28,17 +29,15 @@ def write_burst_limit(
         priority: int,
         hint: SchedulerHint = SchedulerHint.UNSPECIFIED_OR_BALANCED,
 ) -> int:
-    priority = _nonnegative_int(priority, "priority")
-    hint = _coerce_scheduler_hint(hint)
-    if priority >= 16:
-        return SATURATED_WRITE_BURST_FRAMES
-    if priority >= 4:
-        return STRONG_WRITE_BURST_FRAMES
-    if priority >= 1:
-        return MILD_WRITE_BURST_FRAMES
-    if hint is SchedulerHint.LATENCY:
-        return MILD_WRITE_BURST_FRAMES
-    return DEFAULT_WRITE_BURST_FRAMES
+    return _priority_policy_value(
+        priority,
+        hint,
+        saturated=SATURATED_WRITE_BURST_FRAMES,
+        strong=STRONG_WRITE_BURST_FRAMES,
+        mild=MILD_WRITE_BURST_FRAMES,
+        latency=MILD_WRITE_BURST_FRAMES,
+        default=DEFAULT_WRITE_BURST_FRAMES,
+    )
 
 
 def scaled_fragment_cap(max_value: int, numerator: int, denominator: int) -> int:
@@ -85,34 +84,30 @@ def fragment_time_budget(
         priority: int,
         hint: SchedulerHint = SchedulerHint.UNSPECIFIED_OR_BALANCED,
 ) -> float:
-    priority = _nonnegative_int(priority, "priority")
-    hint = _coerce_scheduler_hint(hint)
-    if priority >= 16:
-        return SATURATED_FRAGMENT_TIME_BUDGET
-    if priority >= 4:
-        return STRONG_FRAGMENT_TIME_BUDGET
-    if priority >= 1:
-        return MILD_FRAGMENT_TIME_BUDGET
-    if hint is SchedulerHint.LATENCY:
-        return STRONG_FRAGMENT_TIME_BUDGET
-    return DEFAULT_FRAGMENT_TIME_BUDGET
+    return _priority_policy_value(
+        priority,
+        hint,
+        saturated=SATURATED_FRAGMENT_TIME_BUDGET,
+        strong=STRONG_FRAGMENT_TIME_BUDGET,
+        mild=MILD_FRAGMENT_TIME_BUDGET,
+        latency=STRONG_FRAGMENT_TIME_BUDGET,
+        default=DEFAULT_FRAGMENT_TIME_BUDGET,
+    )
 
 
 def fragment_time_budget_nanos(
         priority: int,
         hint: SchedulerHint = SchedulerHint.UNSPECIFIED_OR_BALANCED,
 ) -> int:
-    priority = _nonnegative_int(priority, "priority")
-    hint = _coerce_scheduler_hint(hint)
-    if priority >= 16:
-        return SATURATED_FRAGMENT_TIME_BUDGET_NANOS
-    if priority >= 4:
-        return STRONG_FRAGMENT_TIME_BUDGET_NANOS
-    if priority >= 1:
-        return MILD_FRAGMENT_TIME_BUDGET_NANOS
-    if hint is SchedulerHint.LATENCY:
-        return STRONG_FRAGMENT_TIME_BUDGET_NANOS
-    return DEFAULT_FRAGMENT_TIME_BUDGET_NANOS
+    return _priority_policy_value(
+        priority,
+        hint,
+        saturated=SATURATED_FRAGMENT_TIME_BUDGET_NANOS,
+        strong=STRONG_FRAGMENT_TIME_BUDGET_NANOS,
+        mild=MILD_FRAGMENT_TIME_BUDGET_NANOS,
+        latency=STRONG_FRAGMENT_TIME_BUDGET_NANOS,
+        default=DEFAULT_FRAGMENT_TIME_BUDGET_NANOS,
+    )
 
 
 def rate_limited_fragment_cap(
@@ -167,12 +162,27 @@ def _coerce_scheduler_hint(value: SchedulerHint) -> SchedulerHint:
     return SchedulerHint.from_code(value)
 
 
-def _nonnegative_int(value: int, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError("%s must be an integer" % name)
-    if value < 0:
-        raise ValueError("%s must be >= 0" % name)
-    return value
+def _priority_policy_value(
+        priority: int,
+        hint: SchedulerHint,
+        *,
+        saturated,
+        strong,
+        mild,
+        latency,
+        default,
+):
+    priority = _nonnegative_int(priority, "priority")
+    hint = _coerce_scheduler_hint(hint)
+    if priority >= 16:
+        return saturated
+    if priority >= 4:
+        return strong
+    if priority >= 1:
+        return mild
+    if hint is SchedulerHint.LATENCY:
+        return latency
+    return default
 
 
 __all__ = (

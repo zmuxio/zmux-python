@@ -8,19 +8,10 @@ combined internal surface used by the rest of the runtime and tests.
 
 from __future__ import annotations
 
-from typing import Tuple
-
 from . import tx as _tx
 from . import write_queue as _write_queue
+from ._facade import export_modules
 
+__all__ = export_modules(globals(), _tx, _write_queue)
 
-def _export(module: object) -> Tuple[str, ...]:
-    names = tuple(vars(module).get("__all__", ()))
-    for name in names:
-        globals()[name] = getattr(module, name)
-    return names
-
-
-__all__ = _export(_tx) + _export(_write_queue)
-
-del _export, _tx, _write_queue
+del export_modules, _tx, _write_queue

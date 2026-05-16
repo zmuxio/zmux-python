@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from enum import Enum, IntEnum
 from typing import BinaryIO, Deque, Optional, Protocol
 
+from ._errors import frame_size_error, local_internal_error
 from .flow import (
     aggregate_late_data_cap,
     late_data_per_stream_cap,
@@ -109,6 +110,13 @@ from ..protocol import (
     capabilities_can_carry_group_on_open,
     capabilities_can_carry_priority_in_update,
     capabilities_can_carry_priority_on_open,
+)
+from .._validation import (
+    require_bool as _require_bool,
+    require_nonnegative_duration as _nonnegative_duration,
+    require_nonnegative_int as _nonnegative_int,
+    require_stream_id as _require_stream_id,
+    require_varint62 as _require_varint62,
 )
 
 PING_TOKEN_BYTES = 8
@@ -1312,20 +1320,6 @@ def _default_if_zero(value: int, default: int) -> int:
     return default if value == 0 else value
 
 
-def _require_stream_id(stream_id: int) -> int:
-    stream_id = _require_varint62(stream_id, "stream_id")
-    if stream_id == 0:
-        raise ValueError("stream_id must be non-zero")
-    return stream_id
-
-
-def _require_varint62(value: int, name: str) -> int:
-    value = _nonnegative_int(value, name)
-    if value > MAX_VARINT62:
-        raise ValueError("%s must be within varint62 range" % name)
-    return value
-
-
 def _require_ping_payload(payload: bytes, label: str) -> None:
     if len(payload) < PING_TOKEN_BYTES:
         raise FrameSizeError(
@@ -1367,29 +1361,6 @@ def _monotonic_now(now: Optional[float]) -> float:
     return now
 
 
-def _nonnegative_duration(value: float, name: str) -> float:
-    if isinstance(value, bool):
-        raise TypeError("%s must be a duration in seconds" % name)
-    duration = float(value)
-    if duration < 0:
-        raise ValueError("%s must be >= 0" % name)
-    return duration
-
-
-def _nonnegative_int(value: int, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError("%s must be an integer" % name)
-    if value < 0:
-        raise ValueError("%s must be >= 0" % name)
-    return value
-
-
-def _require_bool(value: bool, name: str) -> bool:
-    if not isinstance(value, bool):
-        raise TypeError("%s must be a bool" % name)
-    return value
-
-
 def _remote_protocol_error(message: str) -> ProtocolError:
     return ProtocolError(
         message,
@@ -1413,10 +1384,8 @@ def _flow_control_error(message: str) -> FlowControlError:
 
 
 def _frame_size_error(message: str) -> FrameSizeError:
-    return FrameSizeError(
+    return frame_size_error(
         message,
-        code=int(ErrorCode.FRAME_SIZE),
-        scope=ErrorScope.SESSION,
         operation=ErrorOperation.READ,
         source=ErrorSource.REMOTE,
         direction=ErrorDirection.READ,
@@ -1424,12 +1393,9 @@ def _frame_size_error(message: str) -> FrameSizeError:
 
 
 def _local_internal_error(message: str) -> ProtocolError:
-    return ProtocolError(
+    return local_internal_error(
         message,
-        code=int(ErrorCode.INTERNAL),
-        scope=ErrorScope.SESSION,
         operation=ErrorOperation.READ,
-        source=ErrorSource.LOCAL,
         direction=ErrorDirection.READ,
     )
 

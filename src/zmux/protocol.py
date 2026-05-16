@@ -5,6 +5,8 @@ from __future__ import annotations
 from enum import IntEnum, IntFlag
 from typing import Tuple, Type, TypeVar
 
+from ._validation import require_varint62
+
 MAGIC = b"ZMUX"
 PREFACE_VERSION = 1
 PROTO_VERSION = 1
@@ -358,13 +360,7 @@ def has_capability(capabilities: int, capability: int) -> bool:
 
 
 def _coerce_capability_bits(value: int, field_name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError("%s must be an integer" % field_name)
-    if value < 0:
-        raise ValueError("%s must be >= 0" % field_name)
-    if value > MAX_VARINT62:
-        raise ValueError("%s must be within varint62 range" % field_name)
-    return int(value)
+    return require_varint62(value, field_name)
 
 
 def capabilities_support_open_metadata(capabilities: int) -> bool:

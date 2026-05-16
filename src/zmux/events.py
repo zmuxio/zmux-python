@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+from ._validation import require_varint62 as _require_stream_id
 from .errors import (
     ErrorDirection,
     ErrorOperation,
@@ -28,7 +29,6 @@ from .errors import (
     timeout as _error_timeout,
 )
 from .payload import StreamMetadata, StreamMetadataView
-from .protocol import MAX_VARINT62
 
 
 class EventType(str, Enum):
@@ -205,16 +205,6 @@ def _coerce_metadata(value: object) -> StreamMetadata:
     if isinstance(value, StreamMetadataView):
         return value.to_owned()
     raise TypeError("metadata must be StreamMetadata")
-
-
-def _require_stream_id(value: int, field_name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError("%s must be an integer" % field_name)
-    if value < 0:
-        raise ValueError("%s must be >= 0" % field_name)
-    if value > MAX_VARINT62:
-        raise ValueError("%s must be within varint62 range" % field_name)
-    return int(value)
 
 
 def _coerce_bool(value: bool, field_name: str) -> bool:

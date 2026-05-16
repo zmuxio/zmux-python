@@ -295,11 +295,15 @@ def make_none_read_pair():
 class ZmuxTestingSurfaceTest(unittest.TestCase):
     def test_session_contract_exports(self):
         self.assertIs(zmux_testing.DEFAULT_TIMEOUT, zmux_testing.DEFAULT_TIMEOUT)
-        self.assertTrue(callable(zmux_testing.run_session_contract))
-        self.assertTrue(callable(zmux_testing.run_async_session_contract))
-        self.assertTrue(callable(zmux_testing.locate_fixture_dir))
-        self.assertTrue(callable(zmux_testing.load_fixture_ndjson))
-        self.assertTrue(callable(zmux_testing.read_fixture_json))
+        for name in (
+                "run_session_contract",
+                "run_async_session_contract",
+                "locate_fixture_dir",
+                "load_fixture_ndjson",
+                "read_fixture_json",
+        ):
+            with self.subTest(name=name):
+                self.assertTrue(callable(getattr(zmux_testing, name)))
         self.assertFalse(hasattr(zmux_testing, "load_ndjson"))
         self.assertFalse(hasattr(zmux_testing, "read_json"))
         self.assertNotIn("load_ndjson", zmux_testing.__all__)

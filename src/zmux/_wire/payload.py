@@ -6,7 +6,9 @@ from collections.abc import Iterable
 from typing import Optional
 
 from .tlv import Tlv, append_tlv, iter_tlvs_view, parse_tlvs
-from .varint import append_varint, encode_varint_into, parse_varint, varint_len
+from .varint import append_varint, encode_varint_into, parse_varint, parse_varints, varint_len
+from .._buffers import byte_view
+from .._validation import require_varint62
 from ..errors import (
     EMPTY_METADATA_UPDATE_MESSAGE,
     OPEN_INFO_UNAVAILABLE_MESSAGE,
@@ -416,13 +418,9 @@ def build_go_away_payload_capped(
 
 def parse_go_away_payload(payload: bytes) -> GoAwayPayload:
     payload_view = memoryview(payload)
-    offset = 0
-    last_accepted_bidi, consumed = parse_varint(payload_view, offset, len(payload_view))
-    offset += consumed
-    last_accepted_uni, consumed = parse_varint(payload_view, offset, len(payload_view))
-    offset += consumed
-    code, consumed = parse_varint(payload_view, offset, len(payload_view))
-    offset += consumed
+    (last_accepted_bidi, last_accepted_uni, code), offset = parse_varints(
+        payload_view, 0, len(payload_view), 3
+    )
     return GoAwayPayload(
         last_accepted_bidi=last_accepted_bidi,
         last_accepted_uni=last_accepted_uni,
@@ -540,23 +538,11 @@ def _is_utf8_continuation(value: int) -> bool:
 def _as_byte_view(value: bytes) -> memoryview:
     if value is None:
         return memoryview(b"")
-    view = memoryview(value)
-    if view.ndim == 1 and view.itemsize == 1 and view.format in ("B", "b", "c"):
-        return view
-    try:
-        return view.cast("B")
-    except TypeError:
-        return memoryview(view.tobytes())
+    return byte_view(value)
 
 
 def _require_payload_limit(value: int, field_name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError("%s must be an integer" % field_name)
-    if value < 0:
-        raise ValueError("%s must be >= 0" % field_name)
-    if value > MAX_VARINT62:
-        raise ValueError("%s must be within varint62 range" % field_name)
-    return value
+    return require_varint62(value, field_name)
 
 
 def _metadata_singleton_seen_bit(typ: int) -> int:

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Iterable, Optional, Tuple
 
-from .protocol import MAX_VARINT62
+from ._validation import require_varint62
 
 
 @dataclass(frozen=True)
@@ -354,12 +354,7 @@ def parse_diag_reason(payload: bytes) -> str:
 
 
 def _require_optional_varint62(value: int, field_name: str) -> None:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError("%s must be an integer" % field_name)
-    if value < 0:
-        raise ValueError("%s must be >= 0" % field_name)
-    if value > MAX_VARINT62:
-        raise ValueError("%s must be within varint62 range" % field_name)
+    require_varint62(value, field_name)
 
 
 def _coerce_bytes(value) -> bytes:

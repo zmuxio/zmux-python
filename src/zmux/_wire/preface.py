@@ -6,7 +6,9 @@ from typing import BinaryIO
 
 from .io import read_exact_bytes
 from .settings import marshal_settings_tlv, parse_settings_tlv
-from .varint import encode_varint_into, parse_varint, read_varint, varint_len
+from .varint import encode_varint_into, parse_varints, read_varint, varint_len
+from .._buffers import byte_view
+from .._validation import require_varint62 as _require_varint62
 from ..config import DEFAULT_CAPABILITIES, Settings, default_settings
 from ..errors import (
     ErrorDirection,
@@ -33,6 +35,18 @@ MIN_COMPAT_FRAME_PAYLOAD = 16384
 MIN_COMPAT_CONTROL_PAYLOAD = 4096
 MIN_COMPAT_EXTENSION_PAYLOAD = 4096
 PREFACE_SETTINGS_TOO_LARGE = "settings_tlv exceeds 4096 bytes"
+_RESOLVED_EXPLICIT_OR_AUTO_ROLES = {
+    (Role.INITIATOR, Role.RESPONDER): (Role.INITIATOR, Role.RESPONDER),
+    (Role.RESPONDER, Role.INITIATOR): (Role.RESPONDER, Role.INITIATOR),
+    (Role.INITIATOR, Role.AUTO): (Role.INITIATOR, Role.RESPONDER),
+    (Role.RESPONDER, Role.AUTO): (Role.RESPONDER, Role.INITIATOR),
+    (Role.AUTO, Role.INITIATOR): (Role.RESPONDER, Role.INITIATOR),
+    (Role.AUTO, Role.RESPONDER): (Role.INITIATOR, Role.RESPONDER),
+}
+_EXPLICIT_ROLE_CONFLICTS = {
+    (Role.INITIATOR, Role.INITIATOR): "both peers explicitly requested initiator",
+    (Role.RESPONDER, Role.RESPONDER): "both peers explicitly requested responder",
+}
 
 __all__ = (
     "MIN_COMPAT_CONTROL_PAYLOAD",
@@ -112,18 +126,13 @@ def parse_preface_prefix(data: bytes) -> tuple[Preface, int]:
             "unsupported preface version", ErrorCode.UNSUPPORTED_VERSION
         )
     role = _parse_role(data_view[5], ErrorOperation.READ)
-    offset = PREFACE_FIXED_LEN
-
-    tie_breaker_nonce, consumed = parse_varint(data_view, offset, len(data_view))
-    offset += consumed
-    min_proto, consumed = parse_varint(data_view, offset, len(data_view))
-    offset += consumed
-    max_proto, consumed = parse_varint(data_view, offset, len(data_view))
-    offset += consumed
-    capabilities, consumed = parse_varint(data_view, offset, len(data_view))
-    offset += consumed
-    settings_len, consumed = parse_varint(data_view, offset, len(data_view))
-    offset += consumed
+    (
+        tie_breaker_nonce,
+        min_proto,
+        max_proto,
+        capabilities,
+        settings_len,
+    ), offset = parse_varints(data_view, PREFACE_FIXED_LEN, len(data_view), 5)
     if settings_len > MAX_PREFACE_SETTINGS_BYTES:
         raise _preface_frame_size_error(PREFACE_SETTINGS_TOO_LARGE, ErrorOperation.READ)
     if len(data_view) - offset < settings_len:
@@ -220,26 +229,14 @@ def resolve_roles(
     local_nonce = _require_varint62(local_nonce, "local_nonce")
     peer_nonce = _require_varint62(peer_nonce, "peer_nonce")
 
-    if local_role == Role.INITIATOR and peer_role == Role.RESPONDER:
-        return Role.INITIATOR, Role.RESPONDER
-    if local_role == Role.RESPONDER and peer_role == Role.INITIATOR:
-        return Role.RESPONDER, Role.INITIATOR
-    if local_role == Role.INITIATOR and peer_role == Role.AUTO:
-        return Role.INITIATOR, Role.RESPONDER
-    if local_role == Role.RESPONDER and peer_role == Role.AUTO:
-        return Role.RESPONDER, Role.INITIATOR
-    if local_role == Role.AUTO and peer_role == Role.INITIATOR:
-        return Role.RESPONDER, Role.INITIATOR
-    if local_role == Role.AUTO and peer_role == Role.RESPONDER:
-        return Role.INITIATOR, Role.RESPONDER
-    if local_role == Role.INITIATOR and peer_role == Role.INITIATOR:
-        raise _preface_negotiate_error(
-            "both peers explicitly requested initiator", ErrorCode.ROLE_CONFLICT
-        )
-    if local_role == Role.RESPONDER and peer_role == Role.RESPONDER:
-        raise _preface_negotiate_error(
-            "both peers explicitly requested responder", ErrorCode.ROLE_CONFLICT
-        )
+    resolved = _RESOLVED_EXPLICIT_OR_AUTO_ROLES.get((local_role, peer_role))
+    if resolved is not None:
+        return resolved
+
+    conflict_message = _EXPLICIT_ROLE_CONFLICTS.get((local_role, peer_role))
+    if conflict_message is not None:
+        raise _preface_negotiate_error(conflict_message, ErrorCode.ROLE_CONFLICT)
+
     if local_role == Role.AUTO and peer_role == Role.AUTO:
         if local_nonce == peer_nonce:
             raise _preface_negotiate_error(
@@ -345,16 +342,6 @@ def _coerce_role(value: Role, field_name: str) -> Role:
     return Role.from_code(value)
 
 
-def _require_varint62(value: int, field_name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError("%s must be an integer" % field_name)
-    if value < 0:
-        raise ValueError("%s must be >= 0" % field_name)
-    if value > ((1 << 62) - 1):
-        raise ValueError("%s must be within varint62 range" % field_name)
-    return int(value)
-
-
 def _read_preface_varint(reader: BinaryIO) -> tuple[int, int]:
     try:
         return read_varint(reader)
@@ -374,13 +361,7 @@ def _read_exact(reader: BinaryIO, size: int, truncated_message: str) -> bytes:
 def _byte_view(value: bytes) -> memoryview:
     if value is None:
         return memoryview(b"")
-    view = memoryview(value)
-    if view.ndim == 1 and view.itemsize == 1 and view.format in ("B", "b", "c"):
-        return view
-    try:
-        return view.cast("B")
-    except (TypeError, ValueError):
-        return memoryview(view.tobytes())
+    return byte_view(value)
 
 
 def _preface_parse_error(

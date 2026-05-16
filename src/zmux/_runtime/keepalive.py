@@ -15,6 +15,10 @@ from threading import Lock
 from typing import Any
 
 from .flow import MAX_UINT64
+from .._validation import (
+    require_bool as _shared_require_bool,
+    require_nonnegative_duration as _duration_seconds,
+)
 from ..config import DEFAULT_PING_PADDING_MAX_BYTES, DEFAULT_PING_PADDING_MIN_BYTES, Settings
 
 KEEPALIVE_JITTER_GAMMA = 0x9E3779B97F4A7C15
@@ -498,19 +502,8 @@ def _nonnegative_int(value: int, name: str) -> int:
     return value
 
 
-def _duration_seconds(value: float, name: str) -> float:
-    if isinstance(value, bool):
-        raise TypeError("%s must be a duration in seconds" % name)
-    seconds = float(value)
-    if seconds < 0:
-        raise ValueError("%s must be >= 0" % name)
-    return seconds
-
-
 def _require_bool(value: bool, name: str) -> bool:
-    if not isinstance(value, bool):
-        raise TypeError("%s must be a bool" % name)
-    return value
+    return _shared_require_bool(value, name)
 
 
 def _byte_view(data: bytes) -> memoryview:

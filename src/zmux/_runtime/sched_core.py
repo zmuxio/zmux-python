@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Dict, Optional
 
+from ._containers import clear_attrs
 from .flow import (
     MAX_UINT64,
     saturating_add,
@@ -42,6 +43,45 @@ CLASS_SCORE_SCALE = 8
 BATCH_SCRATCH_RETAIN_MIN_CAP = 256
 BATCH_SCRATCH_RETAIN_FACTOR = 4
 _DEFAULT_MAX_FRAME_PAYLOAD = default_settings().max_frame_payload
+
+_BATCH_SCRATCH_CLEAR_ATTRS = (
+    "group_order",
+    "groups",
+    "group_state",
+    "group_queue_entries",
+    "stream_order",
+    "stream_order_entries",
+    "queued_bytes",
+    "stream_meta",
+    "prepared_streams",
+    "bypass_selections",
+    "interactive_active_streams",
+    "bulk_active_streams",
+    "interactive_candidates",
+    "bulk_candidates",
+    "transient_stream_finish",
+    "transient_stream_last_served",
+    "transient_group_virtual",
+    "transient_group_finish",
+    "transient_group_last_served",
+    "tie_pref_streams",
+    "ordered",
+    "selected",
+    "recorded_group_head",
+)
+_IDLE_BATCH_STATE_ATTRS = (
+    "group_virtual_time",
+    "group_finish_tag",
+    "group_last_service",
+    "group_lag",
+    "stream_finish_tag",
+    "stream_last_service",
+    "stream_lag",
+    "stream_class",
+    "stream_last_seen_batch",
+    "small_burst_disarmed",
+    "preferred_stream_head",
+)
 
 
 class TrafficClass(IntEnum):
@@ -220,34 +260,12 @@ class BatchScratch(object):
         self.last_build_cap_hint = 0
 
     def clear_refs(self) -> None:
-        self.group_order.clear()
-        self.groups.clear()
-        self.group_state.clear()
         for queues in self.group_queues:
             queues.clear()
+        clear_attrs(self, _BATCH_SCRATCH_CLEAR_ATTRS)
         self.group_queue_count = 0
-        self.group_queue_entries.clear()
         self.group_queue_entry_count = 0
-        self.stream_order.clear()
-        self.stream_order_entries.clear()
         self.stream_order_entry_count = 0
-        self.queued_bytes.clear()
-        self.stream_meta.clear()
-        self.prepared_streams.clear()
-        self.bypass_selections.clear()
-        self.interactive_active_streams.clear()
-        self.bulk_active_streams.clear()
-        self.interactive_candidates.clear()
-        self.bulk_candidates.clear()
-        self.transient_stream_finish.clear()
-        self.transient_stream_last_served.clear()
-        self.transient_group_virtual.clear()
-        self.transient_group_finish.clear()
-        self.transient_group_last_served.clear()
-        self.tie_pref_streams.clear()
-        self.ordered.clear()
-        self.selected.clear()
-        self.recorded_group_head.clear()
         self.last_build_cap_hint = 0
 
     def clear_build_refs(self) -> None:
@@ -550,17 +568,7 @@ def scrub_idle_retained_batch_state(state: Optional[BatchState]) -> None:
 def release_idle_batch_state_storage(state: Optional[BatchState]) -> None:
     if state is None:
         return
-    state.group_virtual_time.clear()
-    state.group_finish_tag.clear()
-    state.group_last_service.clear()
-    state.group_lag.clear()
-    state.stream_finish_tag.clear()
-    state.stream_last_service.clear()
-    state.stream_lag.clear()
-    state.stream_class.clear()
-    state.stream_last_seen_batch.clear()
-    state.small_burst_disarmed.clear()
-    state.preferred_stream_head.clear()
+    clear_attrs(state, _IDLE_BATCH_STATE_ATTRS)
     state.scratch.clear()
 
 

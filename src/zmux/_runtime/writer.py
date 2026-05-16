@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Dict, List, Optional, Protocol, Tuple
 
+from ._containers import clear_attrs
+from ._errors import frame_size_error, local_internal_error
 from .queue import (
     MAX_UINT64,
     MAX_WRITE_BATCH_FRAMES,
@@ -45,6 +47,11 @@ from .sched_core import (
     order_batch_indices,
 )
 from .write_plan import rate_limited_fragment_cap, saturating_add
+from .._validation import (
+    coerce_int_enum as _coerce_enum,
+    require_bool as _shared_require_bool,
+    require_nonnegative_int as _nonnegative_int,
+)
 from .._wire.frame import append_frame_header_trusted, normalize_limits
 from .._wire.varint import parse_varint
 from ..config import Settings, default_settings
@@ -63,7 +70,6 @@ from ..frame import Frame
 from ..protocol import (
     EXT_PRIORITY_UPDATE,
     FRAME_FLAG_OPEN_METADATA,
-    ErrorCode,
     FrameType,
     SchedulerHint,
 )
@@ -77,6 +83,22 @@ MAX_RETAINED_WRITE_BATCH_BYTES = MAX_WRITE_BATCH_FRAMES * _DEFAULT_MAX_FRAME_PAY
 MIN_VECTORED_PAYLOAD_BYTES = 16 << 10
 MAX_VECTORED_SEGMENTS = 64
 MIN_VECTORED_PAYLOAD_BYTES_PER_SEGMENT = 1024
+_WRITE_BATCH_RETAINED_ATTRS = (
+    "batch",
+    "ordered",
+    "rejected",
+)
+_WRITE_BATCH_SCRATCH_ATTRS = (
+    "batch",
+    "items",
+    "ordered",
+    "rejected",
+    "encoded",
+    "explicit_groups",
+    "explicit_group_ids",
+    "queued_by_stream",
+    "queued_streams",
+)
 MIN_RETAINED_ENCODED_BUFFER_BYTES = 64 << 10
 MAX_RETAINED_ENCODED_BUFFER_BYTES = 512 << 10
 MIN_RETAINED_BATCH_FRAMES = 64
@@ -314,21 +336,11 @@ class WriteBatchScratch(object):
         self.explicit_group_ids.append(group_id)
 
     def clear_retained_batch_refs(self) -> None:
-        self.batch.clear()
-        self.ordered.clear()
-        self.rejected.clear()
+        clear_attrs(self, _WRITE_BATCH_RETAINED_ATTRS)
         self.clear_queued_stream_refs()
 
     def reset(self) -> None:
-        self.batch.clear()
-        self.items.clear()
-        self.ordered.clear()
-        self.rejected.clear()
-        self.encoded.clear()
-        self.explicit_groups.clear()
-        self.explicit_group_ids.clear()
-        self.queued_by_stream.clear()
-        self.queued_streams.clear()
+        clear_attrs(self, _WRITE_BATCH_SCRATCH_ATTRS)
 
     def queued_stream_scratch(self, cap_hint: int = 0) -> Dict[int, int]:
         _nonnegative_int(cap_hint, "cap_hint")
@@ -1259,22 +1271,6 @@ def _write_count(value: int) -> int:
     return value
 
 
-def _coerce_enum(value, enum_type, name: str):
-    if isinstance(value, enum_type):
-        return value
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError("%s must be a %s or integer" % (name, enum_type.__name__))
-    return enum_type(value)
-
-
-def _nonnegative_int(value: int, name: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError("%s must be an integer" % name)
-    if value < 0:
-        raise ValueError("%s must be >= 0" % name)
-    return value
-
-
 def _positive_int(value: int, name: str) -> int:
     value = _nonnegative_int(value, name)
     if value == 0:
@@ -1314,16 +1310,12 @@ def _signed_int(value: int, name: str) -> int:
 
 
 def _require_bool(value: bool, name: str) -> bool:
-    if not isinstance(value, bool):
-        raise TypeError("%s must be a boolean" % name)
-    return value
+    return _shared_require_bool(value, name, noun="boolean")
 
 
 def _frame_size_write(message: str) -> FrameSizeError:
-    return FrameSizeError(
+    return frame_size_error(
         message,
-        code=int(ErrorCode.FRAME_SIZE),
-        scope=ErrorScope.SESSION,
         operation=ErrorOperation.WRITE,
         source=ErrorSource.LOCAL,
         direction=ErrorDirection.WRITE,
@@ -1331,12 +1323,9 @@ def _frame_size_write(message: str) -> FrameSizeError:
 
 
 def _local_internal_error(message: str) -> ProtocolError:
-    return ProtocolError(
+    return local_internal_error(
         message,
-        code=int(ErrorCode.INTERNAL),
-        scope=ErrorScope.SESSION,
         operation=ErrorOperation.WRITE,
-        source=ErrorSource.LOCAL,
         direction=ErrorDirection.WRITE,
     )
 

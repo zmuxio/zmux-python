@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Iterable
 from types import TracebackType
 from typing import Optional, Protocol, Union, runtime_checkable
 
+from ._validation import optional_seconds
 from .payload import MetadataUpdate, StreamMetadata
 
 ReadableBuffer = Union[bytes, bytearray, memoryview]
@@ -327,14 +327,13 @@ def maybe_timeout(timeout: Optional[float]) -> Optional[float]:
     immediate timeout, matching the runtime deadline helpers.
     """
 
-    if timeout is None:
-        return None
-    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
-        raise TypeError("timeout must be a number or None")
-    value = float(timeout)
-    if math.isnan(value) or math.isinf(value):
-        return None
-    return max(0.0, value)
+    value = optional_seconds(
+        timeout,
+        "timeout",
+        description="a number",
+        clamp_negative=True,
+    )
+    return None if value is None else value
 
 
 __all__ = (
