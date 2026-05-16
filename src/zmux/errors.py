@@ -600,6 +600,7 @@ def error_code_name(code: int) -> str:
         return "APPLICATION_ERROR"
 
 
+# noinspection PyTypeHints
 def find_error(error: BaseException, error_type: Type[_E]) -> Optional[_E]:
     """Find the first nested exception of ``error_type`` within ``error``."""
 

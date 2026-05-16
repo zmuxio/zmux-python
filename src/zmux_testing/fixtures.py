@@ -15,7 +15,9 @@ from copy import deepcopy
 from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, List, Optional, Union
 
+# noinspection PyTypeHints
 PathLike = Union[str, os.PathLike]
+# noinspection PyTypeHints
 MaybePathLike = Optional[Union[str, os.PathLike]]
 
 _FIXTURE_ENV = "ZMUX_FIXTURE_DIR"

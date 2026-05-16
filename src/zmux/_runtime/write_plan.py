@@ -55,6 +55,8 @@ from ..protocol import (
 )
 from ..streams import ReadableBuffer
 
+FrameBuffer = List[Frame]
+
 class OpenerVisibilityMark(IntEnum):
     UNCHANGED = 0
     PEER_VISIBLE = 1
@@ -118,7 +120,7 @@ class WriteBurstFlushMode(IntEnum):
 
 
 @dataclass(frozen=True)
-class WritePrepareWindow:
+class WritePrepareWindow(object):
     opener_visibility: OpenerVisibilityMark = OpenerVisibilityMark.UNCHANGED
     prefix_len: int = 0
     available_session: int = 0
@@ -149,7 +151,7 @@ class WritePrepareWindow:
 
 
 @dataclass(frozen=True)
-class LocalOpenerPrepareResult:
+class LocalOpenerPrepareResult(object):
     visibility: OpenerVisibilityMark = OpenerVisibilityMark.UNCHANGED
     status: LocalOpenerPrepareStatus = LocalOpenerPrepareStatus.READY
     wait: object = None
@@ -171,7 +173,7 @@ class LocalOpenerPrepareResult:
 
 
 @dataclass(frozen=True)
-class WritePrepareAttempt:
+class WritePrepareAttempt(object):
     window: WritePrepareWindow = field(default_factory=WritePrepareWindow)
     outcome: WritePrepareOutcome = WritePrepareOutcome.READY
 
@@ -186,7 +188,7 @@ class WritePrepareAttempt:
 
 
 @dataclass(frozen=True)
-class WriteStep:
+class WriteStep(object):
     frame: Frame
     app_n: int = 0
     opener_visibility: OpenerVisibilityMark = OpenerVisibilityMark.UNCHANGED
@@ -203,7 +205,7 @@ class WriteStep:
 
 
 @dataclass(frozen=True)
-class PreparedWriteStepBuild:
+class PreparedWriteStepBuild(object):
     step: Optional[WriteStep] = None
     ready: bool = False
     chunk: int = 0
@@ -225,7 +227,7 @@ class PreparedWriteStepBuild:
 
 
 @dataclass(frozen=True)
-class PreparedPriorityFrame:
+class PreparedPriorityFrame(object):
     frame: Optional[Frame] = None
     frame_bytes: int = 0
 
@@ -249,7 +251,7 @@ class PreparedPriorityFrame:
 
 
 @dataclass(frozen=True)
-class WriteBatchStart:
+class WriteBatchStart(object):
     burst_limit: int = DEFAULT_WRITE_BURST_FRAMES
     priority: PreparedPriorityFrame = field(default_factory=PreparedPriorityFrame)
     queue_byte_cap: int = 0
@@ -273,7 +275,7 @@ class WriteBatchStart:
 
 
 @dataclass
-class QueuedWriteCommit:
+class QueuedWriteCommit(object):
     progress: int = 0
     opener_visibility: OpenerVisibilityMark = OpenerVisibilityMark.UNCHANGED
     finalize: bool = False
@@ -301,8 +303,8 @@ class QueuedWriteCommit:
 
 
 @dataclass
-class WriteBurstState:
-    frames: List[Frame] = field(default_factory=list)
+class WriteBurstState(object):
+    frames: FrameBuffer = field(default_factory=list)
     queued_bytes: int = 0
     commit: QueuedWriteCommit = field(default_factory=QueuedWriteCommit)
     data_frames: int = 0
@@ -314,8 +316,9 @@ class WriteBurstState:
             raise TypeError("commit must be QueuedWriteCommit")
         self.data_frames = _nonnegative_int(self.data_frames, "data_frames")
 
+    # noinspection PyTypeHints
     def init_frame_buffer(
-            self, start: WriteBatchStart, frames: Optional[List[Frame]] = None
+            self, start: WriteBatchStart, frames: Optional[FrameBuffer] = None
     ) -> None:
         self.frames = [] if frames is None else list(_frame_tuple(frames, "frames"))
         self.frames.clear()
@@ -363,7 +366,7 @@ class WriteBurstState:
 
 
 @dataclass(frozen=True)
-class WriteBurstBatchPreparation:
+class WriteBurstBatchPreparation(object):
     start: WriteBatchStart = field(default_factory=WriteBatchStart)
     frames: Tuple[Frame, ...] = ()
     queued_bytes: int = 0
@@ -391,7 +394,7 @@ class WriteBurstBatchPreparation:
 
 
 @dataclass(frozen=True)
-class WriteBurstResult:
+class WriteBurstResult(object):
     progress: int = 0
     final_state: WriteBurstFinalState = WriteBurstFinalState.NOT_FINALIZED
     stop: bool = False

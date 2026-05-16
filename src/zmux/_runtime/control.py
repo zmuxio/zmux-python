@@ -84,7 +84,7 @@ class PendingPriorityQueueStatus(IntEnum):
 
 
 @dataclass(frozen=True)
-class PriorityUpdatePlan:
+class PriorityUpdatePlan(object):
     """Projected memory state for replacing one pending priority update."""
 
     next_pending_bytes: int = 0
@@ -102,7 +102,7 @@ class PriorityUpdatePlan:
 
 
 @dataclass(frozen=True)
-class AdvisoryHandoffPlan:
+class AdvisoryHandoffPlan(object):
     """Projected tracked memory after moving pending advisory bytes to a queue."""
 
     projected_tracked: int = 0
@@ -116,7 +116,7 @@ class AdvisoryHandoffPlan:
 
 
 @dataclass(frozen=True)
-class PendingControlValue:
+class PendingControlValue(object):
     """A coalesced varint control value and its presence bit."""
 
     value: int = 0
@@ -135,7 +135,7 @@ class PendingControlValue:
 
 
 @dataclass(frozen=True)
-class PendingControlMetrics:
+class PendingControlMetrics(object):
     """Small diagnostic counters owned by pending control bookkeeping."""
 
     coalesced_terminal_signals: int = 0
@@ -161,7 +161,7 @@ class PendingControlMetrics:
 
 
 @dataclass(frozen=True)
-class WriteRequest:
+class WriteRequest(object):
     """A runtime write request assembled from pending control frames."""
 
     frames: tuple[Frame, ...]
@@ -193,7 +193,7 @@ class WriteRequest:
 
 
 @dataclass(frozen=True)
-class PendingWriteRequestResult:
+class PendingWriteRequestResult(object):
     """Result returned by one pending-write take attempt."""
 
     request: Optional[WriteRequest] = None
@@ -204,7 +204,7 @@ class PendingWriteRequestResult:
 
 
 @dataclass(frozen=True)
-class PendingPriorityQueueResult:
+class PendingPriorityQueueResult(object):
     """Structured result for local PRIORITY_UPDATE queueing."""
 
     status: PendingPriorityQueueStatus = PendingPriorityQueueStatus.NONE
@@ -241,7 +241,7 @@ class PendingPriorityQueueResult:
 
 
 @dataclass(frozen=True)
-class PreparedPriorityUpdate:
+class PreparedPriorityUpdate(object):
     """A pending priority update moved out for stream-local write ordering."""
 
     stream_id: int = 0
@@ -263,7 +263,7 @@ class PreparedPriorityUpdate:
 
 
 @dataclass(frozen=True)
-class PendingControlSnapshot:
+class PendingControlSnapshot(object):
     """Immutable inspection snapshot for tests and diagnostics."""
 
     control_bytes: int = 0
@@ -281,7 +281,7 @@ class PendingControlSnapshot:
     metrics: PendingControlMetrics = field(default_factory=PendingControlMetrics)
 
 
-class PendingTxFrameCollector:
+class PendingTxFrameCollector(object):
     """Collect a bounded write batch using Go's first-frame-admission rule."""
 
     def __init__(
@@ -357,7 +357,7 @@ class PendingTxFrameCollector:
         return tuple(self.frames)
 
 
-class PendingControlState:
+class PendingControlState(object):
     """Coalesced pending control/advisory state for one session.
 
     The owning runtime is expected to call methods while holding its session

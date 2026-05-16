@@ -9,7 +9,7 @@ from .protocol import MAX_VARINT62
 
 
 @dataclass(frozen=True)
-class StreamMetadata:
+class StreamMetadata(object):
     """Peer-visible stream metadata known locally."""
 
     priority: Optional[int] = None
@@ -52,7 +52,7 @@ class StreamMetadata:
 
 
 @dataclass(frozen=True)
-class StreamMetadataView:
+class StreamMetadataView(object):
     """Borrowed peer-visible stream metadata."""
 
     priority: Optional[int] = None
@@ -91,7 +91,7 @@ class StreamMetadataView:
 
 
 @dataclass(frozen=True)
-class MetadataUpdate:
+class MetadataUpdate(object):
     """Post-open advisory metadata update request."""
 
     priority: Optional[int] = None
@@ -110,7 +110,7 @@ class MetadataUpdate:
 
 
 @dataclass(frozen=True)
-class DataPayload:
+class DataPayload(object):
     """Parsed DATA payload split into metadata and application bytes."""
 
     metadata_tlvs: Tuple[object, ...] = ()
@@ -171,7 +171,7 @@ class DataPayload:
 
 
 @dataclass(frozen=True)
-class DataPayloadView:
+class DataPayloadView(object):
     """Parsed DATA payload view split into metadata and application bytes."""
 
     metadata: StreamMetadataView = field(default_factory=StreamMetadataView)
@@ -223,7 +223,7 @@ class DataPayloadView:
 
 
 @dataclass(frozen=True)
-class GoAwayPayload:
+class GoAwayPayload(object):
     """Parsed GOAWAY payload."""
 
     last_accepted_bidi: int

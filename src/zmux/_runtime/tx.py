@@ -57,6 +57,7 @@ MAX_WRITE_BATCH_FRAMES = DEFAULT_WRITE_BATCH_MAX_FRAMES
 FRAME_QUEUE_OVERHEAD_BYTES = 1
 MAX_INITIAL_QUEUE_SCRATCH_RESERVE = 64
 MAX_TX_PAYLOAD_PREALLOC_BYTES = MAX_WRITE_BATCH_FRAMES * Limits().max_frame_payload
+PriorityUpdateFields = Tuple[Optional[int], Optional[int]]
 
 WRITER_QUEUE_FULL_MESSAGE = "zmux: writer queue full"
 URGENT_WRITER_QUEUE_FULL_MESSAGE = "zmux: urgent writer queue full"
@@ -159,7 +160,7 @@ class WriteQueuePopStatus(IntEnum):
 
 
 @dataclass(frozen=True)
-class ChunkSpan:
+class ChunkSpan(object):
     start: int
     end: int
 
@@ -309,7 +310,7 @@ def write_all(writer: object, data: ReadableBuffer) -> None:
 
 
 @dataclass(frozen=True)
-class CoalesceKey:
+class CoalesceKey(object):
     kind: CoalesceKind
     stream_id: int = 0
 
@@ -323,7 +324,7 @@ class CoalesceKey:
 
 
 @dataclass
-class TxFrame:
+class TxFrame(object):
     frame_type: FrameType
     flags: int = 0
     stream_id: int = 0
@@ -527,7 +528,7 @@ class TxFrame:
 
 
 @dataclass(frozen=True)
-class PreparedPriorityUpdate:
+class PreparedPriorityUpdate(object):
     frame: Optional[TxFrame] = None
     stream_id: int = 0
     payload: bytes = b""
@@ -553,7 +554,7 @@ class PreparedPriorityUpdate:
 
 
 @dataclass
-class QueuedWriteRequest:
+class QueuedWriteRequest(object):
     frames: Tuple[TxFrame, ...] = ()
     origin: WriteRequestOrigin = WriteRequestOrigin.PROTOCOL
     terminal_policy: TerminalWritePolicy = TerminalWritePolicy.REJECT
@@ -693,7 +694,7 @@ class QueuedWriteRequest:
 
 
 @dataclass(frozen=True)
-class QueuedWriteResult:
+class QueuedWriteResult(object):
     admitted: bool = False
     completed: bool = False
     error: Optional[BaseException] = None
@@ -711,7 +712,7 @@ class QueuedWriteResult:
 
 
 @dataclass
-class QueueReservationResult:
+class QueueReservationResult(object):
     state: QueueReservationState = QueueReservationState.NONE
     memory_error: Optional[BaseException] = None
 
@@ -723,7 +724,7 @@ class QueueReservationResult:
 
 
 @dataclass
-class DataCosts:
+class DataCosts(object):
     total: int = 0
     by_stream: Dict[int, int] = field(default_factory=dict)
 
@@ -756,7 +757,7 @@ class DataCosts:
 
 
 @dataclass(frozen=True)
-class QueueCost:
+class QueueCost(object):
     queued: int = 0
     urgent: int = 0
     advisory: int = 0
@@ -787,7 +788,7 @@ class QueueCost:
 
 
 @dataclass(frozen=True)
-class StreamDiscardStats:
+class StreamDiscardStats(object):
     removed_frames: int = 0
     data_frames: int = 0
     data_bytes: int = 0
@@ -839,7 +840,7 @@ class StreamDiscardStats:
 
 
 @dataclass(frozen=True)
-class WriteQueueLimits:
+class WriteQueueLimits(object):
     max_bytes: int = 1
     urgent_max_bytes: int = 1
     session_data_max_bytes: int = 1
@@ -865,7 +866,7 @@ class WriteQueueLimits:
 
 
 @dataclass(frozen=True)
-class WriterQueueStats:
+class WriterQueueStats(object):
     urgent_jobs: int = 0
     advisory_jobs: int = 0
     ordinary_jobs: int = 0
@@ -906,7 +907,7 @@ class WriterQueueStats:
 
 
 @dataclass(frozen=True)
-class WriteCompletionResult:
+class WriteCompletionResult(object):
     """Completed tracked-write result.
 
     ``None`` from ``try_result()`` means still pending; a result with
@@ -924,7 +925,7 @@ class WriteCompletionResult:
             raise self.error
 
 
-class WriteCompletion:
+class WriteCompletion(object):
     """Thread-safe completion token for queued tracked writes."""
 
     def __init__(self) -> None:
@@ -1004,7 +1005,7 @@ class WriteCompletion:
 
 
 @dataclass(frozen=True)
-class TrackedWriteJob:
+class TrackedWriteJob(object):
     frames: Tuple[Frame, ...]
     completion: WriteCompletion
 
@@ -1013,7 +1014,7 @@ class TrackedWriteJob:
 
 
 @dataclass(frozen=True)
-class WriteJob:
+class WriteJob(object):
     kind: WriteJobKind
     frame: Optional[Frame] = None
     frames: Tuple[Frame, ...] = ()
@@ -1832,9 +1833,10 @@ def merged_priority_update_payload(old_payload: bytes, new_payload: bytes) -> Op
     return bytes(out)
 
 
+# noinspection PyTypeHints
 def priority_update_fields(
         payload: bytes
-) -> Optional[Tuple[Optional[int], Optional[int]]]:
+) -> Optional[PriorityUpdateFields]:
     try:
         metadata, valid = parse_priority_update_payload(payload)
     except Exception:

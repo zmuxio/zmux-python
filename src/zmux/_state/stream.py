@@ -168,7 +168,7 @@ class DataFrameTraits(IntFlag):
 
 
 @dataclass(frozen=True)
-class MetadataChange:
+class MetadataChange(object):
     """Result of replacing a stream metadata snapshot."""
 
     previous_open_info_len: int = 0
@@ -185,14 +185,14 @@ class MetadataChange:
 
 
 @dataclass(frozen=True)
-class ReceivedMetadataPolicy:
+class ReceivedMetadataPolicy(object):
     allow_priority: bool = False
     allow_group: bool = False
     allow_open_info_payload: bool = False
 
 
 @dataclass
-class StreamMetadataState:
+class StreamMetadataState(object):
     """Peer-visible metadata and local-open visibility bookkeeping."""
 
     metadata: StreamMetadata = field(default_factory=StreamMetadata)
@@ -457,7 +457,7 @@ class StreamMetadataState:
 
 
 @dataclass
-class StreamLifecycleState:
+class StreamLifecycleState(object):
     """Visibility, accept, event, and active-count flags."""
 
     application_visible: bool = False
@@ -510,7 +510,7 @@ class StreamLifecycleState:
 
 
 @dataclass
-class StreamAdvisoryState:
+class StreamAdvisoryState(object):
     """Retained peer reasons and scheduling-advisory state."""
 
     send_stop_reason_bytes: int = 0
@@ -566,7 +566,7 @@ class StreamAdvisoryState:
 
 
 @dataclass
-class StreamSendAccountingState:
+class StreamSendAccountingState(object):
     local_send_started: bool = False
     peer_send_limit: int = 0
     reserved_send_bytes: int = 0
@@ -635,7 +635,7 @@ class StreamSendAccountingState:
 
 
 @dataclass
-class StreamReceiveAccountingState:
+class StreamReceiveAccountingState(object):
     recv_pending: int = 0
     recv_buffer: int = 0
     late_data_received: int = 0
@@ -666,7 +666,7 @@ class StreamReceiveAccountingState:
 
 
 @dataclass
-class StreamReceiveWindowState:
+class StreamReceiveWindowState(object):
     recv_advertised_limit: int = 0
     initial_receive_window: int = 0
     recv_received_bytes: int = 0
@@ -687,7 +687,7 @@ class StreamReceiveWindowState:
 
 
 @dataclass
-class StreamQueueMembershipState:
+class StreamQueueMembershipState(object):
     provisional_index: int = INVALID_STREAM_QUEUE_INDEX
     accept_index: int = INVALID_STREAM_QUEUE_INDEX
     unseen_local_index: int = INVALID_STREAM_QUEUE_INDEX
@@ -701,20 +701,20 @@ class StreamQueueMembershipState:
 
 
 @dataclass(frozen=True)
-class PendingStreamControlValue:
+class PendingStreamControlValue(object):
     value: int = 0
     present: bool = False
 
 
 @dataclass(frozen=True)
-class PendingTerminalResult:
+class PendingTerminalResult(object):
     changed: bool = False
     coalesced: bool = False
     superseded: bool = False
 
 
 @dataclass
-class PendingStreamTerminalState:
+class PendingStreamTerminalState(object):
     opener: Optional[Frame] = None
     stop_payload: bytes = b""
     reset_payload: bytes = b""
@@ -734,7 +734,7 @@ class PendingStreamTerminalState:
 
 
 @dataclass
-class PendingStreamState:
+class PendingStreamState(object):
     """Per-stream pending control/advisory queue state."""
 
     priority: bytes = b""
@@ -957,7 +957,7 @@ class PendingStreamState:
 
 
 @dataclass
-class StreamTerminalState:
+class StreamTerminalState(object):
     """Terminal error details and public surface-error selection."""
 
     terminal_code: int = 0
@@ -1197,7 +1197,7 @@ class StreamTerminalState:
 
 
 @dataclass
-class StreamState:
+class StreamState(object):
     """Aggregate stream state shaped after Go ``nativeStream``."""
 
     stream_id: int = 0

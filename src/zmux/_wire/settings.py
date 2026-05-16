@@ -239,11 +239,12 @@ def _write_setting_varint_tlv(
     return offset
 
 
-class _UnknownSettingTracker:
+class _UnknownSettingTracker(object):
     __slots__ = ("_inline", "_overflow")
 
     def __init__(self) -> None:
         self._inline: List[int] = []
+        # noinspection PyTypeHints
         self._overflow: Optional[Set[int]] = None
 
     def insert(self, typ: int) -> bool:

@@ -28,7 +28,7 @@ import zmux_aioquic
 
 
 async def run(connection) -> None:
-    session: zmux.AsyncSession = zmux_aioquic.wrap_session(connection)
+    session = zmux_aioquic.wrap_session(connection)
 
     stream = await session.open_stream()
     await stream.write_final(b"hello")

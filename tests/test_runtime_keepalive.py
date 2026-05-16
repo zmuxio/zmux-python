@@ -33,7 +33,7 @@ from zmux._runtime.keepalive import (
 from zmux.config import Settings
 
 
-class Holder:
+class Holder(object):
     ping_padding = True
     ping_padding_min = 8
     ping_padding_max = 8

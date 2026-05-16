@@ -94,6 +94,7 @@ DEFAULT_HOT_COALESCE_SECONDS = 0.003
 BULK_HOT_COALESCE_SECONDS = 0.004
 StreamValueMap = Dict[int, Tuple[object, int]]
 StreamMetaMap = Dict[int, StreamMeta]
+StreamValueItems = Tuple[Tuple[object, int], ...]
 
 
 class DequeuedWriteWorkKind(IntEnum):
@@ -103,7 +104,7 @@ class DequeuedWriteWorkKind(IntEnum):
 
 
 @dataclass(frozen=True)
-class DequeuedWriteWork:
+class DequeuedWriteWork(object):
     request: Optional[QueuedWriteRequest] = None
     lane: QueueLane = QueueLane.ORDINARY
     kind: DequeuedWriteWorkKind = DequeuedWriteWorkKind.REQUEST
@@ -120,7 +121,7 @@ class DequeuedWriteWork:
 
 
 @dataclass(frozen=True)
-class RejectedWriteRequest:
+class RejectedWriteRequest(object):
     request: QueuedWriteRequest
     error: BaseException
 
@@ -132,7 +133,7 @@ class RejectedWriteRequest:
 
 
 @dataclass(frozen=True)
-class WriteBatchSize:
+class WriteBatchSize(object):
     encoded_bytes: int = 0
     payload_bytes: int = 0
     frame_count: int = 0
@@ -158,14 +159,15 @@ class WriteBatchSize:
         return self.frame_count == 0
 
 
+# noinspection PyTypeHints
 @dataclass
-class StreamValueAccumulator:
+class StreamValueAccumulator(object):
     """Small-map accumulator mirroring Go's single-stream fast path."""
 
     cap_hint: int = 0
     _single_stream: object = None
     _single_value: int = 0
-    _values: Optional[Dict[int, Tuple[object, int]]] = None
+    _values: Optional[StreamValueMap] = None
     _order: List[int] = field(default_factory=list)
 
     def promote(self) -> None:
@@ -222,7 +224,7 @@ class StreamValueAccumulator:
             self._values[key] = (stream, value)
             self._order.append(key)
 
-    def items(self) -> Tuple[Tuple[object, int], ...]:
+    def items(self) -> StreamValueItems:
         if self._values is None:
             if self._single_stream is not None and self._single_value > 0:
                 return ((self._single_stream, self._single_value),)
@@ -248,7 +250,7 @@ class StreamValueAccumulator:
 
 
 @dataclass
-class WriteBatchScratch:
+class WriteBatchScratch(object):
     """Reusable batch-local lists without retaining frame payload references."""
 
     batch: List[QueuedWriteRequest] = field(default_factory=list)
@@ -352,7 +354,7 @@ class WriteBatchScratch:
             queued,
         )
 
-    def queued_stream_items(self) -> Tuple[Tuple[object, int], ...]:
+    def queued_stream_items(self) -> StreamValueItems:
         return tuple(
             (stream, self.queued_by_stream[id(stream)])
             for stream in self.queued_streams
@@ -365,7 +367,7 @@ class WriteBatchScratch:
 
 
 @dataclass(frozen=True)
-class EncodedFrame:
+class EncodedFrame(object):
     header: bytes
     payload_parts: Tuple[memoryview, ...] = ()
 
@@ -394,7 +396,7 @@ class EncodedFrame:
 
 
 @dataclass
-class EncodedBatchStats:
+class EncodedBatchStats(object):
     frame_count: int = 0
     close_frames: int = 0
     encoded_bytes: int = 0
@@ -441,7 +443,7 @@ class EncodedBatchStats:
 
 
 @dataclass(frozen=True)
-class EncodedBatch:
+class EncodedBatch(object):
     frames: Tuple[EncodedFrame, ...]
     stats: EncodedBatchStats
 
@@ -736,6 +738,7 @@ def write_vectored_all(writer: object, parts: Iterable[ReadableBuffer]) -> None:
             window = [window[index][offset:]] + window[index + 1:]
 
 
+# noinspection PyTypeHints
 def collect_ready_batch(
         first: QueuedWriteRequest,
         ready: Iterable[QueuedWriteRequest],
@@ -744,7 +747,7 @@ def collect_ready_batch(
         max_frames: int = MAX_WRITE_BATCH_FRAMES,
         scheduler: Optional[BatchScheduler] = None,
         config: Optional[BatchConfig] = None,
-        stream_meta: Optional[Dict[int, StreamMeta]] = None,
+        stream_meta: Optional[StreamMetaMap] = None,
 ) -> Tuple[QueuedWriteRequest, ...]:
     max_frames = max(1, _nonnegative_int(max_frames, "max_frames"))
     batch = [first]
@@ -761,13 +764,14 @@ def collect_ready_batch(
     )
 
 
+# noinspection PyTypeHints
 def order_write_batch(
         batch: Sequence[QueuedWriteRequest],
         lane: QueueLane,
         *,
         scheduler: Optional[BatchScheduler] = None,
         config: Optional[BatchConfig] = None,
-        stream_meta: Optional[Dict[int, StreamMeta]] = None,
+        stream_meta: Optional[StreamMetaMap] = None,
 ) -> Tuple[QueuedWriteRequest, ...]:
     lane = _coerce_enum(lane, QueueLane, "lane")
     batch = _request_tuple(batch, "batch")
@@ -789,13 +793,14 @@ def order_write_batch(
     return tuple(batch[idx] for idx in order)
 
 
+# noinspection PyTypeHints
 def batch_order(
         batch: Sequence[QueuedWriteRequest],
         lane: QueueLane,
         *,
         scheduler: Optional[BatchScheduler] = None,
         config: Optional[BatchConfig] = None,
-        stream_meta: Optional[Dict[int, StreamMeta]] = None,
+        stream_meta: Optional[StreamMetaMap] = None,
 ) -> Tuple[int, ...]:
     lane = _coerce_enum(lane, QueueLane, "lane")
     batch = _request_tuple(batch, "batch")

@@ -16,7 +16,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from enum import IntEnum
 from threading import RLock
-from typing import Any, Callable, Deque, Dict, Generic, List, Optional, TypeVar
+from typing import Any, Callable, Dict, Generic, Optional, TypeVar
 
 from .control import MIN_PENDING_CONTROL_BUDGET, MIN_PENDING_PRIORITY_BUDGET
 from .flow import repo_default_urgent_lane_cap
@@ -207,7 +207,7 @@ class StreamArity(IntEnum):
 
 
 @dataclass(frozen=True)
-class KeepaliveAction:
+class KeepaliveAction(object):
     delay: float = 0.0
     send_ping: bool = False
     timed_out: bool = False
@@ -392,7 +392,7 @@ def truncate_string_to_bytes(value: str, limit: int) -> str:
         return value
 
     used = 0
-    out: List[str] = []
+    out: list[str] = []
     truncated = False
     for char in value:
         size = len(char.encode("utf-8"))
@@ -442,7 +442,7 @@ def establishment_close_drain_delay(err: Optional[BaseException]) -> float:
 
 
 @dataclass(frozen=True)
-class RuntimePolicy:
+class RuntimePolicy(object):
     """Config-derived runtime constants for an established session."""
 
     write_queue_max_bytes: int
@@ -598,7 +598,7 @@ class RuntimePolicy:
 
 
 @dataclass
-class RegistryState:
+class RegistryState(object):
     """Stream id and live-stream counters owned by an established session."""
 
     next_local_bidi: int
@@ -634,7 +634,7 @@ class RegistryState:
 
 
 @dataclass
-class FlowState:
+class FlowState(object):
     recv_session_advertised: int = 0
     recv_session_received: int = 0
     recv_session_used: int = 0
@@ -659,7 +659,7 @@ class FlowState:
 
 
 @dataclass
-class RetentionState:
+class RetentionState(object):
     retained_open_info_bytes: int = 0
     retained_peer_reason_bytes: int = 0
     reset_reasons: "ReasonCounter" = field(
@@ -705,7 +705,7 @@ class RetentionState:
 
 
 @dataclass(frozen=True)
-class RetainedBucket:
+class RetainedBucket(object):
     count: int = 0
     bytes: int = 0
 
@@ -716,7 +716,7 @@ class RetainedBucket:
 
 
 @dataclass(frozen=True)
-class RetainedStateBreakdown:
+class RetainedStateBreakdown(object):
     hidden_control: RetainedBucket = field(default_factory=RetainedBucket)
     accept_backlog: RetainedBucket = field(default_factory=RetainedBucket)
     provisionals: RetainedBucket = field(default_factory=RetainedBucket)
@@ -733,7 +733,7 @@ class RetainedStateBreakdown:
 
 
 @dataclass
-class ReasonCounter:
+class ReasonCounter(object):
     """Bounded reason-code count map with Go-compatible overflow behavior."""
 
     limit: int = REASON_CODE_MAP_LIMIT
@@ -773,7 +773,7 @@ class ReasonCounter:
 
 
 @dataclass
-class IngressState:
+class IngressState(object):
     aggregate_late_data: int = 0
     aggregate_late_data_cap: int = 0
     late_data_per_stream_cap: int = 0
@@ -790,7 +790,7 @@ class IngressState:
 
 
 @dataclass
-class RuntimeMetrics:
+class RuntimeMetrics(object):
     sent_frames: int = 0
     received_frames: int = 0
     sent_data_bytes: int = 0
@@ -850,7 +850,7 @@ class RuntimeMetrics:
 
 
 @dataclass
-class LivenessState:
+class LivenessState(object):
     keepalive_interval: float = DEFAULT_KEEPALIVE_INTERVAL
     keepalive_max_ping_interval: float = DEFAULT_KEEPALIVE_MAX_PING_INTERVAL
     keepalive_timeout: Optional[float] = None
@@ -1056,7 +1056,7 @@ class LivenessState:
 
 
 @dataclass
-class SessionControlState:
+class SessionControlState(object):
     peer_go_away_bidi: int = MAX_VARINT62
     peer_go_away_uni: int = MAX_VARINT62
     local_go_away_bidi: int = MAX_VARINT62
@@ -1086,7 +1086,7 @@ class SessionControlState:
 
 
 @dataclass
-class ShutdownState:
+class ShutdownState(object):
     graceful_close_active: bool = False
     close_frame_pending: bool = False
     close_frame_sent: bool = False
@@ -1102,7 +1102,7 @@ class ShutdownState:
 
 
 @dataclass
-class SessionRuntimeState:
+class SessionRuntimeState(object):
     """In-memory state bundle used by future native sync/async sessions."""
 
     local_preface: Preface
@@ -1522,12 +1522,13 @@ class SessionRuntimeState:
         )
 
 
+# noinspection PyTypeHints
 @dataclass
 class SparseQueue(Generic[QueueT]):
     """List-backed sparse queue with Go-compatible head/count compaction."""
 
     compact_min_head: int = PROVISIONAL_QUEUE_COMPACT_MIN_HEAD
-    items: List[Optional[QueueT]] = field(default_factory=list)
+    items: list[QueueT | None] = field(default_factory=list)
     head: int = 0
     count: int = 0
     init: bool = True
@@ -1550,7 +1551,7 @@ class SparseQueue(Generic[QueueT]):
         self.init = True
         return idx
 
-    def head_item(self) -> Optional[QueueT]:
+    def head_item(self) -> QueueT | None:
         if self.count == 0:
             return None
         self.head = self._advance_head(self.head)
@@ -1558,7 +1559,7 @@ class SparseQueue(Generic[QueueT]):
             return None
         return self.items[self.head]
 
-    def tail_item(self) -> Optional[QueueT]:
+    def tail_item(self) -> QueueT | None:
         if self.count == 0:
             return None
         for idx in range(len(self.items) - 1, self.head - 1, -1):
@@ -1567,7 +1568,7 @@ class SparseQueue(Generic[QueueT]):
                 return item
         return None
 
-    def remove_index(self, idx: int) -> Optional[QueueT]:
+    def remove_index(self, idx: int) -> QueueT | None:
         if idx < 0 or idx >= len(self.items) or self.count == 0:
             return None
         item = self.items[idx]
@@ -1581,7 +1582,7 @@ class SparseQueue(Generic[QueueT]):
             self.head = self._advance_head(self.head)
         return item
 
-    def pop_head(self) -> Optional[QueueT]:
+    def pop_head(self) -> QueueT | None:
         item = self.head_item()
         if item is None:
             return None
@@ -1589,7 +1590,7 @@ class SparseQueue(Generic[QueueT]):
         self.maybe_compact()
         return item
 
-    def pop_tail(self) -> Optional[QueueT]:
+    def pop_tail(self) -> QueueT | None:
         if self.count == 0:
             return None
         for idx in range(len(self.items) - 1, self.head - 1, -1):
@@ -1600,7 +1601,7 @@ class SparseQueue(Generic[QueueT]):
                 return item
         return None
 
-    def clear(self, visit: Optional[Callable[[QueueT], None]] = None) -> None:
+    def clear(self, visit: Callable[[QueueT], None] | None = None) -> None:
         if visit is not None:
             for item in self.items:
                 if item is not None:
@@ -1630,7 +1631,7 @@ class SparseQueue(Generic[QueueT]):
 
 
 @dataclass
-class QueueItem:
+class QueueItem(object):
     """Minimal queue item used by IndexedQueue and local-open trackers."""
 
     value: Any
@@ -1655,6 +1656,7 @@ class QueueItem:
         self.bidi = _require_bool(self.bidi, "bidi")
 
 
+# noinspection PyTypeHints
 @dataclass
 class IndexedQueue(Generic[QueueT]):
     state: SparseQueue[QueueT]
@@ -1668,10 +1670,10 @@ class IndexedQueue(Generic[QueueT]):
         idx = self.state.append(item)
         self.set_index(item, idx)
 
-    def head_item(self) -> Optional[QueueT]:
+    def head_item(self) -> QueueT | None:
         return self.state.head_item()
 
-    def tail_item(self) -> Optional[QueueT]:
+    def tail_item(self) -> QueueT | None:
         return self.state.tail_item()
 
     def holds(self, item: QueueT, current_index: int) -> bool:
@@ -1695,7 +1697,7 @@ class IndexedQueue(Generic[QueueT]):
         self.state.maybe_compact()
         return removed is not None
 
-    def clear(self, visit: Optional[Callable[[QueueT], None]] = None) -> None:
+    def clear(self, visit: Callable[[QueueT], None] | None = None) -> None:
         def clear_index(item: QueueT) -> None:
             self.set_index(item, -1)
             if visit is not None:
@@ -1705,7 +1707,7 @@ class IndexedQueue(Generic[QueueT]):
 
 
 @dataclass
-class LocalOpenTracker:
+class LocalOpenTracker(object):
     """Provisional local-open and unseen-local stream bookkeeping."""
 
     provisional_bidi: SparseQueue[QueueItem] = field(default_factory=SparseQueue)
@@ -1757,7 +1759,7 @@ class LocalOpenTracker:
         now = time.monotonic() if now is None else _nonnegative_float(now, "now")
         max_age = _nonnegative_float(max_age, "max_age")
         queue = self.provisional_queue(arity)
-        expired: List[QueueItem] = []
+        expired: list[QueueItem] = []
         while True:
             item = queue.head_item()
             if item is None or not provisional_expired(item.id_set, item.created_at, now, max_age):
@@ -1777,7 +1779,7 @@ class LocalOpenTracker:
         peer_watermark = _require_varint62(peer_watermark, "peer_watermark")
         queue = self.provisional_queue(arity)
         available = provisional_available_count(next_local_id, peer_watermark)
-        reclaimed: List[QueueItem] = []
+        reclaimed: list[QueueItem] = []
         while len(queue) > available:
             item = queue.pop_tail()
             if item is None:
@@ -1813,13 +1815,14 @@ class LocalOpenTracker:
         return True
 
 
+# noinspection PyTypeHints
 @dataclass
-class EventDispatcher:
+class EventDispatcher(object):
     """Synchronous event emitter with re-entrant queueing and exception capture."""
 
     handler: Optional[Callable[[Event], None]] = None
     emitting: bool = False
-    queue: Deque[Event] = field(default_factory=deque)
+    queue: deque[Event] = field(default_factory=deque)
     dropped_handler_exceptions: int = 0
     _lock: RLock = field(default_factory=RLock, init=False, repr=False, compare=False)
 

@@ -75,7 +75,7 @@ def priority_update(stream_id):
     return frame
 
 
-class PartialWriter:
+class PartialWriter(object):
     def __init__(self, chunk=3):
         self.chunk = chunk
         self.bytes = bytearray()
@@ -91,7 +91,7 @@ class PartialWriter:
         self.flushes += 1
 
 
-class VectoredWriter:
+class VectoredWriter(object):
     def __init__(self, chunk=4096):
         self.chunk = chunk
         self.bytes = bytearray()
@@ -123,13 +123,13 @@ class VectoredWriter:
         self.flushes += 1
 
 
-class BadVectoredWriter:
+class BadVectoredWriter(object):
     def write_vectored(self, parts):
         del parts
         return True
 
 
-class FailingWriter:
+class FailingWriter(object):
     def __init__(self):
         self.error = BrokenPipeError("pipe closed")
         self.flushes = 0
@@ -443,7 +443,7 @@ class RuntimeWriterPolicyTests(unittest.TestCase):
 
     def test_stream_value_accumulator_uses_identity_for_unhashable_streams(self):
         @dataclass
-        class StreamRef:
+        class StreamRef(object):
             stream_id: int
 
         left = StreamRef(7)
@@ -463,7 +463,7 @@ class RuntimeWriterPolicyTests(unittest.TestCase):
 
     def test_write_batch_scratch_tracks_queued_streams_by_identity(self):
         @dataclass
-        class StreamRef:
+        class StreamRef(object):
             stream_id: int
 
         left = StreamRef(9)

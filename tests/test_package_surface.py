@@ -593,7 +593,7 @@ class PackageSurfaceTest(unittest.TestCase):
         self.assertEqual(file_source_preface.tie_breaker_nonce, 6)
         self.assertEqual(file_source_preface.settings.ping_padding_key, 8)
 
-        class PartialRandom:
+        class PartialRandom(object):
             def __init__(self, data: bytes) -> None:
                 self._data = bytearray(data)
 
@@ -1203,7 +1203,7 @@ class PackageSurfaceTest(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             zmux.parse_preface(initiator.marshal() + b"x")
 
-        class PartialWriter:
+        class PartialWriter(object):
             def __init__(self) -> None:
                 self.chunks = []
 
@@ -1216,7 +1216,7 @@ class PackageSurfaceTest(unittest.TestCase):
         zmux.write_preface(partial_writer, responder)
         self.assertEqual(b"".join(partial_writer.chunks), responder.marshal())
 
-        class StalledWriter:
+        class StalledWriter(object):
             def write(self, payload) -> int:
                 return 0
 
@@ -1226,7 +1226,7 @@ class PackageSurfaceTest(unittest.TestCase):
         self.assertEqual(stalled_raised.exception.source, ErrorSource.TRANSPORT)
         self.assertEqual(stalled_raised.exception.direction, ErrorDirection.WRITE)
 
-        class NoneWriter:
+        class NoneWriter(object):
             def write(self, payload):
                 return None
 
@@ -1416,7 +1416,7 @@ class PackageSurfaceTest(unittest.TestCase):
         self.assertEqual(raised.exception.operation, ErrorOperation.READ)
         self.assertTrue(zmux.timeout(raised.exception))
 
-        class BadRead:
+        class BadRead(object):
             def read(self, size=-1):
                 return "not bytes"
 
@@ -1495,7 +1495,7 @@ class PackageSurfaceTest(unittest.TestCase):
         self.assertEqual(write_limit_raised.exception.source, ErrorSource.LOCAL)
         self.assertEqual(write_limit_raised.exception.direction, ErrorDirection.WRITE)
 
-        class PartialWriter:
+        class PartialWriter(object):
             def __init__(self) -> None:
                 self.chunks = []
 
@@ -1508,7 +1508,7 @@ class PackageSurfaceTest(unittest.TestCase):
         zmux.write_frame(partial_writer, data)
         self.assertEqual(b"".join(partial_writer.chunks), encoded)
 
-        class StalledWriter:
+        class StalledWriter(object):
             def write(self, payload) -> int:
                 return 0
 
@@ -1518,7 +1518,7 @@ class PackageSurfaceTest(unittest.TestCase):
         self.assertEqual(stalled_raised.exception.source, ErrorSource.TRANSPORT)
         self.assertEqual(stalled_raised.exception.direction, ErrorDirection.WRITE)
 
-        class NoneWriter:
+        class NoneWriter(object):
             def write(self, payload):
                 return None
 
@@ -1550,7 +1550,7 @@ class PackageSurfaceTest(unittest.TestCase):
         self.assertEqual(zmux.read_frame(chunked), data)
         self.assertGreater(chunked.readinto_calls, 1)
 
-        class BoolProgressReadInto:
+        class BoolProgressReadInto(object):
             def readinto(self, view) -> bool:
                 return True
 
@@ -2008,7 +2008,7 @@ class PackageSurfaceTest(unittest.TestCase):
             append_packed_varint(packed_dst, packed, packed_len)
             self.assertEqual(bytes(packed_dst), encoded)
 
-        class BytesLikeRead:
+        class BytesLikeRead(object):
             def __init__(self, chunks) -> None:
                 self.chunks = list(chunks)
 
@@ -2088,14 +2088,14 @@ class PackageSurfaceTest(unittest.TestCase):
         self.assertEqual(transport_raised.exception.operation, ErrorOperation.READ)
         self.assertTrue(zmux.timeout(transport_raised.exception))
 
-        class InvalidRead:
+        class InvalidRead(object):
             def read(self, size=-1):
                 return True
 
         with self.assertRaises(zmux.TransportError):
             read_varint(InvalidRead())
 
-        class OverRead:
+        class OverRead(object):
             def read(self, size=-1):
                 return b"\x00\x00"
 

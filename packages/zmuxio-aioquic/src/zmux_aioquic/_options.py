@@ -18,7 +18,7 @@ _default_accepted_prelude_max_concurrent = DEFAULT_ACCEPTED_PRELUDE_MAX_CONCURRE
 
 
 @dataclass(frozen=True)
-class SessionOptions:
+class SessionOptions(object):
     """Adapter-local options for an aioquic-backed zmux session."""
 
     accepted_prelude_read_timeout: Optional[float] = (

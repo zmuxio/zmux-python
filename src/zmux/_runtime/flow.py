@@ -24,7 +24,7 @@ MIN_AGGREGATE_LATE_DATA_CAP = 64 << 10
 
 
 @dataclass(frozen=True)
-class ReleaseWakePlan:
+class ReleaseWakePlan(object):
     """Wake decisions after queued bytes or prepared write state are released."""
 
     broadcast: bool = False

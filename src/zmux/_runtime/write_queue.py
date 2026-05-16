@@ -25,6 +25,8 @@ from ..errors import ProtocolError, SessionClosed
 from ..frame import Frame
 
 _WRITE_QUEUE_LANES = (QueueLane.URGENT, QueueLane.ORDINARY)
+LaneJobIndex = Tuple[QueueLane, int]
+WriteJobBatch = Tuple[WriteJob, ...]
 
 
 class QueueCheck(Protocol):
@@ -37,7 +39,7 @@ class FrameRemovePredicate(Protocol):
         ...
 
 
-class WriteQueue:
+class WriteQueue(object):
     """Thread-safe writer lane queue with Go/Rust-compatible accounting."""
 
     def __init__(self, limits: Optional[WriteQueueLimits] = None, **kwargs: int) -> None:
@@ -197,9 +199,10 @@ class WriteQueue:
                         tracked = job.tracked
         return tracked
 
+    # noinspection PyTypeHints
     def pop_batch(
             self, timeout: Optional[float] = None
-    ) -> Optional[Tuple[WriteJob, ...]]:
+    ) -> Optional[WriteJobBatch]:
         batch = []
         status = self.pop_batch_into(batch, timeout)
         if status is WriteQueuePopStatus.BATCH:
@@ -491,9 +494,10 @@ class WriteQueue:
     def _has_queued_data_for_stream_locked(self, stream_id: int) -> bool:
         return self._data_queued_by_stream.get(stream_id, 0) != 0
 
+    # noinspection PyTypeHints
     def _find_coalesced_locked(
             self, key: Optional[CoalesceKey]
-    ) -> Optional[Tuple[QueueLane, int]]:
+    ) -> Optional[LaneJobIndex]:
         if key is None:
             return None
         for lane in _WRITE_QUEUE_LANES:
@@ -503,9 +507,10 @@ class WriteQueue:
                     return lane, index
         return None
 
+    # noinspection PyTypeHints
     def _find_tracked_completion_locked(
             self, completion: WriteCompletion
-    ) -> Optional[Tuple[QueueLane, int]]:
+    ) -> Optional[LaneJobIndex]:
         for lane in _WRITE_QUEUE_LANES:
             jobs = self._lane(lane)
             for index, job in enumerate(jobs):

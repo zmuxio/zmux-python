@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable
 from types import TracebackType
-from typing import Optional, Protocol, Type, Union, runtime_checkable
+from typing import Optional, Protocol, Union, runtime_checkable
 
 from .payload import MetadataUpdate, StreamMetadata
 
@@ -68,9 +68,10 @@ class StreamHandle(Protocol):
     def __enter__(self) -> "StreamHandle":
         """Return this stream for use as a context manager."""
 
+    # noinspection PyTypeHints
     def __exit__(
             self,
-            exc_type: Optional[Type[BaseException]],
+            exc_type: Optional[type[BaseException]],
             exc: Optional[BaseException],
             tb: Optional[TracebackType],
     ) -> None:
@@ -217,9 +218,10 @@ class AsyncStreamHandle(Protocol):
     async def __aenter__(self) -> "AsyncStreamHandle":
         """Return this stream for use as an async context manager."""
 
+    # noinspection PyTypeHints
     async def __aexit__(
             self,
-            exc_type: Optional[Type[BaseException]],
+            exc_type: Optional[type[BaseException]],
             exc: Optional[BaseException],
             tb: Optional[TracebackType],
     ) -> None:

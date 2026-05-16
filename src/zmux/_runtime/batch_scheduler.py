@@ -25,7 +25,7 @@ from .sched_core import (
 )
 
 
-class BatchScheduler:
+class BatchScheduler(object):
     """Stateful retained batch scheduler facade."""
 
     def __init__(self) -> None:

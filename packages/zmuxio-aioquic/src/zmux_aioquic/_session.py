@@ -92,7 +92,7 @@ def target_suites() -> Tuple[str, ...]:
     return (SUITE_STREAM_ADAPTER_PROFILE,)
 
 
-class AioquicSession:
+class AioquicSession(object):
     """Async zmux session facade for an aioquic-like connection."""
 
     def __init__(

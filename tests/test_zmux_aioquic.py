@@ -15,7 +15,7 @@ from zmux.conformance import SUITE_STREAM_ADAPTER_PROFILE
 from zmux.protocol import CLAIM_STREAM_ADAPTER_PROFILE_V1
 
 
-class MemoryReader:
+class MemoryReader(object):
     def __init__(self, data=b""):
         self.data = bytearray(data)
         self.closed = False
@@ -39,7 +39,7 @@ class MemoryReader:
         self.closed = True
 
 
-class MemoryWriter:
+class MemoryWriter(object):
     def __init__(self, stream_id=0):
         self.stream_id = stream_id
         self.chunks = []
@@ -93,7 +93,7 @@ class ShortExactReader(MemoryReader):
         return b""
 
 
-class FakeConnection:
+class FakeConnection(object):
     def __init__(self):
         self.next_stream_id = 4
         self.opened = []
@@ -185,7 +185,7 @@ class BoolProgressConnection(FakeConnection):
         return reader, writer
 
 
-class BlockingReader:
+class BlockingReader(object):
     def __init__(self):
         self.released = asyncio.Event()
         self.closed = False
@@ -378,6 +378,7 @@ class AioquicSessionTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(second_writer.closed)
 
     async def test_quic_session_can_be_used_through_public_async_session_surface(self):
+        # noinspection PyTypeHints
         async def use_session(session: zmux.AsyncSession):
             stream = await session.open_and_send(b"request", timeout=1.0)
             uni_stream = await session.open_uni_and_send(b"event", timeout=1.0)

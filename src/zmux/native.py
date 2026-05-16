@@ -9,7 +9,7 @@ import time
 from collections import deque
 from dataclasses import replace
 from types import TracebackType
-from typing import Deque, Iterable, Optional, Type
+from typing import Deque, Iterable, Optional
 
 from ._state.stream_id import (
     first_local_stream_id,
@@ -87,7 +87,7 @@ def server(transport: object, config: Optional[Config] = None) -> "Conn":
     return Conn.establish(_coerce_transport(transport), cfg)
 
 
-class Conn:
+class Conn(object):
     """Native synchronous ZMux session.
 
     ``Conn`` is the core package's concrete implementation of
@@ -200,9 +200,10 @@ class Conn:
     def __enter__(self) -> "Conn":
         return self
 
+    # noinspection PyTypeHints
     def __exit__(
         self,
-        exc_type: Optional[Type[BaseException]],
+        exc_type: Optional[type[BaseException]],
         exc: Optional[BaseException],
         tb: Optional[TracebackType],
     ) -> None:
@@ -792,7 +793,7 @@ class Conn:
         self._lock.notify_all()
 
 
-class NativeStream:
+class NativeStream(object):
     """Native synchronous ZMux stream."""
 
     __slots__ = (
@@ -856,9 +857,10 @@ class NativeStream:
     def __enter__(self) -> "NativeStream":
         return self
 
+    # noinspection PyTypeHints
     def __exit__(
         self,
-        exc_type: Optional[Type[BaseException]],
+        exc_type: Optional[type[BaseException]],
         exc: Optional[BaseException],
         tb: Optional[TracebackType],
     ) -> None:
@@ -1289,7 +1291,7 @@ class NativeStream:
             raise WriteClosed()
 
 
-class _FrameIO:
+class _FrameIO(object):
     __slots__ = ("_transport",)
 
     def __init__(self, transport: object) -> None:

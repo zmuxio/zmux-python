@@ -66,7 +66,7 @@ _TERMINAL_GRACEFUL_CHOICES = (
 
 
 @dataclass(frozen=True)
-class StreamTombstone:
+class StreamTombstone(object):
     data_action: LateDataAction = LateDataAction.IGNORE
     terminal_kind: TerminalKind = TerminalKind.UNKNOWN
     has_terminal_code: bool = False
@@ -166,7 +166,7 @@ def should_compact_terminal(
 
 
 @dataclass(frozen=True)
-class UsedStreamMarker:
+class UsedStreamMarker(object):
     action: LateDataAction = LateDataAction.IGNORE
     cause: LateDataCause = LateDataCause.NONE
 
@@ -176,7 +176,7 @@ class UsedStreamMarker:
 
 
 @dataclass(frozen=True)
-class TerminalDataDisposition:
+class TerminalDataDisposition(object):
     action: LateDataAction = LateDataAction.IGNORE
     cause: LateDataCause = LateDataCause.NONE
 
@@ -189,7 +189,7 @@ class TerminalDataDisposition:
 
 
 @dataclass
-class UsedStreamRange:
+class UsedStreamRange(object):
     start: int
     end: int
     marker: UsedStreamMarker = field(default_factory=UsedStreamMarker)
@@ -203,7 +203,7 @@ class UsedStreamRange:
 
 
 @dataclass
-class StreamTombstoneRecord:
+class StreamTombstoneRecord(object):
     tombstone: StreamTombstone = field(default_factory=StreamTombstone)
     hidden: bool = False
     created_at: float = 0.0
@@ -266,7 +266,7 @@ class StreamTombstoneRecord:
 
 
 @dataclass(frozen=True)
-class StreamTombstoneLookup:
+class StreamTombstoneLookup(object):
     tombstone: Optional[StreamTombstoneRecord] = None
     present: bool = False
 
@@ -275,7 +275,7 @@ class StreamTombstoneLookup:
 
 
 @dataclass(frozen=True)
-class TerminalDataLookup:
+class TerminalDataLookup(object):
     disposition: TerminalDataDisposition = field(default_factory=TerminalDataDisposition)
     present: bool = False
 
@@ -284,7 +284,7 @@ class TerminalDataLookup:
 
 
 @dataclass(frozen=True)
-class TerminalLateDataResult:
+class TerminalLateDataResult(object):
     hidden: bool = False
     cap_exceeded: bool = False
 
@@ -294,7 +294,7 @@ class TerminalLateDataResult:
 
 
 @dataclass(frozen=True)
-class QueueIndexLookup:
+class QueueIndexLookup(object):
     index: int = INVALID_TOMBSTONE_INDEX
     present: bool = False
 
@@ -303,7 +303,7 @@ class QueueIndexLookup:
 
 
 @dataclass(frozen=True)
-class TombstoneOrderLookup:
+class TombstoneOrderLookup(object):
     stream_id: int = 0
     tombstone: Optional[StreamTombstoneRecord] = None
     present: bool = False
@@ -313,7 +313,7 @@ class TombstoneOrderLookup:
 
 
 @dataclass(frozen=True)
-class TombstoneIDLookup:
+class TombstoneIDLookup(object):
     stream_id: int = 0
     present: bool = False
 
@@ -437,7 +437,7 @@ def used_stream_marker_from_tombstone(
 
 
 @dataclass
-class TerminalBookkeepingState:
+class TerminalBookkeepingState(object):
     tombstone_limit: int = MAX_TOMBSTONES
     marker_only_used_stream_limit: Optional[int] = DEFAULT_MARKER_ONLY_USED_STREAM_LIMIT
     hidden_tombstone_limit: int = HIDDEN_CONTROL_RETAINED_HARD_CAP

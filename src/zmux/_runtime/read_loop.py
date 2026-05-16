@@ -169,7 +169,7 @@ _ERROR_FRAME_KINDS = {
 
 
 @dataclass(frozen=True)
-class ParsedInboundFrame:
+class ParsedInboundFrame(object):
     """One frame after read-loop payload classification."""
 
     frame: Frame
@@ -244,7 +244,7 @@ class ParsedInboundFrame:
 
 
 @dataclass(frozen=True)
-class ReadLoopDispatchResult:
+class ReadLoopDispatchResult(object):
     """Result from one dispatcher call."""
 
     parsed: ParsedInboundFrame
@@ -257,7 +257,7 @@ class ReadLoopDispatchResult:
 
 
 @dataclass
-class WindowedCounter:
+class WindowedCounter(object):
     """A saturating count over a monotonic time window."""
 
     window_start: Optional[float] = None
@@ -302,7 +302,7 @@ class WindowedCounter:
 
 
 @dataclass
-class TrafficBudgetCounter:
+class TrafficBudgetCounter(object):
     """Frame and payload-byte budget over one monotonic time window."""
 
     window_start: Optional[float] = None
@@ -347,7 +347,7 @@ class TrafficBudgetCounter:
 
 
 @dataclass(frozen=True)
-class ReadLoopAbuseConfig:
+class ReadLoopAbuseConfig(object):
     """Configured inbound flood and churn thresholds."""
 
     abuse_window: float = DEFAULT_ABUSE_WINDOW
@@ -503,7 +503,7 @@ class ReadLoopAbuseConfig:
 
 
 @dataclass
-class InboundBudgetTracker:
+class InboundBudgetTracker(object):
     """Stateful inbound flood guard used under the session lock."""
 
     config: ReadLoopAbuseConfig = field(default_factory=ReadLoopAbuseConfig)
@@ -690,7 +690,7 @@ class InboundBudgetTracker:
 
 
 @dataclass
-class ReceiveWindowState:
+class ReceiveWindowState(object):
     """Receive-side window counters for a session or stream."""
 
     received: int = 0
@@ -721,7 +721,7 @@ class ReceiveWindowState:
 
 
 @dataclass(frozen=True)
-class ReplenishDecision:
+class ReplenishDecision(object):
     """Result of a receive-credit flush decision."""
 
     should_flush: bool
@@ -741,7 +741,7 @@ class ReplenishDecision:
 
 
 @dataclass
-class LateDataTracker:
+class LateDataTracker(object):
     """Late-data discard caps and counters."""
 
     aggregate_cap: int = 0
@@ -803,7 +803,7 @@ class LateDataTracker:
 
 
 @dataclass(frozen=True)
-class ProtocolTask:
+class ProtocolTask(object):
     """A deferred action produced by the read loop."""
 
     kind: ProtocolTaskKind
@@ -837,7 +837,7 @@ class ProtocolTaskCallback(Protocol):
 
 
 @dataclass(frozen=True)
-class ProtocolQueueSnapshot:
+class ProtocolQueueSnapshot(object):
     """Inspection state for the read-loop protocol task queue."""
 
     length: int
@@ -852,7 +852,7 @@ class ProtocolQueueSnapshot:
         )
 
 
-class ReadLoopProtocolQueue:
+class ReadLoopProtocolQueue(object):
     """Bounded protocol-loop backlog with Go-compatible overflow rules."""
 
     def __init__(self, max_jobs: int = MAX_PENDING_READ_LOOP_PROTOCOL_JOBS) -> None:
@@ -919,7 +919,7 @@ class ReadLoopProtocolQueue:
         self._tasks.clear()
 
 
-class ReadLoopFrameDispatcher:
+class ReadLoopFrameDispatcher(object):
     """Small frame dispatcher for read-loop-owned generic behavior."""
 
     def __init__(

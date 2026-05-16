@@ -94,7 +94,7 @@ class EventHandler(Protocol):
 
 
 @dataclass(frozen=True)
-class Limits:
+class Limits(object):
     """Negotiated inbound frame payload limits."""
 
     max_frame_payload: int = 16384
@@ -112,7 +112,7 @@ class Limits:
 
 
 @dataclass(frozen=True)
-class Settings:
+class Settings(object):
     """Unilateral receive-side settings advertised in a session preface."""
 
     initial_max_stream_data_bidi_locally_opened: int = 65536
@@ -222,7 +222,7 @@ class Settings:
 
 
 @dataclass(frozen=True)
-class Config:
+class Config(object):
     """Session establishment and runtime configuration."""
 
     role: Role = Role.AUTO
@@ -426,7 +426,7 @@ class Config:
 
 
 @dataclass(frozen=True)
-class OpenOptions:
+class OpenOptions(object):
     """Open-time metadata and advisory inputs for a new stream."""
 
     initial_priority: Optional[int] = None

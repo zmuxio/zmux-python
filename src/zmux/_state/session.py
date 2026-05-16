@@ -40,7 +40,7 @@ class LocalOpenOutcome(str, Enum):
 
 
 @dataclass(frozen=True)
-class BeginClosePlan:
+class BeginClosePlan(object):
     outcome: BeginCloseOutcome
     next_state: SessionState
 
@@ -58,7 +58,7 @@ class BeginClosePlan:
 
 
 @dataclass(frozen=True)
-class PeerGoAwayPlan:
+class PeerGoAwayPlan(object):
     ignore: bool = False
     changed: bool = False
     next_state: Optional[SessionState] = None
@@ -75,7 +75,7 @@ class PeerGoAwayPlan:
 
 
 @dataclass(frozen=True)
-class PeerClosePlan:
+class PeerClosePlan(object):
     ignore: bool = False
 
     def __post_init__(self) -> None:

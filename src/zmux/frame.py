@@ -11,7 +11,7 @@ from .protocol import FRAME_FLAG_MASK, MAX_VARINT62, FrameType
 
 
 @dataclass(frozen=True)
-class Frame:
+class Frame(object):
     """One decoded zmux frame."""
 
     frame_type: FrameType
@@ -87,7 +87,7 @@ class Frame:
 
 
 @dataclass(frozen=True)
-class FrameView:
+class FrameView(object):
     """Borrowed decoded frame view."""
 
     frame_type: FrameType

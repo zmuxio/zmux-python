@@ -62,7 +62,7 @@ _OPENER_FRAME_PHASES = (
 
 
 @dataclass(frozen=True)
-class LocalOpenVisibility:
+class LocalOpenVisibility(object):
     local_opened: bool = False
     send_committed: bool = False
     peer_visible: bool = False

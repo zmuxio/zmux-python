@@ -83,7 +83,7 @@ _PEER_RESET_IGNORED_RECV_STATES = (
 
 
 @dataclass(frozen=True)
-class PeerDataPlan:
+class PeerDataPlan(object):
     outcome: PeerDataOutcome
     advance_recv_fin: bool = False
     track_late_per_stream: bool = False
@@ -95,7 +95,7 @@ class PeerDataPlan:
 
 
 @dataclass(frozen=True)
-class SessionClosePlan:
+class SessionClosePlan(object):
     finish_send: bool = False
     finish_recv: bool = False
     abort_send: bool = False
@@ -109,7 +109,7 @@ class SessionClosePlan:
 
 
 @dataclass(frozen=True)
-class PeerStopSendingPlan:
+class PeerStopSendingPlan(object):
     ignore: bool = False
     record_stop: bool = False
     outcome: StopSendingOutcome = StopSendingOutcome.IGNORE
@@ -121,7 +121,7 @@ class PeerStopSendingPlan:
 
 
 @dataclass(frozen=True)
-class PeerResetPlan:
+class PeerResetPlan(object):
     ignore: bool = False
     record_reset: bool = False
     release_receive: bool = False
@@ -135,7 +135,7 @@ class PeerResetPlan:
 
 
 @dataclass(frozen=True)
-class PeerAbortPlan:
+class PeerAbortPlan(object):
     ignore: bool = False
     record_abort: bool = False
     release_send: bool = False

@@ -19,7 +19,7 @@ REPO_DEFAULT_STOP_SENDING_DRAIN_WINDOW_MAX = DEFAULT_STOP_SENDING_GRACEFUL_DRAIN
 NANOS_PER_SECOND = 1_000_000_000
 
 
-class StopSendingGracefulDeadlineQueue:
+class StopSendingGracefulDeadlineQueue(object):
     """Identity-keyed deadline queue for STOP_SENDING graceful drains.
 
     Streams can be updated repeatedly while old heap entries remain stale.
@@ -130,7 +130,7 @@ class StopSendingGracefulDeadlineQueue:
 
 
 @dataclass(frozen=True)
-class StopSendingGracefulInput:
+class StopSendingGracefulInput(object):
     recv_abortive: bool = False
     needs_local_opener: bool = False
     local_opened: bool = False
@@ -197,7 +197,7 @@ class StopSendingGracefulInput:
 
 
 @dataclass(frozen=True)
-class StopSendingGracefulDecision:
+class StopSendingGracefulDecision(object):
     attempt: bool = False
     tail_budget: int = 0
     committed_tail: int = 0

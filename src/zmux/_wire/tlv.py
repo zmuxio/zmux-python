@@ -38,7 +38,7 @@ __all__ = (
 
 
 @dataclass(frozen=True)
-class Tlv:
+class Tlv(object):
     """Owned TLV item."""
 
     typ: int
@@ -84,7 +84,7 @@ class Tlv:
 
 
 @dataclass(frozen=True)
-class TlvView:
+class TlvView(object):
     """Borrowed TLV item view."""
 
     typ: int

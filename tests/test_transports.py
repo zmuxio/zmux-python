@@ -8,7 +8,7 @@ from io import BytesIO
 import zmux
 
 
-class RecordingReadHalf:
+class RecordingReadHalf(object):
     def __init__(self, data=b"", local=None, remote=None):
         self._data = bytearray(data)
         self.local = local
@@ -41,7 +41,7 @@ class RecordingReadHalf:
         return self.remote
 
 
-class RecordingWriteHalf:
+class RecordingWriteHalf(object):
     def __init__(self, local=None, remote=None):
         self.data = bytearray()
         self.local = local
@@ -137,7 +137,7 @@ class FailingWriteDeadlineHalf(RecordingWriteHalf):
         raise RuntimeError("synthetic write deadline failure")
 
 
-class RecordingControl:
+class RecordingControl(object):
     def __init__(self):
         self.read_timeouts = []
         self.write_timeouts = []
@@ -153,7 +153,7 @@ class RecordingControl:
         self.close_count += 1
 
 
-class CloseCountingResource:
+class CloseCountingResource(object):
     def __init__(self):
         self.close_count = 0
 
@@ -340,11 +340,11 @@ class TransportTest(unittest.TestCase):
         read_error = OSError("read close failed")
         write_error = OSError("write close failed")
 
-        class FailingReadClose:
+        class FailingReadClose(object):
             def close_read(self):
                 raise read_error
 
-        class FailingWriteClose:
+        class FailingWriteClose(object):
             def close_write(self):
                 raise write_error
 
@@ -506,17 +506,17 @@ class TransportTest(unittest.TestCase):
         self.assertEqual(write_half.data, bytearray(b"abc"))
 
     def test_transport_progress_rejects_bool_results(self):
-        class BoolReadIntoHalf:
+        class BoolReadIntoHalf(object):
             def readinto(self, buffer):
                 buffer[0:1] = b"x"
                 return True
 
-        class BoolWriteHalf:
+        class BoolWriteHalf(object):
             def write(self, data):
                 del data
                 return True
 
-        class BoolVectoredHalf:
+        class BoolVectoredHalf(object):
             def write_vectored(self, parts):
                 del parts
                 return True

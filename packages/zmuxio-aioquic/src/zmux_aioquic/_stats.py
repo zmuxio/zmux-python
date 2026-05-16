@@ -9,14 +9,14 @@ from ._constants import MAX_REASON_STATS_CODES
 from ._state import _sat_add
 
 
-class _ActiveKind:
+class _ActiveKind(object):
     LOCAL_BIDI = "local_bidi"
     LOCAL_UNI = "local_uni"
     PEER_BIDI = "peer_bidi"
     PEER_UNI = "peer_uni"
 
 
-class _ActiveCounters:
+class _ActiveCounters(object):
     def __init__(self) -> None:
         self.local_bidi = 0
         self.local_uni = 0
@@ -52,7 +52,7 @@ class _ActiveCounters:
         )
 
 
-class _ReasonCounter:
+class _ReasonCounter(object):
     def __init__(self) -> None:
         self.counts = {}
         self.overflow = 0

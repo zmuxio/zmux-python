@@ -6,7 +6,7 @@ import math
 from dataclasses import dataclass, field
 from enum import Enum
 from types import MappingProxyType, TracebackType
-from typing import Mapping, Optional, Protocol, Type, runtime_checkable
+from typing import Mapping, Optional, Protocol, runtime_checkable
 
 from .config import OpenOptions, Settings
 from .errors import (
@@ -58,7 +58,7 @@ class SessionState(str, Enum):
 
 
 @dataclass(frozen=True)
-class ActiveStreamStats:
+class ActiveStreamStats(object):
     """Snapshot of active streams grouped by opener and direction."""
 
     local_bidi: int = 0
@@ -87,7 +87,7 @@ class ActiveStreamStats:
 
 
 @dataclass(frozen=True)
-class QueueStats:
+class QueueStats(object):
     """Snapshot of writer queue depth."""
 
     urgent: int = 0
@@ -110,7 +110,7 @@ class QueueStats:
 
 
 @dataclass(frozen=True)
-class FlushStats:
+class FlushStats(object):
     """Snapshot of writer flush activity."""
 
     count: int = 0
@@ -129,7 +129,7 @@ class FlushStats:
 
 
 @dataclass(frozen=True)
-class TelemetryStats:
+class TelemetryStats(object):
     """Runtime telemetry values that are useful but not protocol state."""
 
     last_open_latency: Optional[float] = None
@@ -153,7 +153,7 @@ class TelemetryStats:
 
 
 @dataclass(frozen=True)
-class LivenessStats:
+class LivenessStats(object):
     """Keepalive and idle liveness snapshot."""
 
     keepalive_interval: float = 0.0
@@ -193,7 +193,7 @@ class LivenessStats:
 
 
 @dataclass(frozen=True)
-class WriterQueueStats:
+class WriterQueueStats(object):
     """Detailed writer queue accounting."""
 
     urgent_jobs: int = 0
@@ -219,7 +219,7 @@ class WriterQueueStats:
 
 
 @dataclass(frozen=True)
-class RetentionStats:
+class RetentionStats(object):
     """Retained stream-state and diagnostic retention snapshot."""
 
     tombstones: int = 0
@@ -238,7 +238,7 @@ class RetentionStats:
 
 
 @dataclass(frozen=True)
-class MemoryStats:
+class MemoryStats(object):
     """Tracked session memory cap snapshot."""
 
     tracked_bytes: int = 0
@@ -254,7 +254,7 @@ class MemoryStats:
 
 
 @dataclass(frozen=True)
-class AbuseStats:
+class AbuseStats(object):
     """Inbound abuse and no-op budget accounting."""
 
     ignored_control: int = 0
@@ -295,7 +295,7 @@ class AbuseStats:
 
 
 @dataclass(frozen=True)
-class ProgressStats:
+class ProgressStats(object):
     """Recent runtime progress timestamps.
 
     Values are implementation-defined timestamps, usually epoch or monotonic
@@ -312,7 +312,7 @@ class ProgressStats:
 
 
 @dataclass(frozen=True)
-class RetainedBucketStats:
+class RetainedBucketStats(object):
     """Retained item and byte counts for a bounded state bucket."""
 
     count: int = 0
@@ -324,7 +324,7 @@ class RetainedBucketStats:
 
 
 @dataclass(frozen=True)
-class RetainedStateBreakdownStats:
+class RetainedStateBreakdownStats(object):
     """Retained session state grouped by the Go runtime bucket model."""
 
     hidden_control: RetainedBucketStats = field(default_factory=RetainedBucketStats)
@@ -351,7 +351,7 @@ class RetainedStateBreakdownStats:
 
 
 @dataclass(frozen=True)
-class PressureStats:
+class PressureStats(object):
     """Snapshot of buffered memory and receive pressure."""
 
     receive_backlog_bytes: int = 0
@@ -456,7 +456,7 @@ class PressureStats:
 
 
 @dataclass(frozen=True)
-class HiddenStats:
+class HiddenStats(object):
     """Snapshot of non-application-visible retained stream state."""
 
     retained: int = 0
@@ -483,7 +483,7 @@ class HiddenStats:
 
 
 @dataclass(frozen=True)
-class AcceptBacklogStats:
+class AcceptBacklogStats(object):
     """Snapshot of peer-opened streams waiting for application acceptance."""
 
     count: int = 0
@@ -524,7 +524,7 @@ class AcceptBacklogStats:
 
 
 @dataclass(frozen=True)
-class ProvisionalStats:
+class ProvisionalStats(object):
     """Snapshot of locally-created streams waiting to become peer-visible."""
 
     bidi: int = 0
@@ -599,7 +599,7 @@ class ProvisionalStats:
 
 
 @dataclass(frozen=True)
-class ReasonStats:
+class ReasonStats(object):
     """Snapshot of retained reset and abort reason code counts."""
 
     reset: Mapping[int, int] = field(default_factory=dict)
@@ -623,7 +623,7 @@ class ReasonStats:
 
 
 @dataclass(frozen=True)
-class DiagnosticStats:
+class DiagnosticStats(object):
     """Snapshot of protocol/runtime diagnostic counters."""
 
     dropped_priority_updates: int = 0
@@ -652,7 +652,7 @@ class DiagnosticStats:
 
 
 @dataclass(frozen=True)
-class SessionStats:
+class SessionStats(object):
     """Snapshot of public session state and runtime counters."""
 
     state: SessionState = SessionState.INVALID
@@ -803,9 +803,10 @@ class Session(Protocol):
     def __enter__(self) -> "Session":
         """Return the session for ``with`` blocks."""
 
+    # noinspection PyTypeHints
     def __exit__(
             self,
-            exc_type: Optional[Type[BaseException]],
+            exc_type: Optional[type[BaseException]],
             exc: Optional[BaseException],
             tb: Optional[TracebackType],
     ) -> None:
@@ -923,9 +924,10 @@ class AsyncSession(Protocol):
     async def __aenter__(self) -> "AsyncSession":
         """Return the session for ``async with`` blocks."""
 
+    # noinspection PyTypeHints
     async def __aexit__(
             self,
-            exc_type: Optional[Type[BaseException]],
+            exc_type: Optional[type[BaseException]],
             exc: Optional[BaseException],
             tb: Optional[TracebackType],
     ) -> None:
@@ -1038,7 +1040,7 @@ class AsyncSession(Protocol):
         """Return negotiated session parameters."""
 
 
-class ClosedSession:
+class ClosedSession(object):
     """A permanently closed synchronous session."""
 
     __slots__ = ()
@@ -1046,9 +1048,10 @@ class ClosedSession:
     def __enter__(self) -> "ClosedSession":
         return self
 
+    # noinspection PyTypeHints
     def __exit__(
             self,
-            exc_type: Optional[Type[BaseException]],
+            exc_type: Optional[type[BaseException]],
             exc: Optional[BaseException],
             tb: Optional[TracebackType],
     ) -> None:
@@ -1175,7 +1178,7 @@ class InvalidSession(ClosedSession):
         return _INVALID_STATS
 
 
-class AsyncClosedSession:
+class AsyncClosedSession(object):
     """A permanently closed asynchronous session."""
 
     __slots__ = ()
@@ -1183,9 +1186,10 @@ class AsyncClosedSession:
     async def __aenter__(self) -> "AsyncClosedSession":
         return self
 
+    # noinspection PyTypeHints
     async def __aexit__(
             self,
-            exc_type: Optional[Type[BaseException]],
+            exc_type: Optional[type[BaseException]],
             exc: Optional[BaseException],
             tb: Optional[TracebackType],
     ) -> None:

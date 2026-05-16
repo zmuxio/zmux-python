@@ -19,6 +19,7 @@ def _enum_codes(*members: int) -> Tuple[int, ...]:
     return tuple(int(member) for member in members)
 
 
+# noinspection PyTypeHints
 def _enum_from_code(enum_type: Type[_E], code: int, label: str) -> _E:
     code = _coerce_int_code(code, label)
     try:

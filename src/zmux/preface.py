@@ -23,7 +23,7 @@ from .protocol import (
 )
 
 
-class _CapabilityHelpers:
+class _CapabilityHelpers(object):
     capabilities: int
 
     def has_capability(self, bit: int) -> bool:

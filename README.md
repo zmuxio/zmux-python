@@ -64,9 +64,10 @@ shape and reuse the same public value and error types for other transports.
 
 ```python
 import zmux
+from zmux.session import Session
 
 
-def echo_once(session: zmux.Session) -> None:
+def echo_once(session: Session) -> None:
     stream = session.accept_stream()
     with stream:
         request = stream.read(65536)
@@ -128,7 +129,7 @@ ZMux runs over one reliable, ordered byte stream. The core package exposes small
 transport protocols and helpers for custom integrations:
 
 ```python
-class SyncByteStream:
+class SyncByteStream(object):
     def read(self, max_bytes: int = 16384) -> bytes: ...
     def write_all(self, data: bytes) -> None: ...
     def close(self) -> None: ...
@@ -161,14 +162,15 @@ session.wait()
 Use error helpers instead of matching exception text:
 
 ```python
-try:
-    stream.write_all(payload)
-except Exception as exc:
-    if zmux.session_closed(exc):
-        return
-    if zmux.timeout(exc):
-        raise
-    app_code = zmux.error_code(exc)
+def write_or_code(stream, payload):
+    try:
+        stream.write_all(payload)
+    except Exception as exc:
+        if zmux.session_closed(exc):
+            return None
+        if zmux.timeout(exc):
+            raise
+        return zmux.error_code(exc)
 ```
 
 Common helpers include `session_closed`, `read_closed`, `write_closed`,
@@ -203,9 +205,11 @@ payload = zmux.parse_data_payload(frame.payload, frame.flags)
 import zmux
 import zmux_aioquic
 
-session: zmux.AsyncSession = zmux_aioquic.wrap_session(connection)
-stream = await session.open_stream()
-await stream.write_final(b"hello")
+
+async def run(connection) -> None:
+    session = zmux_aioquic.wrap_session(connection)
+    stream = await session.open_stream()
+    await stream.write_final(b"hello")
 ```
 
 See the adapter package README for aioquic-specific options and behavior.

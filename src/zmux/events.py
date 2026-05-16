@@ -43,7 +43,7 @@ class EventType(str, Enum):
 
 
 @dataclass(frozen=True)
-class StreamEventInfo:
+class StreamEventInfo(object):
     """Metadata attached to stream lifecycle events."""
 
     stream_id: int
@@ -85,7 +85,7 @@ class StreamEventInfo:
 
 
 @dataclass(frozen=True)
-class Event:
+class Event(object):
     """A lightweight stream or session lifecycle notification."""
 
     event_type: EventType

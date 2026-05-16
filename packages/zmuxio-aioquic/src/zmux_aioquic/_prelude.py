@@ -22,7 +22,7 @@ from ._validation import _normalize_open_options, _require_bool
 
 
 @dataclass(frozen=True)
-class AcceptedStreamMetadata:
+class AcceptedStreamMetadata(object):
     """Decoded adapter prelude metadata for an accepted QUIC stream."""
 
     metadata: StreamMetadata = field(default_factory=StreamMetadata)

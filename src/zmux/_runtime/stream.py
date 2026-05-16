@@ -242,7 +242,7 @@ class PendingTerminalKind(IntFlag):
 
 
 @dataclass(frozen=True)
-class StreamAddr:
+class StreamAddr(object):
     """Fallback address object for stream-local address reporting."""
 
     endpoint: str
@@ -276,7 +276,7 @@ class StreamAddr:
 
 
 @dataclass(frozen=True)
-class StreamReadResult:
+class StreamReadResult(object):
     bytes_read: int = 0
     released_retained_bytes: int = 0
 
@@ -294,7 +294,7 @@ class StreamReadResult:
 
 
 @dataclass(frozen=True)
-class StreamBufferClearResult:
+class StreamBufferClearResult(object):
     bytes: int = 0
     released_retained_bytes: int = 0
 
@@ -308,7 +308,7 @@ class StreamBufferClearResult:
 
 
 @dataclass
-class _ReadChunk:
+class _ReadChunk(object):
     data: memoryview
     offset: int = 0
     retained_bytes: int = 0
@@ -342,7 +342,7 @@ class _ReadChunk:
 
 
 @dataclass
-class StreamReadBuffer:
+class StreamReadBuffer(object):
     """Chunked receive buffer with retained-storage accounting.
 
     Python cannot observe list/deque capacity like Go/Rust can, so retained
@@ -480,7 +480,7 @@ class StreamReadBuffer:
 
 
 @dataclass
-class StreamReceiveAccountingState:
+class StreamReceiveAccountingState(object):
     recv_pending: int = 0
     recv_buffer: int = 0
 
@@ -503,7 +503,7 @@ class StreamReceiveAccountingState:
 
 
 @dataclass(frozen=True)
-class ReceiveReleaseResult:
+class ReceiveReleaseResult(object):
     released_budget_bytes: int = 0
     cleared_read_bytes: int = 0
     released_retained_bytes: int = 0
@@ -527,7 +527,7 @@ class ReceiveReleaseResult:
 
 
 @dataclass
-class StreamWaitState:
+class StreamWaitState(object):
     read_deadline: Optional[float] = None
     write_deadline: Optional[float] = None
     read_waiters: int = 0
@@ -613,7 +613,7 @@ class StreamWaitState:
 
 
 @dataclass
-class StreamHalfState:
+class StreamHalfState(object):
     """Mutable stream half-state with Java/Rust-style convenience methods."""
 
     local_send: bool
@@ -780,7 +780,7 @@ class StreamHalfState:
 
 
 @dataclass
-class StreamTerminalState:
+class StreamTerminalState(object):
     send_reset_error: Optional[ApplicationError] = None
     send_stop_error: Optional[ApplicationError] = None
     recv_reset_error: Optional[ApplicationError] = None
@@ -956,7 +956,7 @@ class StreamTerminalState:
 
 
 @dataclass(frozen=True)
-class TerminalLocalOpenerResult:
+class TerminalLocalOpenerResult(object):
     visibility: OpenerVisibility = OpenerVisibility.NONE
     finished: bool = False
 
@@ -970,7 +970,7 @@ class TerminalLocalOpenerResult:
 
 
 @dataclass(frozen=True)
-class TerminalFramePlan:
+class TerminalFramePlan(object):
     frames: tuple[Frame, ...] = ()
     opener_visibility: OpenerVisibility = OpenerVisibility.NONE
     status: TerminalPlanStatus = TerminalPlanStatus.READY
@@ -996,7 +996,7 @@ class TerminalFramePlan:
 
 
 @dataclass(frozen=True)
-class TerminalSignalPlan:
+class TerminalSignalPlan(object):
     frame_type: Optional[FrameType] = None
     payload: bytes = b""
     opener_visibility: OpenerVisibility = OpenerVisibility.NONE
@@ -1040,7 +1040,7 @@ class TerminalSignalPlan:
 
 
 @dataclass(frozen=True)
-class CloseReadPlan:
+class CloseReadPlan(object):
     opener: TerminalFramePlan = field(default_factory=TerminalFramePlan)
     stop_frame: Optional[Frame] = None
 
@@ -1061,7 +1061,7 @@ class CloseReadPlan:
 
 
 @dataclass(frozen=True)
-class PendingTerminalResult:
+class PendingTerminalResult(object):
     accepted: bool = True
     changed: bool = False
     coalesced: bool = False
@@ -1075,7 +1075,7 @@ class PendingTerminalResult:
 
 
 @dataclass
-class PendingTerminalState:
+class PendingTerminalState(object):
     flags: PendingTerminalKind = PendingTerminalKind.NONE
     opener: Optional[Frame] = None
     stop_payload: bytes = b""
@@ -1152,7 +1152,7 @@ class PendingTerminalState:
 
 
 @dataclass
-class StreamRuntimeState:
+class StreamRuntimeState(object):
     """Pure stream-local runtime state used by future native sessions."""
 
     stream_id: int = 0

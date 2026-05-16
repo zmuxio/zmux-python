@@ -143,7 +143,7 @@ def fill_ping_padding_from_state(length: int, liveness: Any) -> bytes:
 
 
 @dataclass(frozen=True)
-class PingPayloadFingerprint:
+class PingPayloadFingerprint(object):
     """Hash one outstanding or recently canceled PING payload."""
 
     nonce: int = 0

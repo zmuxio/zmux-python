@@ -427,7 +427,7 @@ class RuntimeSessionPingTests(unittest.TestCase):
         self.assertNotEqual(second_default, 0)
         self.assertNotEqual(first_default, second_default)
 
-        class Holder:
+        class Holder(object):
             ping_nonce_state = 1
             keepalive_jitter_state = 1
 

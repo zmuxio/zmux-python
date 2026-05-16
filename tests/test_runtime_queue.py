@@ -168,7 +168,7 @@ class TxFrameViewTests(unittest.TestCase):
         self.assertEqual(effective_deadline(10.0, 5.0), 5.0)
         self.assertEqual(effective_deadline(5.0, 10.0), 5.0)
 
-        class Partial:
+        class Partial(object):
             def __init__(self):
                 self.data = bytearray()
 
@@ -182,11 +182,11 @@ class TxFrameViewTests(unittest.TestCase):
         write_all(writer, b"hello")
         self.assertEqual(bytes(writer.data), b"hello")
 
-        class ZeroProgress:
+        class ZeroProgress(object):
             def write(self, _chunk):
                 return 0
 
-        class InvalidProgress:
+        class InvalidProgress(object):
             def __init__(self, written):
                 self.written = written
 

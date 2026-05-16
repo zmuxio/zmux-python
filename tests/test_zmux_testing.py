@@ -13,7 +13,7 @@ from zmux_testing.fixtures import load_ndjson, read_json
 _EOF = object()
 
 
-class MemorySession:
+class MemorySession(object):
     def __init__(self):
         self.peer = None
         self.bidi_queue = asyncio.Queue()
@@ -88,7 +88,7 @@ class SessionClosedWaitSession(MemorySession):
         raise zmux.SessionClosed()
 
 
-class MemoryStream:
+class MemoryStream(object):
     def __init__(self, readable=True, writable=True):
         self.peer = None
         self.inbound = asyncio.Queue()
@@ -214,13 +214,13 @@ class NoneReadStream(MemoryStream):
         return None
 
 
-class ShortExactStream:
+class ShortExactStream(object):
     async def read_exact(self, size, timeout=None):
         del timeout
         return b"x" * max(0, size - 1)
 
 
-class EndlessReadStream:
+class EndlessReadStream(object):
     async def read(self, max_bytes=-1, timeout=None):
         del timeout
         if max_bytes is None or max_bytes < 0:
@@ -228,13 +228,13 @@ class EndlessReadStream:
         return b"x" * max(1, max_bytes)
 
 
-class TooLongReadStream:
+class TooLongReadStream(object):
     async def read(self, max_bytes=-1, timeout=None):
         del max_bytes, timeout
         return b"xx"
 
 
-class CallableClosedSession:
+class CallableClosedSession(object):
     def __init__(self, value):
         self.value = value
 

@@ -51,6 +51,7 @@ def __dir__():
     return sorted(set(globals()) | set(__all__))
 
 
+# noinspection PyTypeHints
 def _find_export(name: str) -> Optional[Tuple[str, str]]:
     cached = _EXPORT_CACHE.get(name)
     if cached is not None:

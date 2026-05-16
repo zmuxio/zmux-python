@@ -50,7 +50,7 @@ class TrafficClass(IntEnum):
 
 
 @dataclass(frozen=True)
-class GroupKey:
+class GroupKey(object):
     kind: int = 0
     value: int = 0
 
@@ -78,7 +78,7 @@ class GroupKey:
 
 
 @dataclass(frozen=True)
-class RequestMeta:
+class RequestMeta(object):
     group_key: GroupKey = field(default_factory=GroupKey)
     stream_id: int = 0
     stream_scoped: bool = False
@@ -111,7 +111,7 @@ class RequestMeta:
 
 
 @dataclass(frozen=True)
-class StreamMeta:
+class StreamMeta(object):
     priority: int = 0
     group: int = 0
 
@@ -121,7 +121,7 @@ class StreamMeta:
 
 
 @dataclass(frozen=True)
-class BatchItem:
+class BatchItem(object):
     request: RequestMeta = field(default_factory=RequestMeta)
     stream: StreamMeta = field(default_factory=StreamMeta)
 
@@ -133,7 +133,7 @@ class BatchItem:
 
 
 @dataclass(frozen=True)
-class BatchConfig:
+class BatchConfig(object):
     urgent: bool = False
     group_fair: bool = False
     scheduler_hint: SchedulerHint = SchedulerHint.UNSPECIFIED_OR_BALANCED
@@ -150,7 +150,7 @@ class BatchConfig:
 
 
 @dataclass
-class BatchScratch:
+class BatchScratch(object):
     """Reusable scheduler scratch for batch-local structures.
 
     The objects stored here are private to the scheduler.  Callers must not
@@ -255,7 +255,7 @@ class BatchScratch:
 
 
 @dataclass
-class BatchState:
+class BatchState(object):
     root_virtual_time: int = 0
     group_virtual_time: Dict[GroupKey, int] = field(default_factory=dict)
     group_finish_tag: Dict[GroupKey, int] = field(default_factory=dict)
@@ -299,7 +299,7 @@ class BatchState:
 
 
 @dataclass(frozen=True)
-class WFQStreamCandidate:
+class WFQStreamCandidate(object):
     stream_id: int = 0
     req_idx: int = 0
     queue_pos: int = 0
@@ -355,7 +355,7 @@ class WFQStreamCandidate:
 
 
 @dataclass(frozen=True)
-class WFQGroupCandidate:
+class WFQGroupCandidate(object):
     group_key: GroupKey = field(default_factory=GroupKey)
     group_virtual: int = 0
     group_start: int = 0
@@ -405,7 +405,7 @@ class WFQGroupCandidate:
 
 
 @dataclass(frozen=True)
-class BatchTiePrefs:
+class BatchTiePrefs(object):
     has_group: bool = False
     group: GroupKey = field(default_factory=GroupKey)
     streams: Dict[GroupKey, int] = field(default_factory=dict)
@@ -423,7 +423,7 @@ class BatchTiePrefs:
 
 
 @dataclass(frozen=True)
-class BatchStreamSelection:
+class BatchStreamSelection(object):
     req_idx: int = 0
     queue_pos: int = 0
     cost: int = 1
@@ -443,7 +443,7 @@ class BatchStreamSelection:
 
 
 @dataclass
-class BatchPreparedStream:
+class BatchPreparedStream(object):
     meta: StreamMeta = field(default_factory=StreamMeta)
     selection: BatchStreamSelection = field(default_factory=BatchStreamSelection)
     queued_bytes: int = 0
@@ -463,14 +463,14 @@ class BatchPreparedStream:
 
 
 @dataclass
-class BatchBuiltGroup:
+class BatchBuiltGroup(object):
     key: GroupKey = field(default_factory=GroupKey)
     queues: Dict[int, list] = field(default_factory=dict)
     streams: list = field(default_factory=list)
 
 
 @dataclass
-class BatchBuildResult:
+class BatchBuildResult(object):
     group_order: list = field(default_factory=list)
     group_state: Dict[GroupKey, Dict[int, list]] = field(default_factory=dict)
     groups: list = field(default_factory=list)
@@ -483,7 +483,7 @@ class BatchBuildResult:
 
 
 @dataclass
-class BatchTransientState:
+class BatchTransientState(object):
     stream_finish: Dict[int, int] = field(default_factory=dict)
     stream_last_served: Dict[int, int] = field(default_factory=dict)
     group_virtual: Dict[GroupKey, int] = field(default_factory=dict)
@@ -492,7 +492,7 @@ class BatchTransientState:
 
 
 @dataclass(frozen=True)
-class StreamGroupBinding:
+class StreamGroupBinding(object):
     group: int = 0
     bucket: int = 0
 
@@ -502,7 +502,7 @@ class StreamGroupBinding:
 
 
 @dataclass(frozen=True)
-class GroupClassCandidatePair:
+class GroupClassCandidatePair(object):
     interactive: WFQGroupCandidate = field(default_factory=WFQGroupCandidate)
     bulk: WFQGroupCandidate = field(default_factory=WFQGroupCandidate)
     has_interactive: bool = False

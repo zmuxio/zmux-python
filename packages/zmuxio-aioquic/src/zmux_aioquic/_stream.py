@@ -6,7 +6,7 @@ import asyncio
 import time
 from collections.abc import Iterable
 from types import TracebackType
-from typing import Optional, Tuple, Type
+from typing import Optional, Tuple
 
 from zmux.config import OpenOptions
 from zmux.errors import (
@@ -56,7 +56,7 @@ from ._validation import (
 )
 
 
-class _StreamBase:
+class _StreamBase(object):
     def __init__(
             self,
             session: AioquicSession,
@@ -107,9 +107,10 @@ class _StreamBase:
     async def __aenter__(self) -> "_StreamBase":
         return self
 
+    # noinspection PyTypeHints
     async def __aexit__(
             self,
-            exc_type: Optional[Type[BaseException]],
+            exc_type: Optional[type[BaseException]],
             exc: Optional[BaseException],
             tb: Optional[TracebackType],
     ) -> None:

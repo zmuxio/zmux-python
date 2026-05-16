@@ -48,7 +48,7 @@ Address = object
 
 
 @dataclass(frozen=True)
-class ZmuxSocketAddress:
+class ZmuxSocketAddress(object):
     """Synthetic address used when a stream transport has no network address."""
 
     endpoint: str
@@ -193,7 +193,7 @@ class AsyncByteStream(AsyncByteReceiveStream, AsyncByteSendStream, Protocol):
         """Close the stream."""
 
 
-class BasicDuplexTransport:
+class BasicDuplexTransport(object):
     """Adapt a read half plus write half into a full-duplex byte stream."""
 
     def __init__(
@@ -329,7 +329,7 @@ class BasicDuplexTransport:
         self.close()
 
 
-class SocketTransport:
+class SocketTransport(object):
     """Wrap ``socket.socket`` with the synchronous byte-stream protocol."""
 
     def __init__(self, sock: socket.socket) -> None:
@@ -491,7 +491,7 @@ class SocketTransport:
             raise error_type()
 
 
-class JoinedTransport:
+class JoinedTransport(object):
     """Join independent read and write halves into a full-duplex stream.
 
     ``pause_read`` and ``pause_write`` detach one direction once in-flight work
@@ -941,7 +941,7 @@ def join(
     )
 
 
-class PausedReadHalf:
+class PausedReadHalf(object):
     """Caller-owned read half detached from a :class:`JoinedTransport`."""
 
     def __init__(self, owner: JoinedTransport, current: Optional[object]) -> None:
@@ -993,7 +993,7 @@ class PausedReadHalf:
             self._resumed = True
 
 
-class PausedWriteHalf:
+class PausedWriteHalf(object):
     """Caller-owned write half detached from a :class:`JoinedTransport`."""
 
     def __init__(self, owner: JoinedTransport, current: Optional[object]) -> None:
@@ -1045,7 +1045,7 @@ class PausedWriteHalf:
             self._resumed = True
 
 
-class FileReadHalf:
+class FileReadHalf(object):
     """Read-half adapter for binary file-like objects."""
 
     def __init__(
@@ -1086,7 +1086,7 @@ class FileReadHalf:
         return self._file
 
 
-class FileWriteHalf:
+class FileWriteHalf(object):
     """Write-half adapter for binary file-like objects."""
 
     def __init__(
