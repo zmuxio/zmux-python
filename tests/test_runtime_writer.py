@@ -6,6 +6,7 @@ from zmux._runtime.queue import (
     OpenerVisibilityMark,
     QueueLane,
     TxFrame,
+    WriteCompletion,
     WriteJob,
     make_tx_frame,
 )
@@ -23,19 +24,24 @@ from zmux._runtime.writer import (
     append_frame_binary_trusted,
     data_batch_items,
     encode_write_batch,
+    filter_writable_jobs,
     frame_data_bytes_tx,
     frame_is_priority_update_tx,
     ordinary_batch_coalesce_seconds,
     ordinary_batch_cost_limit,
     order_write_batch,
+    order_write_jobs,
     prepare_write_batch_size,
+    priority_update_send_state_allows,
     queued_request_from_job,
     request_from_frames,
     should_use_vectored_batch,
     urgent_batch_items,
     write_batch,
+    write_job_batch,
     write_vectored_all,
 )
+from zmux._runtime.stream import StreamRuntimeState
 from zmux.errors import (
     ErrorDirection,
     ErrorOperation,
@@ -200,6 +206,68 @@ class RuntimeWriterEncodingTests(unittest.TestCase):
         self.assertEqual(stats.frame_count, 0)
         self.assertEqual(writer.bytes, bytearray())
         self.assertEqual(writer.flushes, 0)
+
+    def test_write_job_batch_stops_at_shutdown_and_completes_tracked_writes(self):
+        writer = PartialWriter()
+        completion = WriteCompletion()
+        first = Frame(FrameType.DATA, 1, 0, b"first")
+        after_shutdown = Frame(FrameType.DATA, 3, 0, b"ignored")
+
+        stats = write_job_batch(
+            writer,
+            [
+                WriteJob.tracked_frames([first], completion),
+                WriteJob.shutdown(),
+                WriteJob.frame_job(after_shutdown),
+            ],
+            prefer_vectored=False,
+        )
+
+        self.assertEqual(bytes(writer.bytes), first.marshal())
+        self.assertEqual(stats.frame_count, 1)
+        self.assertTrue(completion.try_result().ok)
+
+    def test_write_job_batch_orders_urgent_prefix_before_ordinary_data(self):
+        writer = PartialWriter()
+        ping = Frame(FrameType.PING, 0, 0, b"12345678")
+        reset = Frame(FrameType.RESET, 9, 0, encode_varint(1))
+        data = Frame(FrameType.DATA, 3, 0, b"body")
+
+        ordered = order_write_jobs(
+            [
+                WriteJob.frame_job(ping),
+                WriteJob.frame_job(reset),
+                WriteJob.frame_job(data),
+            ]
+        )
+        stats = write_job_batch(writer, ordered, prefer_vectored=False)
+
+        self.assertEqual(
+            [job.all_frames()[0].frame_type for job in ordered],
+            [FrameType.RESET, FrameType.PING, FrameType.DATA],
+        )
+        self.assertEqual(bytes(writer.bytes), reset.marshal() + ping.marshal() + data.marshal())
+        self.assertEqual(stats.frame_count, 3)
+
+    def test_write_job_batch_completes_tracked_write_on_transport_failure(self):
+        completion = WriteCompletion()
+        writer = FailingWriter()
+
+        with self.assertRaises(TransportError) as caught:
+            write_job_batch(
+                writer,
+                [
+                    WriteJob.tracked_frames(
+                        [Frame(FrameType.DATA, 1, 0, b"hello")],
+                        completion,
+                    )
+                ],
+                prefer_vectored=False,
+            )
+
+        result = completion.try_result()
+        self.assertIsNotNone(result)
+        self.assertIs(result.error, caught.exception)
 
     def test_large_part_payload_uses_vectored_write_without_concatenating_payload(self):
         first = bytearray(b"a" * 9000)
@@ -505,6 +573,92 @@ class RuntimeWriterPolicyTests(unittest.TestCase):
 
         self.assertTrue(frame_is_priority_update_tx(update))
         self.assertEqual(frame_data_bytes_tx(data), 6)
+
+    def test_filter_writable_jobs_drops_reset_stream_data_and_fails_tracked_job(self):
+        state = StreamRuntimeState(stream_id=4, id_set=True)
+        state.half.mark_send_reset()
+        completion = WriteCompletion()
+
+        kept, dropped = filter_writable_jobs(
+            (
+                WriteJob.tracked_frames(
+                    [Frame(FrameType.DATA, 4, 0, b"discard")],
+                    completion,
+                ),
+            ),
+            {4: state},
+        )
+
+        self.assertEqual(kept, ())
+        self.assertEqual(len(dropped), 1)
+        self.assertEqual(dropped[0].stream_id, 4)
+        self.assertEqual(dropped[0].frames, 1)
+        self.assertEqual(dropped[0].bytes, len(b"discard"))
+        result = completion.try_result()
+        self.assertIsNotNone(result)
+        self.assertFalse(result.ok)
+
+    def test_filter_writable_tracked_job_counts_only_rejected_data_frames(self):
+        open_state = StreamRuntimeState(stream_id=4, id_set=True)
+        reset_state = StreamRuntimeState(stream_id=8, id_set=True)
+        reset_state.half.mark_send_reset()
+        completion = WriteCompletion()
+
+        kept, dropped = filter_writable_jobs(
+            (
+                WriteJob.tracked_frames(
+                    [
+                        Frame(FrameType.DATA, 4, 0, b"kept"),
+                        Frame(FrameType.DATA, 8, 0, b"dropped"),
+                    ],
+                    completion,
+                ),
+            ),
+            {4: open_state, 8: reset_state},
+        )
+
+        self.assertEqual(kept, ())
+        self.assertEqual(len(dropped), 1)
+        self.assertEqual(dropped[0].stream_id, 8)
+        self.assertEqual(dropped[0].frames, 1)
+        self.assertEqual(dropped[0].bytes, len(b"dropped"))
+        self.assertFalse(completion.try_result().ok)
+
+    def test_filter_writable_jobs_allows_opening_priority_updates_around_data(self):
+        state = StreamRuntimeState(
+            stream_id=4,
+            id_set=True,
+            opened_locally=True,
+            send_committed=True,
+            peer_visible=False,
+        )
+        update = Frame(FrameType.EXT, 4, 0, encode_varint(EXT_PRIORITY_UPDATE))
+        data = Frame(FrameType.DATA, 4, 0, b"open")
+
+        before, before_dropped = filter_writable_jobs(
+            (WriteJob.frames_job([update, data]),),
+            {4: state},
+        )
+        after, after_dropped = filter_writable_jobs(
+            (WriteJob.frames_job([data, update]),),
+            {4: state},
+        )
+
+        self.assertEqual(before[0].all_frames(), (update, data))
+        self.assertEqual(after[0].all_frames(), (data, update))
+        self.assertEqual(before_dropped, ())
+        self.assertEqual(after_dropped, ())
+
+    def test_priority_update_send_state_predicate_matches_writer_filter(self):
+        self.assertTrue(
+            priority_update_send_state_allows(True, False, False, False, False, False, False)
+        )
+        self.assertFalse(
+            priority_update_send_state_allows(True, True, False, False, False, False, False)
+        )
+        self.assertFalse(
+            priority_update_send_state_allows(True, True, True, False, True, False, False)
+        )
 
     def test_stream_accounting_is_validated_and_sorted_like_rust(self):
         req = request_from_frames(

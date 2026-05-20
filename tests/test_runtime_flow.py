@@ -188,17 +188,17 @@ class RuntimeFlowTest(unittest.TestCase):
             8192,
         )
         self.assertEqual(stream_window_target(1024, 2048), 4096)
-        self.assertGreater(
+        self.assertEqual(
             session_window_target(Settings(initial_max_data=0), MAX_VARINT62),
             MAX_VARINT62,
         )
-        self.assertGreater(stream_window_target(0, MAX_VARINT62), MAX_VARINT62)
+        self.assertEqual(stream_window_target(0, MAX_VARINT62), MAX_VARINT62)
         self.assertEqual(
             next_credit_limit(MAX_VARINT62 - 2, 10, MAX_VARINT62 - 1, 16, True),
             MAX_VARINT62,
         )
         self.assertEqual(stream_emergency_threshold(0, 16384), 1)
-        self.assertEqual(stream_emergency_threshold(64, 0), 0)
+        self.assertEqual(stream_emergency_threshold(64, 0), 16)
         self.assertEqual(replenish_min_pending(0, 16384), 1)
         self.assertFalse(should_flush_receive_credit(100, 10, 15, 64, 2, 16, False))
         self.assertTrue(should_flush_receive_credit(100, 10, 16, 64, 2, 16, False))

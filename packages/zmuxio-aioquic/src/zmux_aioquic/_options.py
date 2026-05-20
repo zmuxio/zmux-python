@@ -26,9 +26,12 @@ class SessionOptions(object):
     )
     accepted_prelude_max_concurrent: Optional[int] = None
     local_addr: Optional[object] = None
+    peer_addr: Optional[object] = None
     remote_addr: Optional[object] = None
 
     def __post_init__(self) -> None:
+        if self.remote_addr is None and self.peer_addr is not None:
+            object.__setattr__(self, "remote_addr", self.peer_addr)
         if self.accepted_prelude_read_timeout is not None:
             object.__setattr__(
                 self,

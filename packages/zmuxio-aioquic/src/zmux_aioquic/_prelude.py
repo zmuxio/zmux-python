@@ -18,7 +18,7 @@ from ._constants import (
 )
 from ._errors import _protocol_prelude_error
 from ._io import _read_exactly
-from ._validation import _normalize_open_options, _require_bool
+from ._validation import _normalize_open_options, _normalize_stream_group, _require_bool
 
 
 @dataclass(frozen=True)
@@ -31,6 +31,15 @@ class AcceptedStreamMetadata(object):
     def __post_init__(self) -> None:
         if not isinstance(self.metadata, StreamMetadata):
             raise TypeError("metadata must be StreamMetadata")
+        object.__setattr__(
+            self,
+            "metadata",
+            StreamMetadata(
+                self.metadata.priority,
+                _normalize_stream_group(self.metadata.group),
+                self.metadata.open_info,
+            ),
+        )
         object.__setattr__(
             self,
             "metadata_valid",
@@ -49,7 +58,7 @@ def build_stream_prelude(options: Optional[OpenOptions] = None) -> bytes:
     prefix = zmux.build_open_metadata_prefix(
         OPEN_METADATA_CAPABILITIES,
         options.initial_priority,
-        options.initial_group,
+        _normalize_stream_group(options.initial_group),
         options.open_info,
         STREAM_PRELUDE_MAX_PAYLOAD,
     )

@@ -13,7 +13,7 @@ from .protocol import (
     MAX_VARINT62,
     PREFACE_VERSION,
     PROTO_VERSION,
-    Capability,
+    DEFAULT_CAPABILITIES,
     Role,
     SchedulerHint,
     SETTING_PREFACE_PADDING,
@@ -26,12 +26,6 @@ DEFAULT_PREFACE_PADDING_MIN_BYTES = 16
 DEFAULT_PREFACE_PADDING_MAX_BYTES = 256
 DEFAULT_PING_PADDING_MIN_BYTES = 16
 DEFAULT_PING_PADDING_MAX_BYTES = 64
-DEFAULT_CAPABILITIES = int(
-    Capability.OPEN_METADATA
-    | Capability.PRIORITY_HINTS
-    | Capability.STREAM_GROUPS
-    | Capability.PRIORITY_UPDATE
-)
 DEFAULT_WRITE_QUEUE_MAX_BYTES = 4 * 1024 * 1024
 DEFAULT_WRITE_BATCH_MAX_FRAMES = 32
 DEFAULT_URGENT_QUEUE_MAX_BYTES_FLOOR = 64 * 1024
@@ -46,6 +40,7 @@ DEFAULT_USED_MARKER_LIMIT = 16384
 DEFAULT_LATE_DATA_AGGREGATE_CAP_FLOOR = 64 * 1024
 DEFAULT_LATE_DATA_PER_STREAM_CAP_FLOOR = 1024
 DEFAULT_IGNORED_CONTROL_BUDGET = 128
+DEFAULT_NO_OP_CONTROL_BUDGET = DEFAULT_IGNORED_CONTROL_BUDGET
 DEFAULT_NO_OP_ZERO_DATA_BUDGET = 128
 DEFAULT_INBOUND_PING_BUDGET = 128
 DEFAULT_NO_OP_MAX_DATA_BUDGET = 128
@@ -63,6 +58,7 @@ DEFAULT_VISIBLE_TERMINAL_CHURN_WINDOW = 1.0
 DEFAULT_VISIBLE_TERMINAL_CHURN_BUDGET = 128
 DEFAULT_CLOSE_DRAIN_TIMEOUT = 0.5
 DEFAULT_GO_AWAY_DRAIN_INTERVAL = 0.01
+DEFAULT_KEEPALIVE_TIMEOUT = 0.0
 DEFAULT_ACCEPT_BACKLOG_LIMIT = 128
 DEFAULT_ACCEPT_BACKLOG_BYTES_FLOOR = 4 * 1024 * 1024
 DEFAULT_ACCEPT_BACKLOG_PER_STREAM_BYTES_FLOOR = 256 * 1024
@@ -241,7 +237,7 @@ class Config(object):
     ping_padding_max_bytes: int = DEFAULT_PING_PADDING_MAX_BYTES
     keepalive_interval: Optional[float] = DEFAULT_KEEPALIVE_INTERVAL
     keepalive_max_ping_interval: Optional[float] = DEFAULT_KEEPALIVE_MAX_PING_INTERVAL
-    keepalive_timeout: Optional[float] = None
+    keepalive_timeout: Optional[float] = DEFAULT_KEEPALIVE_TIMEOUT
     write_queue_max_bytes: int = DEFAULT_WRITE_QUEUE_MAX_BYTES
     write_batch_max_frames: int = DEFAULT_WRITE_BATCH_MAX_FRAMES
     session_memory_cap: Optional[int] = None
@@ -255,6 +251,7 @@ class Config(object):
     accept_backlog_limit: Optional[int] = None
     accept_backlog_bytes_limit: Optional[int] = None
     tombstone_limit: int = DEFAULT_TOMBSTONE_LIMIT
+    hidden_control_opened_limit: Optional[int] = None
     marker_only_used_stream_limit: Optional[int] = None
     used_marker_limit: int = DEFAULT_USED_MARKER_LIMIT
     retained_open_info_bytes_budget: Optional[int] = None
@@ -262,6 +259,7 @@ class Config(object):
     late_data_per_stream_cap: Optional[int] = None
     aggregate_late_data_cap: Optional[int] = None
     ignored_control_budget: int = DEFAULT_IGNORED_CONTROL_BUDGET
+    no_op_control_flood_threshold: int = 0
     no_op_zero_data_budget: int = DEFAULT_NO_OP_ZERO_DATA_BUDGET
     inbound_ping_budget: int = DEFAULT_INBOUND_PING_BUDGET
     no_op_max_data_budget: int = DEFAULT_NO_OP_MAX_DATA_BUDGET
@@ -321,6 +319,7 @@ class Config(object):
                 "tombstone_limit",
                 "used_marker_limit",
                 "ignored_control_budget",
+                "no_op_control_flood_threshold",
                 "no_op_zero_data_budget",
                 "inbound_ping_budget",
                 "no_op_max_data_budget",
@@ -342,6 +341,7 @@ class Config(object):
                 "pending_priority_bytes_budget",
                 "accept_backlog_limit",
                 "accept_backlog_bytes_limit",
+                "hidden_control_opened_limit",
                 "marker_only_used_stream_limit",
                 "retained_open_info_bytes_budget",
                 "retained_peer_reason_bytes_budget",
@@ -810,11 +810,13 @@ __all__ = [
     "DEFAULT_INBOUND_PING_BUDGET",
     "DEFAULT_KEEPALIVE_INTERVAL",
     "DEFAULT_KEEPALIVE_MAX_PING_INTERVAL",
+    "DEFAULT_KEEPALIVE_TIMEOUT",
     "DEFAULT_LATE_DATA_AGGREGATE_CAP_FLOOR",
     "DEFAULT_LATE_DATA_PER_STREAM_CAP_FLOOR",
     "DEFAULT_MAX_PROVISIONAL_STREAMS_BIDI",
     "DEFAULT_MAX_PROVISIONAL_STREAMS_UNI",
     "DEFAULT_NO_OP_BLOCKED_BUDGET",
+    "DEFAULT_NO_OP_CONTROL_BUDGET",
     "DEFAULT_NO_OP_MAX_DATA_BUDGET",
     "DEFAULT_NO_OP_PRIORITY_UPDATE_BUDGET",
     "DEFAULT_NO_OP_ZERO_DATA_BUDGET",

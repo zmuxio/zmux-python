@@ -208,7 +208,7 @@ def parse_data_payload(payload: bytes, flags: int) -> DataPayload:
 
     payload_view = memoryview(payload)
     if flags & FRAME_FLAG_OPEN_METADATA == 0:
-        return DataPayload(app_data=payload_view.tobytes())
+        return DataPayload(app_data=payload_view.tobytes(), metadata_valid=True)
 
     metadata_len, consumed = parse_varint(payload_view)
     if metadata_len > len(payload_view) - consumed:
@@ -234,7 +234,7 @@ def parse_data_payload_view(payload: bytes, flags: int) -> DataPayloadView:
 
     payload_view = memoryview(payload)
     if flags & FRAME_FLAG_OPEN_METADATA == 0:
-        return DataPayloadView(app_data=payload_view)
+        return DataPayloadView(app_data=payload_view, metadata_valid=True)
 
     metadata_len, consumed = parse_varint(payload_view)
     if metadata_len > len(payload_view) - consumed:

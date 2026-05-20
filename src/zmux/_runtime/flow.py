@@ -263,6 +263,7 @@ def session_window_target(local: Settings, session_data_high_watermark: int) -> 
                 session_data_high_watermark, "session_data_high_watermark"
             ),
             4,
+            MAX_VARINT62,
         ),
     )
 
@@ -277,6 +278,7 @@ def stream_window_target(
                 per_stream_data_high_watermark, "per_stream_data_high_watermark"
             ),
             2,
+            MAX_VARINT62,
         ),
     )
 
@@ -287,9 +289,9 @@ def session_emergency_threshold(payload: int) -> int:
 
 def stream_emergency_threshold(target: int, payload: int) -> int:
     payload = _nonnegative_int(payload, "payload")
-    if payload == 0:
-        return 0
     threshold = quarter_threshold(target)
+    if payload == 0:
+        return threshold
     return min(payload, threshold)
 
 

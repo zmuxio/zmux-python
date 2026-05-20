@@ -27,6 +27,7 @@ from .queue import (
     WriteJob,
     WriteJobKind,
     classify_write_request,
+    frame_data_app_bytes,
     make_tx_frame,
     tx_frame_encoded_bytes,
     tx_frame_queue_cost,
@@ -52,6 +53,7 @@ from .._validation import (
     require_bool as _shared_require_bool,
     require_nonnegative_int as _nonnegative_int,
 )
+from .stream import SendHalfState, StreamRuntimeState
 from .._wire.frame import append_frame_header_trusted, normalize_limits
 from .._wire.varint import parse_varint
 from ..config import Settings, default_settings
@@ -69,6 +71,7 @@ from ..errors import (
 from ..frame import Frame
 from ..protocol import (
     EXT_PRIORITY_UPDATE,
+    FRAME_FLAG_FIN,
     FRAME_FLAG_OPEN_METADATA,
     FrameType,
     SchedulerHint,
@@ -152,6 +155,41 @@ class RejectedWriteRequest(object):
             raise TypeError("request must be QueuedWriteRequest")
         if not isinstance(self.error, BaseException):
             raise TypeError("error must be BaseException")
+
+
+@dataclass(frozen=True)
+class DroppedDataFrames(object):
+    stream_id: int
+    frames: int = 0
+    bytes: int = 0
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "stream_id", _positive_int(self.stream_id, "stream_id"))
+        object.__setattr__(self, "frames", _nonnegative_int(self.frames, "frames"))
+        object.__setattr__(self, "bytes", _nonnegative_int(self.bytes, "bytes"))
+
+
+@dataclass(frozen=True)
+class WritableFrameDecision(object):
+    stream_id: int
+    data: bool = False
+    priority_update: bool = False
+    priority_update_before_data: bool = False
+    priority_update_before_fin: bool = False
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "stream_id", _nonnegative_int(self.stream_id, "stream_id"))
+        for name in (
+                "data",
+                "priority_update",
+                "priority_update_before_data",
+                "priority_update_before_fin",
+        ):
+            object.__setattr__(self, name, _require_bool(getattr(self, name), name))
+
+    @classmethod
+    def blocked(cls, stream_id: int) -> "WritableFrameDecision":
+        return cls(stream_id)
 
 
 @dataclass(frozen=True)
@@ -595,10 +633,37 @@ def queued_request_from_job(job: WriteJob) -> QueuedWriteRequest:
 def queued_requests_from_jobs(jobs: Sequence[WriteJob]) -> Tuple[QueuedWriteRequest, ...]:
     requests = []
     for job in jobs:
+        if not isinstance(job, WriteJob):
+            raise TypeError("job must be WriteJob")
         if job.kind in (WriteJobKind.SHUTDOWN, WriteJobKind.DRAIN_SHUTDOWN):
-            continue
+            break
         requests.append(queued_request_from_job(job))
     return tuple(requests)
+
+
+def order_write_jobs(
+        jobs: Sequence[WriteJob],
+        *,
+        scheduler: Optional[BatchScheduler] = None,
+        config: Optional[BatchConfig] = None,
+        stream_meta: Optional[StreamMetaMap] = None,
+) -> Tuple[WriteJob, ...]:
+    jobs = tuple(_require_write_job(job) for job in jobs)
+    if len(jobs) < 2:
+        return jobs
+    tail_start = _ordered_tail_start(jobs)
+    prefix = jobs[:tail_start]
+    if len(prefix) < 2:
+        return jobs
+    ordered = _order_write_job_prefix(
+        prefix,
+        scheduler=scheduler,
+        config=config,
+        stream_meta=stream_meta,
+    )
+    if ordered is prefix:
+        return jobs
+    return ordered + jobs[tail_start:]
 
 
 def tx_frame_from_frame(frame: Frame) -> TxFrame:
@@ -695,8 +760,15 @@ def write_job_batch(
 ) -> EncodedBatchStats:
     prefer_vectored = _require_bool(prefer_vectored, "prefer_vectored")
     flush = _require_bool(flush, "flush")
-    encoded = encode_write_jobs(jobs, validate_limits=validate_limits)
-    write_encoded_batch(writer, encoded, prefer_vectored=prefer_vectored, flush=flush)
+    jobs = order_write_jobs(jobs)
+    completions = _tracked_completions_before_shutdown(jobs)
+    try:
+        encoded = encode_write_jobs(jobs, validate_limits=validate_limits)
+        write_encoded_batch(writer, encoded, prefer_vectored=prefer_vectored, flush=flush)
+    except BaseException as exc:
+        _complete_write_completions(completions, exc)
+        raise
+    _complete_write_completions(completions, None)
     return encoded.stats
 
 
@@ -748,6 +820,58 @@ def write_vectored_all(writer: object, parts: Iterable[ReadableBuffer]) -> None:
             del window[:index]
         else:
             window = [window[index][offset:]] + window[index + 1:]
+
+
+def filter_writable_jobs(
+        jobs: Sequence[WriteJob],
+        streams: Dict[int, StreamRuntimeState],
+        *,
+        session_closed: bool = False,
+) -> Tuple[Tuple[WriteJob, ...], Tuple[DroppedDataFrames, ...]]:
+    if not isinstance(streams, dict):
+        raise TypeError("streams must be a dict")
+    session_closed = _require_bool(session_closed, "session_closed")
+    kept: List[WriteJob] = []
+    dropped: Dict[int, DroppedDataFrames] = {}
+    cache: Dict[int, WritableFrameDecision] = {}
+    for job in jobs:
+        job = _require_write_job(job)
+        next_job = _retain_writable_job(
+            job,
+            streams,
+            session_closed=session_closed,
+            dropped=dropped,
+            cache=cache,
+        )
+        if next_job is not None:
+            kept.append(next_job)
+    return tuple(kept), tuple(dropped.values())
+
+
+def priority_update_send_state_allows(
+        local_send: bool,
+        opened_locally: bool,
+        peer_visible: bool,
+        aborted: bool,
+        stopped_by_peer: bool,
+        send_fin: bool,
+        send_reset: bool,
+) -> bool:
+    local_send = _require_bool(local_send, "local_send")
+    opened_locally = _require_bool(opened_locally, "opened_locally")
+    peer_visible = _require_bool(peer_visible, "peer_visible")
+    aborted = _require_bool(aborted, "aborted")
+    stopped_by_peer = _require_bool(stopped_by_peer, "stopped_by_peer")
+    send_fin = _require_bool(send_fin, "send_fin")
+    send_reset = _require_bool(send_reset, "send_reset")
+    return (
+            local_send
+            and not aborted
+            and not stopped_by_peer
+            and not send_fin
+            and not send_reset
+            and (not opened_locally or peer_visible)
+    )
 
 
 # noinspection PyTypeHints
@@ -822,7 +946,7 @@ def batch_order(
             None,
             urgent_batch_items(batch),
         )
-    if lane in (QueueLane.ORDINARY, QueueLane.ADVISORY):
+    if lane is QueueLane.ORDINARY:
         cfg = BatchConfig() if config is None else config
         cfg = BatchConfig(
             urgent=False,
@@ -844,7 +968,7 @@ def same_stream_burst_keeps_order(
 ) -> bool:
     lane = _coerce_enum(lane, QueueLane, "lane")
     batch = _request_tuple(batch, "batch")
-    if lane not in (QueueLane.ORDINARY, QueueLane.ADVISORY) or not batch:
+    if lane is not QueueLane.ORDINARY or not batch:
         return False
     first = batch[0]
     classify_write_request(first)
@@ -1168,6 +1292,394 @@ def _coalesce_stream_accounting(stats: EncodedBatchStats) -> None:
     )
 
 
+def _retain_writable_job(
+        job: WriteJob,
+        streams: Dict[int, StreamRuntimeState],
+        *,
+        session_closed: bool,
+        dropped: Dict[int, DroppedDataFrames],
+        cache: Dict[int, WritableFrameDecision],
+) -> Optional[WriteJob]:
+    if job.kind is WriteJobKind.FRAME:
+        if job.frame is None:
+            return None
+        return job if _retain_writable_frame(job.frame, streams, session_closed, dropped, cache, False) else None
+    if job.kind is WriteJobKind.FRAMES:
+        frames, _ = _retain_writable_frames(
+            job.frames,
+            streams,
+            session_closed,
+            dropped,
+            cache,
+        )
+        return job.with_frames(frames) if frames else None
+    if job.kind is WriteJobKind.TRACKED_FRAMES and job.tracked is not None:
+        frames, dropped_data_frame = _retain_writable_frames(
+            job.tracked.frames,
+            streams,
+            session_closed,
+            dropped,
+            cache,
+        )
+        if not frames or dropped_data_frame:
+            job.tracked.completion.complete_error(
+                _local_internal_error("zmux: queued write is no longer writable")
+            )
+            return None
+        return job.with_frames(frames)
+    return job
+
+
+def _retain_writable_frames(
+        frames: Sequence[Frame],
+        streams: Dict[int, StreamRuntimeState],
+        session_closed: bool,
+        dropped: Dict[int, DroppedDataFrames],
+        cache: Dict[int, WritableFrameDecision],
+) -> Tuple[Tuple[Frame, ...], bool]:
+    dropped_data_frame = False
+    opening_priority_stream: Optional[int] = None
+    priority_before_data = (
+        tuple(
+            _priority_update_allowed_before_following_data(
+                frames,
+                index,
+                streams,
+                session_closed,
+                cache,
+            )
+            for index in range(len(frames))
+        )
+        if _has_priority_update_before_data_candidate(frames)
+        else ()
+    )
+    kept: List[Frame] = []
+    for index, frame in enumerate(frames):
+        allow_opening_priority_update = (
+                _frame_is_priority_update(frame)
+                and opening_priority_stream == frame.stream_id
+        )
+        allow_priority_before_data = bool(priority_before_data and priority_before_data[index])
+        keep = _retain_writable_frame(
+            frame,
+            streams,
+            session_closed,
+            dropped,
+            cache,
+            allow_opening_priority_update or allow_priority_before_data,
+        )
+        if not keep and frame.frame_type is FrameType.DATA:
+            dropped_data_frame = True
+        if keep:
+            kept.append(frame)
+        opening_priority_stream = _next_opening_priority_stream(
+            frame,
+            keep,
+            streams,
+            session_closed,
+            cache,
+        )
+    return tuple(kept), dropped_data_frame
+
+
+def _has_priority_update_before_data_candidate(frames: Sequence[Frame]) -> bool:
+    for index in range(len(frames) - 1):
+        priority = frames[index]
+        data = frames[index + 1]
+        if (
+                _frame_is_priority_update(priority)
+                and data.frame_type is FrameType.DATA
+                and data.stream_id == priority.stream_id
+        ):
+            return True
+    return False
+
+
+def _priority_update_allowed_before_following_data(
+        frames: Sequence[Frame],
+        index: int,
+        streams: Dict[int, StreamRuntimeState],
+        session_closed: bool,
+        cache: Dict[int, WritableFrameDecision],
+) -> bool:
+    if index + 1 >= len(frames):
+        return False
+    frame = frames[index]
+    if not _frame_is_priority_update(frame):
+        return False
+    next_frame = frames[index + 1]
+    if next_frame.frame_type is not FrameType.DATA or next_frame.stream_id != frame.stream_id:
+        return False
+    decision = _writable_frame_decision(streams, frame.stream_id, session_closed, cache)
+    return decision.data and (
+            decision.priority_update_before_data
+            or (bool(next_frame.flags & FRAME_FLAG_FIN) and decision.priority_update_before_fin)
+    )
+
+
+def _next_opening_priority_stream(
+        frame: Frame,
+        keep: bool,
+        streams: Dict[int, StreamRuntimeState],
+        session_closed: bool,
+        cache: Dict[int, WritableFrameDecision],
+) -> Optional[int]:
+    if keep and frame.frame_type is FrameType.DATA and frame.stream_id != 0:
+        decision = _writable_frame_decision(streams, frame.stream_id, session_closed, cache)
+        if not decision.priority_update:
+            return frame.stream_id
+    return None
+
+
+def _retain_writable_frame(
+        frame: Frame,
+        streams: Dict[int, StreamRuntimeState],
+        session_closed: bool,
+        dropped: Dict[int, DroppedDataFrames],
+        cache: Dict[int, WritableFrameDecision],
+        allow_opening_priority_update: bool,
+) -> bool:
+    if frame.frame_type is FrameType.DATA:
+        if _writable_frame_decision(streams, frame.stream_id, session_closed, cache).data:
+            return True
+        _note_dropped_data(dropped, frame.stream_id, frame_data_app_bytes(frame))
+        return False
+    return (
+            not _frame_is_priority_update(frame)
+            or allow_opening_priority_update
+            or _writable_frame_decision(
+                streams,
+                frame.stream_id,
+                session_closed,
+                cache,
+            ).priority_update
+    )
+
+
+def _writable_frame_decision(
+        streams: Dict[int, StreamRuntimeState],
+        stream_id: int,
+        session_closed: bool,
+        cache: Dict[int, WritableFrameDecision],
+) -> WritableFrameDecision:
+    stream_id = _nonnegative_int(stream_id, "stream_id")
+    decision = cache.get(stream_id)
+    if decision is not None:
+        return decision
+    decision = _stream_writable_decision(streams, stream_id, session_closed)
+    cache[stream_id] = decision
+    return decision
+
+
+def _stream_writable_decision(
+        streams: Dict[int, StreamRuntimeState],
+        stream_id: int,
+        session_closed: bool,
+) -> WritableFrameDecision:
+    if session_closed:
+        return WritableFrameDecision.blocked(stream_id)
+    stream = streams.get(stream_id)
+    if stream is None:
+        return WritableFrameDecision.blocked(stream_id)
+    if not isinstance(stream, StreamRuntimeState):
+        raise TypeError("streams values must be StreamRuntimeState")
+    send_half = stream.half.effective_send_half()
+    recv_half = stream.half.effective_recv_half()
+    aborted = send_half is SendHalfState.ABORTED or recv_half is SendHalfState.ABORTED
+    stopped_by_peer = stream.half.remote_write_stop or send_half is SendHalfState.STOP_SEEN
+    send_reset = send_half is SendHalfState.RESET
+    send_fin = send_half is SendHalfState.FIN
+    priority_update_non_terminal = bool(stream.local_send) and not aborted and not stopped_by_peer
+    return WritableFrameDecision(
+        stream_id=stream_id,
+        data=not aborted and not send_reset,
+        priority_update=priority_update_send_state_allows(
+            bool(stream.local_send),
+            stream.opened_locally,
+            stream.peer_visible,
+            aborted,
+            stopped_by_peer,
+            send_fin,
+            send_reset,
+        ),
+        priority_update_before_data=(
+                priority_update_non_terminal
+                and not send_reset
+                and stream.opened_locally
+                and stream.send_committed
+                and not stream.peer_visible
+        ),
+        priority_update_before_fin=(
+                priority_update_non_terminal
+                and not send_reset
+                and (not stream.opened_locally or stream.send_committed)
+        ),
+    )
+
+
+def _note_dropped_data(
+        dropped: Dict[int, DroppedDataFrames], stream_id: int, bytes_dropped: int
+) -> None:
+    if stream_id == 0:
+        return
+    bytes_dropped = _nonnegative_int(bytes_dropped, "bytes_dropped")
+    current = dropped.get(stream_id)
+    if current is None:
+        dropped[stream_id] = DroppedDataFrames(stream_id, 1, bytes_dropped)
+        return
+    dropped[stream_id] = DroppedDataFrames(
+        stream_id,
+        _saturating_add(current.frames, 1),
+        _saturating_add(current.bytes, bytes_dropped),
+    )
+
+
+def _frame_is_priority_update(frame: Frame) -> bool:
+    if frame.frame_type is not FrameType.EXT or frame.stream_id == 0:
+        return False
+    try:
+        extension_id, _ = parse_varint(frame.payload)
+    except Exception:
+        return False
+    return extension_id == EXT_PRIORITY_UPDATE
+
+
+def _order_write_job_prefix(
+        jobs: Tuple[WriteJob, ...],
+        *,
+        scheduler: Optional[BatchScheduler],
+        config: Optional[BatchConfig],
+        stream_meta: Optional[StreamMetaMap],
+) -> Tuple[WriteJob, ...]:
+    urgent_len = 0
+    for job in jobs:
+        if not job.is_urgent():
+            break
+        urgent_len += 1
+    needs_urgent_order = urgent_len > 1
+    needs_nonurgent_order = urgent_len < len(jobs) and not _same_stream_job_burst_keeps_order(
+        jobs[urgent_len:]
+    )
+    if not needs_urgent_order and not needs_nonurgent_order:
+        return jobs
+    if urgent_len == len(jobs):
+        return _order_write_job_slice(
+            jobs,
+            QueueLane.URGENT,
+            scheduler=scheduler,
+            config=config,
+            stream_meta=stream_meta,
+        )
+    if urgent_len == 0:
+        return _order_write_job_slice(
+            jobs,
+            QueueLane.ORDINARY,
+            scheduler=scheduler,
+            config=config,
+            stream_meta=stream_meta,
+        )
+    urgent = (
+        _order_write_job_slice(
+            jobs[:urgent_len],
+            QueueLane.URGENT,
+            scheduler=scheduler,
+            config=config,
+            stream_meta=stream_meta,
+        )
+        if needs_urgent_order
+        else jobs[:urgent_len]
+    )
+    ordinary = (
+        _order_write_job_slice(
+            jobs[urgent_len:],
+            QueueLane.ORDINARY,
+            scheduler=scheduler,
+            config=config,
+            stream_meta=stream_meta,
+        )
+        if needs_nonurgent_order
+        else jobs[urgent_len:]
+    )
+    return urgent + ordinary
+
+
+def _order_write_job_slice(
+        jobs: Tuple[WriteJob, ...],
+        lane: QueueLane,
+        *,
+        scheduler: Optional[BatchScheduler],
+        config: Optional[BatchConfig],
+        stream_meta: Optional[StreamMetaMap],
+) -> Tuple[WriteJob, ...]:
+    requests = tuple(queued_request_from_job(job) for job in jobs)
+    order = batch_order(
+        requests,
+        lane,
+        scheduler=scheduler,
+        config=config,
+        stream_meta=stream_meta,
+    )
+    if len(order) != len(jobs) or batch_order_is_identity(order):
+        return jobs
+    if any(index < 0 or index >= len(jobs) for index in order):
+        return jobs
+    return tuple(jobs[index] for index in order)
+
+
+def _same_stream_job_burst_keeps_order(jobs: Tuple[WriteJob, ...]) -> bool:
+    if not jobs:
+        return False
+    return same_stream_burst_keeps_order(
+        tuple(queued_request_from_job(job) for job in jobs),
+        QueueLane.ORDINARY,
+    )
+
+
+def _ordered_tail_start(jobs: Tuple[WriteJob, ...]) -> int:
+    for index, job in enumerate(jobs):
+        if _job_is_ordered_tail(job):
+            return index
+    return len(jobs)
+
+
+def _job_is_ordered_tail(job: WriteJob) -> bool:
+    return job.kind in (
+        WriteJobKind.GRACEFUL_CLOSE,
+        WriteJobKind.SHUTDOWN,
+        WriteJobKind.DRAIN_SHUTDOWN,
+    )
+
+
+def _tracked_completions_before_shutdown(
+        jobs: Sequence[WriteJob],
+) -> Tuple[object, ...]:
+    completions = []
+    for job in jobs:
+        if not isinstance(job, WriteJob):
+            raise TypeError("job must be WriteJob")
+        if job.kind in (WriteJobKind.SHUTDOWN, WriteJobKind.DRAIN_SHUTDOWN):
+            break
+        if job.kind is WriteJobKind.TRACKED_FRAMES and job.tracked is not None:
+            completions.append(job.tracked.completion)
+    return tuple(completions)
+
+
+def _require_write_job(job: object) -> WriteJob:
+    if not isinstance(job, WriteJob):
+        raise TypeError("job must be WriteJob")
+    return job
+
+
+def _complete_write_completions(
+        completions: Sequence[object], error: Optional[BaseException]
+) -> None:
+    for completion in completions:
+        if error is None:
+            completion.complete_success()
+        else:
+            completion.complete_error(error)
+
+
 def _stream_stat_dict(values: Dict[int, int], name: str) -> Dict[int, int]:
     if not isinstance(values, dict):
         raise TypeError("%s must be a dict" % name)
@@ -1349,6 +1861,7 @@ __all__ = (
     "BatchScheduler",
     "DequeuedWriteWork",
     "DequeuedWriteWorkKind",
+    "DroppedDataFrames",
     "EncodedBatch",
     "EncodedBatchStats",
     "EncodedFrame",
@@ -1359,6 +1872,7 @@ __all__ = (
     "StreamValueAccumulator",
     "WriteBatchScratch",
     "WriteBatchSize",
+    "WritableFrameDecision",
     "append_encoded_frames",
     "append_frame_binary_trusted",
     "batch_order",
@@ -1369,15 +1883,18 @@ __all__ = (
     "encode_write_batch",
     "encode_write_jobs",
     "encoded_batch_parts",
+    "filter_writable_jobs",
     "frame_data_bytes_tx",
     "frame_is_priority_update_tx",
     "frame_opens_local_stream",
     "now_seconds",
     "order_batch_indices",
     "order_write_batch",
+    "order_write_jobs",
     "ordinary_batch_coalesce_seconds",
     "ordinary_batch_cost_limit",
     "prepare_write_batch_size",
+    "priority_update_send_state_allows",
     "queued_request_from_job",
     "queued_requests_from_jobs",
     "request_from_frames",

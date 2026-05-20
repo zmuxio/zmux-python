@@ -16,7 +16,6 @@ from .tx import (
     jobs_have_removable_stream_frame,
     merge_coalesced_priority_update,
     nonnegative_duration,
-    order_urgent_jobs_in_place,
     remove_stream_frames,
     replacement_would_exceed_limit,
     saturating_add,
@@ -137,13 +136,11 @@ class WriteQueue(object):
         with self._cond:
             stats = WriterQueueStats(
                 urgent_jobs=len(self._urgent),
-                advisory_jobs=0,
                 ordinary_jobs=len(self._ordinary),
                 queued_bytes=self._queued_bytes,
                 max_bytes=self.limits.max_bytes,
                 urgent_queued_bytes=self._urgent_queued_bytes,
                 urgent_max_bytes=self.limits.urgent_max_bytes,
-                advisory_queued_bytes=0,
                 data_queued_bytes=self._data_queued_bytes,
                 session_data_high_watermark=self.limits.session_data_max_bytes,
                 per_stream_data_high_watermark=self.limits.per_stream_data_max_bytes,
@@ -226,37 +223,27 @@ class WriteQueue(object):
             if self._is_empty_locked():
                 return WriteQueuePopStatus.CLOSED
 
-            if self._urgent:
-                for _ in range(max(1, self.limits.max_batch_frames)):
-                    if not self._urgent:
-                        break
-                    job = self._urgent.popleft()
-                    cost = job.cost_bytes()
-                    self._apply_cost_remove(queue_cost_for(QueueLane.URGENT, job, cost))
-                    batch.append(job)
-                    if job.kind is WriteJobKind.SHUTDOWN:
-                        break
-                order_urgent_jobs_in_place(batch)
-                self._cond.notify_all()
-                return WriteQueuePopStatus.BATCH
-
             saw_nonurgent = False
             nonurgent_batch_bytes = 0
             for _ in range(max(1, self.limits.max_batch_frames)):
-                if not self._ordinary:
+                if self._urgent:
+                    lane = QueueLane.URGENT
+                elif self._ordinary:
+                    lane = QueueLane.ORDINARY
+                else:
                     break
-                lane = QueueLane.ORDINARY
-                job = self._ordinary.popleft()
+                job = self._lane(lane).popleft()
                 cost = job.cost_bytes()
-                would_exceed = (
-                        saturating_add(nonurgent_batch_bytes, cost)
-                        > self.limits.max_batch_bytes
-                )
-                if saw_nonurgent and would_exceed:
-                    self._ordinary.appendleft(job)
-                    break
-                saw_nonurgent = True
-                nonurgent_batch_bytes = saturating_add(nonurgent_batch_bytes, cost)
+                if lane is not QueueLane.URGENT:
+                    would_exceed = (
+                            saturating_add(nonurgent_batch_bytes, cost)
+                            > self.limits.max_batch_bytes
+                    )
+                    if saw_nonurgent and would_exceed:
+                        self._lane(lane).appendleft(job)
+                        break
+                    saw_nonurgent = True
+                    nonurgent_batch_bytes = saturating_add(nonurgent_batch_bytes, cost)
                 self._apply_cost_remove(queue_cost_for(lane, job, cost))
                 batch.append(job)
                 if job.kind in (WriteJobKind.SHUTDOWN, WriteJobKind.DRAIN_SHUTDOWN):

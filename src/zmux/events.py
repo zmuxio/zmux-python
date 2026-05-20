@@ -83,6 +83,12 @@ class StreamEventInfo(object):
 
         return bool(self.metadata.open_info)
 
+    @property
+    def open_info_len(self) -> int:
+        """Return the open metadata length."""
+
+        return len(self.metadata.open_info)
+
 
 @dataclass(frozen=True)
 class Event(object):

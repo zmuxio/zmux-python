@@ -50,6 +50,12 @@ class StreamMetadata(object):
 
         return bool(self.open_info)
 
+    @property
+    def open_info_len(self) -> int:
+        """Return the opaque open metadata length."""
+
+        return len(self.open_info)
+
 
 @dataclass(frozen=True)
 class StreamMetadataView(object):
@@ -85,6 +91,12 @@ class StreamMetadataView(object):
         """Return whether opaque open metadata is present."""
 
         return bool(self.open_info)
+
+    @property
+    def open_info_len(self) -> int:
+        """Return the opaque open metadata length."""
+
+        return len(self.open_info)
 
     def to_owned(self) -> StreamMetadata:
         return StreamMetadata(self.priority, self.group, self.open_info.tobytes())
@@ -131,7 +143,6 @@ class DataPayload(object):
         if not has_metadata:
             metadata = StreamMetadata()
             open_info = b""
-            metadata_valid = False
             metadata_tlvs = ()
         elif metadata_valid:
             if metadata.open_info and not open_info:
@@ -187,7 +198,6 @@ class DataPayloadView(object):
             has_metadata = True
         if not has_metadata:
             metadata = StreamMetadataView()
-            metadata_valid = False
         elif not metadata_valid:
             metadata = StreamMetadataView()
         object.__setattr__(self, "metadata", metadata)

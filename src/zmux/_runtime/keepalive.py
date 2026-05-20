@@ -38,7 +38,6 @@ _JITTER_WINDOW_DIVISOR = 8.0
 _NANOS_PER_SECOND = 1_000_000_000
 _MAX_DURATION_SECONDS = ((1 << 63) - 1) / _NANOS_PER_SECOND
 _PING_BLOCK_BYTES = 8
-_DEFAULT_SETTINGS = Settings()
 
 _seed_counter = 0
 _seed_lock = Lock()
@@ -207,13 +206,13 @@ def effective_keepalive_timeout(
     interval = _duration_seconds(interval, "interval")
     configured = _duration_seconds(configured, "configured")
     last_ping_rtt = _duration_seconds(last_ping_rtt, "last_ping_rtt")
+    if interval <= 0:
+        return 0.0
     if configured > 0:
         timeout = configured
         if last_ping_rtt > 0:
             timeout = max(timeout, keepalive_timeout_rtt_floor(last_ping_rtt))
         return timeout
-    if interval <= 0:
-        return 0.0
     timeout = min(
         DEFAULT_KEEPALIVE_TIMEOUT_MAX,
         max(
@@ -288,8 +287,12 @@ def pong_payload_matches_ping(
 
 
 def ping_payload_limit(local: Settings, peer: Settings) -> int:
-    local_limit = local.max_control_payload_bytes or _DEFAULT_SETTINGS.max_control_payload_bytes
-    peer_limit = peer.max_control_payload_bytes or _DEFAULT_SETTINGS.max_control_payload_bytes
+    local_limit = local.max_control_payload_bytes
+    peer_limit = peer.max_control_payload_bytes
+    if local_limit == 0:
+        return peer_limit
+    if peer_limit == 0:
+        return local_limit
     return min(local_limit, peer_limit)
 
 

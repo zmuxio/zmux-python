@@ -91,21 +91,18 @@ class QueueStats(object):
     """Snapshot of writer queue depth."""
 
     urgent: int = 0
-    advisory: int = 0
     ordinary: int = 0
     total: int = 0
 
     def __post_init__(self) -> None:
         urgent = _nonnegative_int(self.urgent, "urgent")
-        advisory = _nonnegative_int(self.advisory, "advisory")
         ordinary = _nonnegative_int(self.ordinary, "ordinary")
         object.__setattr__(self, "urgent", urgent)
-        object.__setattr__(self, "advisory", advisory)
         object.__setattr__(self, "ordinary", ordinary)
         object.__setattr__(
             self,
             "total",
-            _saturating_add(_saturating_add(urgent, advisory), ordinary),
+            _saturating_add(urgent, ordinary),
         )
 
 
@@ -197,13 +194,11 @@ class WriterQueueStats(object):
     """Detailed writer queue accounting."""
 
     urgent_jobs: int = 0
-    advisory_jobs: int = 0
     ordinary_jobs: int = 0
     queued_bytes: int = 0
     max_bytes: int = 0
     urgent_queued_bytes: int = 0
     urgent_max_bytes: int = 0
-    advisory_queued_bytes: int = 0
     data_queued_bytes: int = 0
     session_data_high_watermark: int = 0
     per_stream_data_high_watermark: int = 0
@@ -368,12 +363,7 @@ class PressureStats(object):
     tracked_buffered_limit: int = 0
     tracked_buffered_high: bool = False
     tracked_buffered_at_cap: bool = False
-    ordinary_queued_bytes: int = 0
-    advisory_queued_bytes: int = 0
-    urgent_queued_bytes: int = 0
     pending_control_bytes: int = 0
-    pending_advisory_bytes: int = 0
-    prepared_advisory_bytes: int = 0
     pending_terminal_bytes: int = 0
     pending_terminal_count: int = 0
     pending_protocol_jobs: int = 0
@@ -403,12 +393,7 @@ class PressureStats(object):
                 "retained_peer_reason_bytes",
                 "tracked_buffered_bytes",
                 "tracked_buffered_limit",
-                "ordinary_queued_bytes",
-                "advisory_queued_bytes",
-                "urgent_queued_bytes",
                 "pending_control_bytes",
-                "pending_advisory_bytes",
-                "prepared_advisory_bytes",
                 "pending_terminal_bytes",
                 "pending_terminal_count",
                 "pending_protocol_jobs",
@@ -479,7 +464,28 @@ class HiddenStats(object):
         ):
             object.__setattr__(self, name, _nonnegative_int(getattr(self, name), name))
         for name in ("at_soft_cap", "at_hard_cap"):
-            object.__setattr__(self, name, _require_bool(getattr(self, name), name))
+            value = _require_bool(getattr(self, name), name)
+            if name == "at_soft_cap":
+                value = value or (self.soft_cap != 0 and self.retained >= self.soft_cap)
+            else:
+                value = value or (self.hard_cap != 0 and self.retained >= self.hard_cap)
+            object.__setattr__(self, name, value)
+
+    @property
+    def soft_limit(self) -> int:
+        return self.soft_cap
+
+    @property
+    def hard_limit(self) -> int:
+        return self.hard_cap
+
+    @property
+    def at_soft_limit(self) -> bool:
+        return self.at_soft_cap
+
+    @property
+    def at_hard_limit(self) -> bool:
+        return self.at_hard_cap
 
 
 @dataclass(frozen=True)
@@ -493,6 +499,11 @@ class AcceptBacklogStats(object):
     bytes_limit: int = 0
     at_bytes_cap: bool = False
     refused: int = 0
+    bidi: int = 0
+    uni: int = 0
+    limit: int = 0
+    bidi_limit: int = 0
+    uni_limit: int = 0
 
     def __post_init__(self) -> None:
         for name in (
@@ -501,8 +512,19 @@ class AcceptBacklogStats(object):
                 "bytes",
                 "bytes_limit",
                 "refused",
+                "bidi",
+                "uni",
+                "limit",
+                "bidi_limit",
+                "uni_limit",
         ):
             object.__setattr__(self, name, _nonnegative_int(getattr(self, name), name))
+        if self.count == 0 and (self.bidi or self.uni):
+            object.__setattr__(self, "count", _saturating_add(self.bidi, self.uni))
+        if self.limit == 0 and self.count_limit:
+            object.__setattr__(self, "limit", self.count_limit)
+        elif self.count_limit == 0 and self.limit:
+            object.__setattr__(self, "count_limit", self.limit)
         object.__setattr__(
             self,
             "at_count_cap",
@@ -795,6 +817,10 @@ class SessionStats(object):
             else self.progress.pong_at,
         )
 
+    @property
+    def provisional(self) -> ProvisionalStats:
+        return self.provisionals
+
 
 @runtime_checkable
 class Session(Protocol):
@@ -866,6 +892,9 @@ class Session(Protocol):
 
     def wait(self, timeout: Optional[float] = None) -> None:
         """Wait for final session termination."""
+
+    def wait_timeout(self, timeout: Optional[float] = None) -> bool:
+        """Return whether final session termination happened before timeout."""
 
     @property
     def closed(self) -> bool:
@@ -989,6 +1018,9 @@ class AsyncSession(Protocol):
 
     async def wait(self, timeout: Optional[float] = None) -> None:
         """Wait for final session termination."""
+
+    async def wait_timeout(self, timeout: Optional[float] = None) -> bool:
+        """Return whether final session termination happened before timeout."""
 
     @property
     def closed(self) -> bool:
@@ -1118,6 +1150,10 @@ class ClosedSession(object):
         if timeout is not None:
             return None
         return None
+
+    @staticmethod
+    def wait_timeout(timeout: Optional[float] = None) -> bool:
+        return True
 
     @property
     def closed(self) -> bool:
@@ -1258,6 +1294,10 @@ class AsyncClosedSession(object):
         if timeout is not None:
             return None
         return None
+
+    @staticmethod
+    async def wait_timeout(timeout: Optional[float] = None) -> bool:
+        return True
 
     @property
     def closed(self) -> bool:

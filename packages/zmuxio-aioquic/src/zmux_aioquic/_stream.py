@@ -17,6 +17,7 @@ from zmux.errors import (
     PriorityUpdateUnavailable,
     ReadClosed,
     ReadTimeout,
+    SessionClosed,
     StreamNotReadable,
     StreamNotWritable,
     TerminationKind,
@@ -45,6 +46,7 @@ from ._validation import (
     _memoryview,
     _memoryviews,
     _nonnegative_int,
+    _normalize_stream_group,
     _normalize_open_options,
     _read_size,
     _remaining_deadline,
@@ -53,7 +55,14 @@ from ._validation import (
     _require_bool,
     _stream_id_value,
     _writable_memoryview,
+    _writable_memoryviews,
 )
+
+
+def _adapter_terminal_error(error: BaseException) -> bool:
+    if isinstance(error, (asyncio.CancelledError, ReadTimeout, WriteTimeout)):
+        return False
+    return isinstance(error, (ApplicationError, ReadClosed, SessionClosed, WriteClosed))
 
 
 class _StreamBase(object):
@@ -95,7 +104,9 @@ class _StreamBase(object):
             options = _normalize_open_options(options)
             self._options = options
             self._metadata = StreamMetadata(
-                options.initial_priority, options.initial_group, options.open_info
+                options.initial_priority,
+                _normalize_stream_group(options.initial_group),
+                options.open_info,
             )
             self._metadata_valid = True
         else:
@@ -133,6 +144,14 @@ class _StreamBase(object):
         return self._metadata.open_info
 
     @property
+    def open_info_len(self) -> int:
+        return len(self._metadata.open_info)
+
+    @property
+    def has_open_info(self) -> bool:
+        return bool(self._metadata.open_info)
+
+    @property
     def metadata(self) -> StreamMetadata:
         return StreamMetadata(
             self._metadata.priority, self._metadata.group, self._metadata.open_info
@@ -145,6 +164,10 @@ class _StreamBase(object):
     @property
     def remote_addr(self) -> Optional[object]:
         return self._session.remote_addr
+
+    @property
+    def peer_addr(self) -> Optional[object]:
+        return self._session.peer_addr
 
     def set_deadline(self, deadline: Optional[float]) -> None:
         self._deadline = _deadline_seconds(deadline, "deadline")
@@ -239,7 +262,7 @@ class _StreamBase(object):
             raise ReadTimeout()
         except Exception as exc:
             translated = translate_read_error(exc)
-            self._read_error = translated
+            self._store_read_error(translated)
             raise translated
         if data == b"":
             self._read_closed = True
@@ -264,6 +287,22 @@ class _StreamBase(object):
             view[:size] = data
         return size
 
+    async def read_vectored(
+            self, buffers: Iterable[object], *, timeout: Optional[float] = None
+    ) -> int:
+        views, total = _writable_memoryviews(buffers)
+        if not views:
+            return 0
+        data = await self.read(total, timeout=timeout)
+        offset = 0
+        for view in views:
+            if offset >= len(data):
+                break
+            take = min(len(view), len(data) - offset)
+            view[:take] = data[offset: offset + take]
+            offset += take
+        return len(data)
+
     async def read_exact(
             self, n: int, *, timeout: Optional[float] = None
     ) -> bytes:
@@ -285,7 +324,7 @@ class _StreamBase(object):
                 raise ReadTimeout()
             except Exception as exc:
                 translated = translate_read_error(exc)
-                self._read_error = translated
+                self._store_read_error(translated)
                 raise translated
             if not chunk:
                 self._read_closed = True
@@ -307,7 +346,13 @@ class _StreamBase(object):
         self._require_readable()
         code = _require_application_code(code)
         if self._opened_locally and self._bidirectional:
-            await self._ensure_open_prelude()
+            try:
+                await self._ensure_open_prelude()
+            except Exception as exc:
+                if _adapter_terminal_error(exc):
+                    async with self._lock:
+                        self._store_read_error(exc)
+                raise
         async with self._lock:
             if self._read_closed:
                 raise self._read_error or ReadClosed()
@@ -464,7 +509,7 @@ class _StreamBase(object):
             await _finish_writer(self._writer, timeout)
         except Exception as exc:
             translated = translate_write_error(exc)
-            self._write_error = translated
+            self._store_write_error(translated)
             raise translated
         self._maybe_finish_active()
 
@@ -506,7 +551,11 @@ class _StreamBase(object):
             if not self._opened_locally or self._prelude_sent:
                 raise PriorityUpdateUnavailable()
             priority = self._metadata.priority if update.priority is None else update.priority
-            group = self._metadata.group if update.group is None else update.group
+            group = (
+                self._metadata.group
+                if update.group is None
+                else _normalize_stream_group(update.group)
+            )
             self._metadata = StreamMetadata(priority, group, self._metadata.open_info)
             self._options = OpenOptions(priority, group, self._metadata.open_info)
         await self._ensure_open_prelude(timeout=self._remaining_write_timeout(start, None))
@@ -577,7 +626,7 @@ class _StreamBase(object):
                     raise WriteTimeout()
                 except Exception as exc:
                     translated = translate_write_error(exc)
-                    self._write_error = translated
+                    self._store_write_error(translated)
                     raise translated
             async with self._lock:
                 if self._prelude_offset >= len(prelude):
@@ -615,8 +664,22 @@ class _StreamBase(object):
             raise WriteTimeout()
         except Exception as exc:
             translated = translate_write_error(exc)
-            self._write_error = translated
+            self._store_write_error(translated)
             raise translated
+
+    def _store_read_error(self, error: BaseException) -> None:
+        self._read_error = error
+        if _adapter_terminal_error(error):
+            self._read_closed = True
+        if self._read_closed:
+            self._maybe_finish_active()
+
+    def _store_write_error(self, error: BaseException) -> None:
+        self._write_error = error
+        if _adapter_terminal_error(error):
+            self._write_closed = True
+        if self._write_closed:
+            self._maybe_finish_active()
 
     def _require_readable(self) -> None:
         if self._reader is None:

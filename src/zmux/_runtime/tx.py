@@ -117,17 +117,13 @@ class WriteRequestOrigin(IntEnum):
 
 class QueueLane(IntEnum):
     ORDINARY = 0
-    ADVISORY = 1
-    URGENT = 2
+    URGENT = 1
 
     def is_urgent(self) -> bool:
         return self is QueueLane.URGENT
 
-    def is_advisory(self) -> bool:
-        return self is QueueLane.ADVISORY
 
-
-_QUEUE_LANES = (QueueLane.URGENT, QueueLane.ADVISORY, QueueLane.ORDINARY)
+_QUEUE_LANES = (QueueLane.URGENT, QueueLane.ORDINARY)
 
 
 class WriteUrgencyProfile(IntEnum):
@@ -766,7 +762,6 @@ class DataCosts(object):
 class QueueCost(object):
     queued: int = 0
     urgent: int = 0
-    advisory: int = 0
     data: DataCosts = field(default_factory=DataCosts)
     pending_control: int = 0
     pending_priority: int = 0
@@ -774,11 +769,6 @@ class QueueCost(object):
     def __post_init__(self) -> None:
         object.__setattr__(self, "queued", _nonnegative_int(self.queued, "queued"))
         object.__setattr__(self, "urgent", _nonnegative_int(self.urgent, "urgent"))
-        object.__setattr__(
-            self,
-            "advisory",
-            _nonnegative_int(self.advisory, "advisory"),
-        )
         if not isinstance(self.data, DataCosts):
             raise TypeError("data must be a DataCosts")
         object.__setattr__(
@@ -874,13 +864,11 @@ class WriteQueueLimits(object):
 @dataclass(frozen=True)
 class WriterQueueStats(object):
     urgent_jobs: int = 0
-    advisory_jobs: int = 0
     ordinary_jobs: int = 0
     queued_bytes: int = 0
     max_bytes: int = 0
     urgent_queued_bytes: int = 0
     urgent_max_bytes: int = 0
-    advisory_queued_bytes: int = 0
     data_queued_bytes: int = 0
     session_data_high_watermark: int = 0
     per_stream_data_high_watermark: int = 0
@@ -893,13 +881,11 @@ class WriterQueueStats(object):
     def __post_init__(self) -> None:
         for name in (
                 "urgent_jobs",
-                "advisory_jobs",
                 "ordinary_jobs",
                 "queued_bytes",
                 "max_bytes",
                 "urgent_queued_bytes",
                 "urgent_max_bytes",
-                "advisory_queued_bytes",
                 "data_queued_bytes",
                 "session_data_high_watermark",
                 "per_stream_data_high_watermark",
@@ -1111,7 +1097,7 @@ class WriteJob(object):
             if _frame_is_priority_update(frame):
                 return CoalesceKey(CoalesceKind.PRIORITY_UPDATE, frame.stream_id)
             return None
-        if frame.frame_type is FrameType.MAX_DATA and _payload_is_exact_varint(frame.payload):
+        if frame.frame_type is FrameType.MAX_DATA:
             return CoalesceKey(CoalesceKind.MAX_DATA, frame.stream_id)
         if frame.frame_type is FrameType.BLOCKED and _payload_is_exact_varint(frame.payload):
             return CoalesceKey(CoalesceKind.BLOCKED, frame.stream_id)
@@ -1633,13 +1619,12 @@ def queue_cost_for(lane: QueueLane, job: WriteJob, queued: int) -> QueueCost:
         if lane is QueueLane.URGENT and job.is_urgent() and not job.bypasses_urgent_capacity()
         else 0
     )
-    advisory = queued if lane is QueueLane.ADVISORY else 0
     key = job.coalesce_key()
     if key is not None and key.kind is CoalesceKind.PRIORITY_UPDATE:
         pending_control = 0
         pending_priority = pending_priority_frame_bytes(job.frame)
     elif key is not None and key.kind in (CoalesceKind.MAX_DATA, CoalesceKind.BLOCKED):
-        pending_control = pending_control_frame_bytes(job.frame)
+        pending_control = queued
         pending_priority = 0
     elif key is not None and key.kind is CoalesceKind.GOAWAY:
         pending_control = 0
@@ -1650,7 +1635,6 @@ def queue_cost_for(lane: QueueLane, job: WriteJob, queued: int) -> QueueCost:
     return QueueCost(
         queued=queued,
         urgent=urgent,
-        advisory=advisory,
         data=data_costs(job),
         pending_control=pending_control,
         pending_priority=pending_priority,
@@ -1685,21 +1669,6 @@ def add_frame_data_cost(costs: DataCosts, frame: Frame) -> None:
     if frame.frame_type is not FrameType.DATA:
         return
     costs.add(frame.stream_id, retained_frame_queue_cost(frame))
-
-
-def pending_control_frame_bytes(frame: Optional[Frame]) -> int:
-    if frame is None or frame.frame_type not in (FrameType.MAX_DATA, FrameType.BLOCKED):
-        return 0
-    try:
-        value, consumed = parse_varint(frame.payload)
-    except Exception:
-        return retained_frame_queue_cost(frame)
-    if consumed != len(frame.payload):
-        return retained_frame_queue_cost(frame)
-    total = varint_len(value)
-    if frame.stream_id != 0:
-        total = _saturating_add(total, varint_len(frame.stream_id))
-    return total
 
 
 def pending_priority_frame_bytes(frame: Optional[Frame]) -> int:
@@ -1909,8 +1878,14 @@ def frame_bypasses_capacity(frame: Frame) -> bool:
     return frame_is_urgent(frame)
 
 
-def frame_bypasses_urgent_capacity(_frame: Frame) -> bool:
-    return False
+def frame_bypasses_urgent_capacity(frame: Frame) -> bool:
+    return frame.frame_type in (
+        FrameType.ABORT,
+        FrameType.RESET,
+        FrameType.STOP_SENDING,
+        FrameType.GOAWAY,
+        FrameType.CLOSE,
+    )
 
 
 def frames_are_all_urgent(frames: Iterable[Frame]) -> bool:

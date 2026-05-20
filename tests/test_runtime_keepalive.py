@@ -82,7 +82,7 @@ class RuntimeKeepaliveTest(unittest.TestCase):
         self.assertGreaterEqual(len(pong), len(ping))
 
         zero_limit = Settings(max_control_payload_bytes=0, ping_padding_key=key)
-        self.assertEqual(ping_payload_limit(zero_limit, zero_limit), 4096)
+        self.assertEqual(ping_payload_limit(zero_limit, zero_limit), 0)
         self.assertEqual(
             ping_payload_limit(
                 Settings(max_control_payload_bytes=0),
@@ -93,8 +93,8 @@ class RuntimeKeepaliveTest(unittest.TestCase):
         zero_echo, zero_padded = build_padded_ping_echo(
             holder, zero_limit, zero_limit, b"", 7
         )
-        self.assertTrue(zero_padded)
-        self.assertTrue(has_ping_padding_tag(build_ping_payload(zero_echo, 7), key))
+        self.assertFalse(zero_padded)
+        self.assertFalse(has_ping_padding_tag(build_ping_payload(zero_echo, 7), key))
 
     def test_jitter_padding_and_uint64_boundaries_are_strict(self) -> None:
         holder = Holder()
@@ -140,7 +140,7 @@ class RuntimeKeepaliveTest(unittest.TestCase):
 
     def test_keepalive_timeout_and_send_rate_follow_rust_edges(self) -> None:
         self.assertEqual(effective_keepalive_timeout(0.0), 0.0)
-        self.assertEqual(effective_keepalive_timeout(0.0, 10.0), 10.0)
+        self.assertEqual(effective_keepalive_timeout(0.0, 10.0), 0.0)
         self.assertEqual(effective_keepalive_timeout(0.5), DEFAULT_KEEPALIVE_TIMEOUT_MIN)
         self.assertEqual(effective_keepalive_timeout(float("inf")), DEFAULT_KEEPALIVE_TIMEOUT_MAX)
         self.assertEqual(

@@ -36,12 +36,14 @@ from zmux._runtime.session import (
     build_ping_payload,
     close_frame_send_timeout,
     close_session_state,
+    default_hidden_control_opened_limit,
     default_urgent_queue_max_bytes,
     effective_go_away_send_watermark,
     establishment_close_max_payload,
     go_away_drain_interval,
     graceful_close_drain_timeout,
     has_ping_padding_tag,
+    hidden_control_soft_limit,
     init_keepalive_jitter_state,
     max_peer_go_away_watermark,
     ping_padding_bounds,
@@ -185,6 +187,11 @@ class RuntimeSessionPolicyTests(unittest.TestCase):
         self.assertGreaterEqual(policy.pending_priority_bytes_budget, 64 * 1024)
         self.assertEqual(policy.accept_backlog_limit, 128)
         self.assertGreaterEqual(policy.accept_backlog_bytes_limit, 4 * 1024 * 1024)
+        self.assertEqual(
+            policy.hidden_control_opened_limit,
+            default_hidden_control_opened_limit(policy.accept_backlog_limit),
+        )
+        self.assertEqual(hidden_control_soft_limit(policy.hidden_control_opened_limit), 32)
 
     def test_policy_honors_explicit_overrides_and_memory_threshold(self):
         config, local, peer, negotiated = _prefaces()
@@ -198,6 +205,7 @@ class RuntimeSessionPolicyTests(unittest.TestCase):
             pending_priority_bytes_budget=555,
             accept_backlog_limit=9,
             accept_backlog_bytes_limit=10,
+            hidden_control_opened_limit=7,
             ping_padding=True,
             ping_padding_min_bytes=9,
             ping_padding_max_bytes=11,
@@ -211,12 +219,14 @@ class RuntimeSessionPolicyTests(unittest.TestCase):
         self.assertEqual(policy.pending_priority_bytes_budget, 555)
         self.assertEqual(policy.accept_backlog_limit, 9)
         self.assertEqual(policy.accept_backlog_bytes_limit, 10)
+        self.assertEqual(policy.hidden_control_opened_limit, 7)
+        self.assertEqual(hidden_control_soft_limit(policy.hidden_control_opened_limit), 3)
         self.assertTrue(policy.ping_padding)
         self.assertEqual(policy.ping_padding_min_bytes, 9)
         self.assertEqual(policy.ping_padding_max_bytes, 11)
         self.assertEqual(session_memory_high_threshold(100), 75)
 
-    def test_policy_zero_optional_limits_fall_back_to_java_defaults(self):
+    def test_policy_zero_configured_limits_match_runtime_zero_semantics(self):
         config, local, peer, negotiated = _prefaces()
         baseline = RuntimePolicy.from_config(config, local, peer, negotiated)
         zeroed = RuntimePolicy.from_config(
@@ -231,6 +241,10 @@ class RuntimeSessionPolicyTests(unittest.TestCase):
                 accept_backlog_bytes_limit=0,
                 tombstone_limit=0,
                 aggregate_late_data_cap=0,
+                late_data_per_stream_cap=0,
+                max_provisional_streams_bidi=0,
+                max_provisional_streams_uni=0,
+                marker_only_used_stream_limit=0,
             ),
             local,
             peer,
@@ -238,8 +252,6 @@ class RuntimeSessionPolicyTests(unittest.TestCase):
         )
 
         for attr in (
-                "per_stream_queued_data_hwm",
-                "session_queued_data_hwm",
                 "urgent_queued_bytes_cap",
                 "pending_control_bytes_budget",
                 "pending_priority_bytes_budget",
@@ -247,9 +259,23 @@ class RuntimeSessionPolicyTests(unittest.TestCase):
                 "accept_backlog_bytes_limit",
                 "tombstone_limit",
                 "aggregate_late_data_cap",
+                "late_data_per_stream_cap",
+                "max_provisional_streams_bidi",
+                "max_provisional_streams_uni",
+                "marker_only_used_stream_limit",
         ):
             with self.subTest(attr=attr):
-                self.assertEqual(getattr(zeroed, attr), getattr(baseline, attr))
+                self.assertEqual(getattr(zeroed, attr), 0)
+        self.assertEqual(zeroed.per_stream_queued_data_hwm, 1)
+        self.assertEqual(zeroed.session_queued_data_hwm, 1)
+        self.assertNotEqual(baseline.tombstone_limit, zeroed.tombstone_limit)
+        runtime = SessionRuntimeState.established(
+            local,
+            peer,
+            negotiated,
+            replace(config, late_data_per_stream_cap=0),
+        )
+        self.assertEqual(runtime.effective_late_data_per_stream_cap(65536), 0)
 
     def test_adaptive_session_timers_match_rust_edges(self):
         self.assertEqual(go_away_drain_interval(0.010, 0.0), 0.010)
@@ -542,7 +568,6 @@ class RuntimeSessionStateTests(unittest.TestCase):
         runtime.flow.recv_session_used = 100
         runtime.flow.recv_session_advertised = 150
         runtime.flow.queued_data_bytes = 11
-        runtime.flow.advisory_queued_bytes = 12
         runtime.flow.urgent_queued_bytes = 13
         runtime.flow.read_buffer_overhead = 14
         runtime.retention.retained_open_info_bytes = 20
@@ -559,6 +584,10 @@ class RuntimeSessionStateTests(unittest.TestCase):
         runtime.metrics.group_rebucket_events = 10
         runtime.metrics.hidden_abort_churn_events = 11
         runtime.metrics.last_open_latency = 0.25
+        runtime.metrics.note_writer_failure(close_frame_attempted=True)
+        runtime.metrics.note_writer_failure(close_frame_attempted=False)
+        runtime.add_inflight_data([(5, 10), (5, 7), (9, 3)])
+        runtime.remove_inflight_data({5: 8, 9: 3})
         runtime.ingress.dropped_priority_update = 12
         runtime.note_reset_reason(7)
         runtime.note_abort_reason(8)
@@ -575,15 +604,14 @@ class RuntimeSessionStateTests(unittest.TestCase):
         self.assertEqual(stats.pressure.outstanding_ping_bytes, 8)
         self.assertEqual(stats.pressure.retained_open_info_bytes, 20)
         self.assertEqual(stats.pressure.retained_peer_reason_bytes, 21)
-        self.assertEqual(stats.pressure.ordinary_queued_bytes, 11)
-        self.assertEqual(stats.pressure.advisory_queued_bytes, 12)
-        self.assertEqual(stats.pressure.urgent_queued_bytes, 13)
         self.assertEqual(stats.pressure.buffered_receive_storage_bytes, 14)
         self.assertEqual(stats.pressure.retained_buckets.hidden_control.count, 2)
         self.assertEqual(stats.pressure.retained_buckets.visible_tombstone.count, 3)
         self.assertEqual(stats.pressure.retained_buckets.marker_only.count, 4)
         self.assertEqual(stats.diagnostics.close_frame_admission_timeouts, 5)
         self.assertEqual(stats.diagnostics.close_frame_flush_timeouts, 6)
+        self.assertEqual(stats.diagnostics.close_frame_flush_errors, 1)
+        self.assertEqual(stats.diagnostics.skipped_close_on_dead_io, 1)
         self.assertEqual(stats.diagnostics.close_completion_timeouts, 7)
         self.assertEqual(stats.diagnostics.protocol_backlog_blocked, 8)
         self.assertEqual(stats.diagnostics.visible_terminal_churn_events, 9)
@@ -593,7 +621,7 @@ class RuntimeSessionStateTests(unittest.TestCase):
         self.assertGreater(stats.pressure.tracked_buffered_bytes, 0)
         self.assertEqual(stats.telemetry.last_open_latency, 0.25)
         self.assertGreater(stats.telemetry.send_rate_estimate_bytes_per_second, 0)
-        self.assertEqual(stats.writer_queue.queued_bytes, 36)
+        self.assertEqual(stats.writer_queue.queued_bytes, 24)
         self.assertEqual(
             stats.writer_queue.urgent_max_bytes,
             runtime.policy.urgent_queued_bytes_cap,
@@ -615,6 +643,8 @@ class RuntimeSessionStateTests(unittest.TestCase):
         self.assertEqual(stats.memory.tracked_bytes, stats.pressure.tracked_buffered_bytes)
         self.assertEqual(stats.memory.hard_cap, stats.pressure.tracked_buffered_limit)
         self.assertEqual(stats.abuse.dropped_priority_update, 12)
+        self.assertEqual(runtime.inflight_data_for_stream(5), 9)
+        self.assertEqual(runtime.inflight_data_by_stream.get(9), None)
         self.assertEqual(
             stats.abuse.inbound_control_frame_budget,
             runtime.policy.abuse.inbound_control_frame_budget,

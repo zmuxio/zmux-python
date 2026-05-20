@@ -39,6 +39,16 @@ class StreamHandle(Protocol):
         raise NotImplementedError
 
     @property
+    def open_info_len(self) -> int:
+        """Return the open metadata length."""
+        return len(self.open_info)
+
+    @property
+    def has_open_info(self) -> bool:
+        """Return whether open metadata is available."""
+        return self.open_info_len != 0
+
+    @property
     def metadata(self) -> StreamMetadata:
         """Return the current peer-visible metadata snapshot."""
         raise NotImplementedError
@@ -94,6 +104,11 @@ class RecvStream(StreamHandle, Protocol):
             self, buffer: WritableBuffer, *, timeout: Optional[float] = None
     ) -> int:
         """Read ordered inbound bytes into a writable bytes-like buffer."""
+
+    def read_vectored(
+            self, buffers: Iterable[WritableBuffer], *, timeout: Optional[float] = None
+    ) -> int:
+        """Read ordered inbound bytes into multiple writable buffers."""
 
     def read_exact(self, n: int, *, timeout: Optional[float] = None) -> bytes:
         """Read exactly ``n`` bytes or raise EOF/timeout from the implementation."""
@@ -189,6 +204,16 @@ class AsyncStreamHandle(Protocol):
         raise NotImplementedError
 
     @property
+    def open_info_len(self) -> int:
+        """Return the open metadata length."""
+        return len(self.open_info)
+
+    @property
+    def has_open_info(self) -> bool:
+        """Return whether open metadata is available."""
+        return self.open_info_len != 0
+
+    @property
     def metadata(self) -> StreamMetadata:
         """Return the current peer-visible metadata snapshot."""
         raise NotImplementedError
@@ -246,6 +271,11 @@ class AsyncRecvStream(AsyncStreamHandle, Protocol):
             self, buffer: WritableBuffer, *, timeout: Optional[float] = None
     ) -> int:
         """Read ordered inbound bytes into a writable bytes-like buffer."""
+
+    async def read_vectored(
+            self, buffers: Iterable[WritableBuffer], *, timeout: Optional[float] = None
+    ) -> int:
+        """Read ordered inbound bytes into multiple writable buffers."""
 
     async def read_exact(
             self, n: int, *, timeout: Optional[float] = None

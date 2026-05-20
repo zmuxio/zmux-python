@@ -25,7 +25,6 @@ from zmux._state.tombstone import (
     used_stream_marker_for,
     used_stream_marker_from_tombstone,
 )
-from zmux.config import DEFAULT_TOMBSTONE_LIMIT, DEFAULT_USED_MARKER_LIMIT
 
 
 def disposition(
@@ -266,7 +265,7 @@ class StreamTombstonePrimitiveTests(unittest.TestCase):
             TerminalBookkeepingState(marker_only_limit_exceeded=1)
         self.assertEqual(
             TerminalBookkeepingState(marker_only_used_stream_limit=0).marker_only_hard_cap(),
-            DEFAULT_USED_MARKER_LIMIT,
+            0,
         )
 
     def test_runtime_stream_reexports_state_tombstone_primitives(self):
@@ -329,7 +328,7 @@ class TerminalBookkeepingTests(unittest.TestCase):
         )
         self.assertEqual(state.marker_only_retained(), 1)
 
-    def test_tombstone_limit_zero_uses_go_default_retention_limit(self):
+    def test_tombstone_limit_zero_retains_only_used_marker(self):
         state = TerminalBookkeepingState(tombstone_limit=0)
 
         removed = state.record_tombstone(
@@ -340,16 +339,16 @@ class TerminalBookkeepingTests(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(removed, [])
-        self.assertTrue(state.tombstone_for(4).found())
-        self.assertEqual(state.effective_tombstone_limit(), DEFAULT_TOMBSTONE_LIMIT)
-        self.assertEqual(state.tombstone_order_ids(), [4])
+        self.assertEqual(removed, [4])
+        self.assertFalse(state.tombstone_for(4).found())
+        self.assertEqual(state.effective_tombstone_limit(), 0)
+        self.assertEqual(state.tombstone_order_ids(), [])
         self.assertEqual(state.hidden_tombstone_order_ids(), [])
         self.assertEqual(
             state.terminal_data_disposition_for(4).disposition,
             disposition(LateDataAction.ABORT_CLOSED, LateDataCause.RESET),
         )
-        self.assertEqual(state.marker_only_retained(), 0)
+        self.assertEqual(state.marker_only_retained(), 1)
 
     def test_terminal_late_data_counts_tombstone_budget_like_java(self):
         state = TerminalBookkeepingState()

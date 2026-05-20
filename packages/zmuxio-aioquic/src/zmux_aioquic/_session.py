@@ -43,6 +43,7 @@ from ._io import (
     _best_effort,
     _close_connection,
     _connection_closed,
+    _cancel_write,
     _consume_task_exception,
     _discard_accepted_stream,
     _discard_local_open_stream,
@@ -90,6 +91,16 @@ def target_implementation_profiles() -> Tuple[str, ...]:
 
 def target_suites() -> Tuple[str, ...]:
     return (SUITE_STREAM_ADAPTER_PROFILE,)
+
+
+def _open_error_cleanup_code(error: BaseException) -> int:
+    code = getattr(error, "numeric_code", None)
+    if code is None:
+        return int(ErrorCode.CANCELLED)
+    try:
+        return _require_application_code(code)
+    except (TypeError, ValueError):
+        return int(ErrorCode.CANCELLED)
 
 
 class AioquicSession(object):
@@ -219,8 +230,16 @@ class AioquicSession(object):
                 stream.close_with_error(ErrorCode.CANCELLED, "open payload cancelled")
             )
             raise
-        except Exception:
-            await _best_effort(stream.close_with_error(ErrorCode.INTERNAL, "open payload failed"))
+        except Exception as exc:
+            code = _open_error_cleanup_code(exc)
+            await _best_effort(
+                stream.close_with_error(
+                    code, "open_and_send failed"
+                )
+            )
+            await _best_effort(
+                _cancel_write(self._connection, stream._writer, stream.stream_id, code)
+            )
             raise
         return stream
 
@@ -241,8 +260,16 @@ class AioquicSession(object):
                 stream.close_with_error(ErrorCode.CANCELLED, "open payload cancelled")
             )
             raise
-        except Exception:
-            await _best_effort(stream.close_with_error(ErrorCode.INTERNAL, "open payload failed"))
+        except Exception as exc:
+            code = _open_error_cleanup_code(exc)
+            await _best_effort(
+                stream.close_with_error(
+                    code, "open_uni_and_send failed"
+                )
+            )
+            await _best_effort(
+                _cancel_write(self._connection, stream._writer, stream.stream_id, code)
+            )
             raise
         return stream
 
@@ -276,7 +303,10 @@ class AioquicSession(object):
                         operation=ErrorOperation.ACCEPT, source=ErrorSource.LOCAL
                     )
                 queue = self._bidi_queue if bidirectional else self._uni_queue
-                await queue.put(stream)
+                if not await self._put_accept_item(queue, stream):
+                    raise SessionClosed(
+                        operation=ErrorOperation.ACCEPT, source=ErrorSource.LOCAL
+                    )
                 self._note_accepted(bidirectional)
             except asyncio.CancelledError:
                 await _discard_accepted_stream(reader, writer, ErrorCode.CANCELLED)
@@ -364,6 +394,13 @@ class AioquicSession(object):
             self._cancel_background_tasks()
             await self._drain_background_tasks()
 
+    async def wait_timeout(self, timeout: Optional[float] = None) -> bool:
+        try:
+            await self.wait(timeout)
+        except SessionWaitTimeout:
+            return False
+        return True
+
     @property
     def closed(self) -> bool:
         return self._state.terminal() or _connection_closed(self._connection)
@@ -379,6 +416,10 @@ class AioquicSession(object):
         return self._options.remote_addr or _addr(
             self._connection, ("remote_addr", "remote_address", "peer_addr")
         )
+
+    @property
+    def peer_addr(self) -> Optional[object]:
+        return self.remote_addr
 
     @property
     def close_error(self) -> Optional[BaseException]:
@@ -613,7 +654,9 @@ class AioquicSession(object):
             if self._closed_event.is_set():
                 await _discard_accepted_stream(reader, writer)
                 return
-            await queue.put(stream)
+            if not await self._put_accept_item(queue, stream):
+                await _discard_accepted_stream(reader, writer)
+                return
             self._note_accepted(bidirectional)
         except asyncio.CancelledError:
             await _discard_accepted_stream(reader, writer)
@@ -640,9 +683,26 @@ class AioquicSession(object):
     async def _publish_accept_error(
             self, queue: "asyncio.Queue[object]", error: BaseException
     ) -> None:
+        await self._put_accept_item(queue, error)
+
+    async def _put_accept_item(
+            self, queue: "asyncio.Queue[object]", item: object
+    ) -> bool:
         if self._closed_event.is_set():
-            return
-        await queue.put(error)
+            return False
+        put_task = asyncio.create_task(queue.put(item))
+        close_task = asyncio.create_task(self._closed_event.wait())
+        tasks = {put_task, close_task}
+        try:
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            if put_task in done:
+                return True
+            return False
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def _track_accept_task(self, task: "asyncio.Task[None]") -> None:
         self._accept_tasks.add(task)

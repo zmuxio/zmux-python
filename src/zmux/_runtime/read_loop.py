@@ -127,6 +127,11 @@ MAX_REUSABLE_PENDING_READ_LOOP_PROTOCOL_JOBS_CAP = 1024
 _DEFAULT_SETTINGS = default_settings()
 
 
+def _default_if_zero(value: int, default: int) -> int:
+    value = _nonnegative_int(value, "value")
+    return default if value == 0 else value
+
+
 class ProtocolAction(Protocol):
     def __call__(self) -> object:
         ...
@@ -292,8 +297,6 @@ class WindowedCounter(object):
         window = _nonnegative_duration(window, "window")
         budget = _nonnegative_int(budget, "budget")
         reset_on_equal = _require_bool(reset_on_equal, "reset_on_equal")
-        if budget == 0:
-            return
         now = _monotonic_now(now)
         if self.window_start is None:
             self.window_start = now
@@ -348,8 +351,8 @@ class TrafficBudgetCounter(object):
             self.bytes = 0
         self.frames = saturating_add(self.frames, 1)
         self.bytes = saturating_add(self.bytes, _nonnegative_int(payload_len, "payload_len"))
-        frames_ok = frame_budget == 0 or self.frames <= frame_budget
-        bytes_ok = byte_budget == 0 or self.bytes <= byte_budget
+        frames_ok = self.frames <= frame_budget
+        bytes_ok = self.bytes <= byte_budget
         if not frames_ok or not bytes_ok:
             raise _remote_protocol_error(message)
 
@@ -427,7 +430,11 @@ class ReadLoopAbuseConfig(object):
             )
 
         settings = config.settings
-        abuse_window = config.abuse_window or DEFAULT_ABUSE_WINDOW
+        abuse_window = (
+            config.abuse_window
+            if config.abuse_window is not None
+            else DEFAULT_ABUSE_WINDOW
+        )
         control_frame_budget = _default_if_zero(
             config.inbound_control_frame_budget,
             DEFAULT_INBOUND_CONTROL_FRAME_BUDGET,
@@ -438,23 +445,31 @@ class ReadLoopAbuseConfig(object):
         )
         control_bytes_budget = (
             config.inbound_control_bytes_budget
-            if config.inbound_control_bytes_budget
+            if config.inbound_control_bytes_budget not in (None, 0)
             else _default_control_byte_budget(settings)
         )
         ext_bytes_budget = (
             config.inbound_ext_bytes_budget
-            if config.inbound_ext_bytes_budget
+            if config.inbound_ext_bytes_budget not in (None, 0)
             else _default_ext_byte_budget(settings)
         )
         mixed_frame_budget = (
             config.inbound_mixed_frame_budget
-            if config.inbound_mixed_frame_budget
+            if config.inbound_mixed_frame_budget not in (None, 0)
             else max(control_frame_budget, ext_frame_budget)
         )
         mixed_bytes_budget = (
             config.inbound_mixed_bytes_budget
-            if config.inbound_mixed_bytes_budget
+            if config.inbound_mixed_bytes_budget not in (None, 0)
             else max(control_bytes_budget, ext_bytes_budget)
+        )
+        ignored_control_budget = (
+            config.no_op_control_flood_threshold
+            if config.no_op_control_flood_threshold != 0
+            else _default_if_zero(
+                config.ignored_control_budget,
+                DEFAULT_IGNORED_CONTROL_BUDGET,
+            )
         )
         return cls(
             abuse_window=abuse_window,
@@ -464,10 +479,7 @@ class ReadLoopAbuseConfig(object):
             inbound_ext_bytes_budget=ext_bytes_budget,
             inbound_mixed_frame_budget=mixed_frame_budget,
             inbound_mixed_bytes_budget=mixed_bytes_budget,
-            ignored_control_budget=_default_if_zero(
-                config.ignored_control_budget,
-                DEFAULT_IGNORED_CONTROL_BUDGET,
-            ),
+            ignored_control_budget=ignored_control_budget,
             no_op_zero_data_budget=_default_if_zero(
                 config.no_op_zero_data_budget,
                 DEFAULT_NO_OP_ZERO_DATA_BUDGET,
@@ -493,15 +505,18 @@ class ReadLoopAbuseConfig(object):
                 DEFAULT_GROUP_REBUCKET_CHURN_BUDGET,
             ),
             hidden_abort_churn_window=(
-                    config.hidden_abort_churn_window or DEFAULT_HIDDEN_ABORT_CHURN_WINDOW
+                config.hidden_abort_churn_window
+                if config.hidden_abort_churn_window is not None
+                else DEFAULT_HIDDEN_ABORT_CHURN_WINDOW
             ),
             hidden_abort_churn_budget=_default_if_zero(
                 config.hidden_abort_churn_threshold,
                 DEFAULT_HIDDEN_ABORT_CHURN_BUDGET,
             ),
             visible_terminal_churn_window=(
-                    config.visible_terminal_churn_window
-                    or DEFAULT_VISIBLE_TERMINAL_CHURN_WINDOW
+                config.visible_terminal_churn_window
+                if config.visible_terminal_churn_window is not None
+                else DEFAULT_VISIBLE_TERMINAL_CHURN_WINDOW
             ),
             visible_terminal_churn_budget=_default_if_zero(
                 config.visible_terminal_churn_threshold,
@@ -586,7 +601,7 @@ class InboundBudgetTracker(object):
         self.ignored_control.record(
             window=self.config.abuse_window,
             budget=self.config.ignored_control_budget,
-            message="repeated mixed no-op control flood exceeded local threshold",
+            message="ignored control budget exceeded",
             now=now,
         )
 
@@ -604,7 +619,7 @@ class InboundBudgetTracker(object):
         self.no_op_max_data.record(
             window=self.config.abuse_window,
             budget=self.config.no_op_max_data_budget,
-            message="repeated no-op MAX_DATA flood exceeded local threshold",
+            message="no-op MAX_DATA budget exceeded",
             now=now,
         )
 
@@ -616,7 +631,7 @@ class InboundBudgetTracker(object):
         self.no_op_blocked.record(
             window=self.config.abuse_window,
             budget=self.config.no_op_blocked_budget,
-            message="repeated no-op BLOCKED flood exceeded local threshold",
+            message="no-op BLOCKED budget exceeded",
             now=now,
         )
 
@@ -628,7 +643,7 @@ class InboundBudgetTracker(object):
         self.no_op_priority_update.record(
             window=self.config.abuse_window,
             budget=self.config.no_op_priority_update_budget,
-            message="repeated no-op PRIORITY_UPDATE flood exceeded local threshold",
+            message="no-op PRIORITY_UPDATE budget exceeded",
             now=now,
         )
 
@@ -639,7 +654,7 @@ class InboundBudgetTracker(object):
         self.no_op_zero_data.record(
             window=self.config.abuse_window,
             budget=self.config.no_op_zero_data_budget,
-            message="repeated no-op zero-length DATA flood exceeded local threshold",
+            message="zero-length DATA budget exceeded",
             now=now,
         )
 
@@ -657,14 +672,14 @@ class InboundBudgetTracker(object):
         data_control_flags = flags & (FRAME_FLAG_FIN | FRAME_FLAG_OPEN_METADATA)
         if stream_existed and app_len == 0 and data_control_flags == 0:
             self.record_no_op_zero_data(now)
-        elif app_len > 0 or data_control_flags:
+        else:
             self.no_op_zero_data.clear()
 
     def record_inbound_ping(self, now: Optional[float] = None) -> None:
         self.inbound_ping.record(
             window=self.config.abuse_window,
             budget=self.config.inbound_ping_budget,
-            message="high-rate inbound PING flood exceeded local threshold",
+            message="inbound PING budget exceeded",
             now=now,
         )
 
@@ -690,7 +705,6 @@ class InboundBudgetTracker(object):
             budget=self.config.visible_terminal_churn_budget,
             message="rapid open-then-reset/abort churn exceeded local threshold",
             now=now,
-            reset_on_equal=True,
         )
 
     def record_dropped_priority_update(self) -> None:
@@ -1314,10 +1328,6 @@ def _default_ext_byte_budget(settings: Settings) -> int:
             or _DEFAULT_SETTINGS.max_extension_payload_bytes
     )
     return max(MIN_INBOUND_EXT_BYTE_BUDGET, saturating_mul(max_payload, 64))
-
-
-def _default_if_zero(value: int, default: int) -> int:
-    return default if value == 0 else value
 
 
 def _require_ping_payload(payload: bytes, label: str) -> None:

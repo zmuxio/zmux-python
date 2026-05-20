@@ -604,7 +604,7 @@ class TerminalBookkeepingState(object):
         return self.marker_only_map_count() + self.marker_only_range_count()
 
     def marker_only_hard_cap(self) -> int:
-        if not self.marker_only_used_stream_limit:
+        if self.marker_only_used_stream_limit is None:
             return DEFAULT_MARKER_ONLY_USED_STREAM_LIMIT
         return self.marker_only_used_stream_limit
 
@@ -666,7 +666,7 @@ class TerminalBookkeepingState(object):
         return removed
 
     def effective_tombstone_limit(self) -> int:
-        return self.tombstone_limit or MAX_TOMBSTONES
+        return self.tombstone_limit
 
     def reap_tombstones_for_memory_pressure(
             self,

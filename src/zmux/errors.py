@@ -25,7 +25,7 @@ OPEN_TIMEOUT_MESSAGE = "zmux: open timed out"
 READ_TIMEOUT_MESSAGE = "zmux: read timed out"
 WRITE_TIMEOUT_MESSAGE = "zmux: write timed out"
 PING_TIMEOUT_MESSAGE = "zmux: ping timed out"
-SESSION_WAIT_TIMEOUT_MESSAGE = "zmux: session wait timed out"
+SESSION_WAIT_TIMEOUT_MESSAGE = "zmux: session termination wait timed out"
 JOINED_HALF_PAUSE_TIMEOUT_MESSAGE = "zmux: joined half pause timed out"
 GRACEFUL_CLOSE_TIMEOUT_MESSAGE = "zmux: graceful close drain timed out"
 NIL_CONN_MESSAGE = "zmux: nil conn"
@@ -69,6 +69,7 @@ class ErrorOperation(str, Enum):
     OPEN = "open"
     ACCEPT = "accept"
     PING = "ping"
+    WAIT = "wait"
     READ = "read"
     WRITE = "write"
     CLOSE = "close"
@@ -493,7 +494,7 @@ class SessionWaitTimeout(ZmuxTimeoutError):
             self, message: str = SESSION_WAIT_TIMEOUT_MESSAGE, **kwargs: object
     ) -> None:
         kwargs.setdefault("scope", ErrorScope.SESSION)
-        kwargs.setdefault("operation", ErrorOperation.CLOSE)
+        kwargs.setdefault("operation", ErrorOperation.WAIT)
         kwargs.setdefault("direction", ErrorDirection.BOTH)
         super().__init__(message, **kwargs)
 

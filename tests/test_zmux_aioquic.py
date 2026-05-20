@@ -87,10 +87,24 @@ class BoolProgressWriter(MemoryWriter):
         return True
 
 
+class FailingPayloadWriter(MemoryWriter):
+    def write(self, data):
+        if not self.chunks:
+            return super().write(data)
+        raise zmux.ApplicationError(77, "payload failed")
+
+
 class ShortExactReader(MemoryReader):
     async def readexactly(self, n):
         del n
         return b""
+
+
+class FailingAfterPreludeReader(MemoryReader):
+    async def read(self, n=-1):
+        if self.data:
+            return await super().read(n)
+        raise ConnectionError("connection lost")
 
 
 class FakeConnection(object):
@@ -181,6 +195,16 @@ class BoolProgressConnection(FakeConnection):
         self.next_stream_id += 4
         reader = None if is_unidirectional else MemoryReader()
         writer = BoolProgressWriter(stream_id)
+        self.opened.append((reader, writer, is_unidirectional))
+        return reader, writer
+
+
+class FailingPayloadConnection(FakeConnection):
+    async def create_stream(self, is_unidirectional=False):
+        stream_id = self.next_stream_id
+        self.next_stream_id += 4
+        reader = None if is_unidirectional else MemoryReader()
+        writer = FailingPayloadWriter(stream_id)
         self.opened.append((reader, writer, is_unidirectional))
         return reader, writer
 
@@ -276,6 +300,16 @@ class AioquicPreludeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metadata.open_info, b"meta")
         self.assertEqual(await reader.read(), b"app")
 
+    async def test_zero_stream_group_is_not_exposed_as_explicit_group(self):
+        options = zmux.OpenOptions(initial_group=0)
+        prelude = zmux_aioquic.build_stream_prelude(options)
+
+        metadata = await zmux_aioquic.read_stream_prelude(MemoryReader(prelude))
+        stream = await zmux_aioquic.wrap_session(FakeConnection()).open_stream(options)
+
+        self.assertIsNone(metadata.metadata.group)
+        self.assertIsNone(stream.metadata.group)
+
     async def test_over_limit_prelude_is_rejected_before_payload_allocation(self):
         reader = MemoryReader(zmux.encode_varint(zmux_aioquic.STREAM_PRELUDE_MAX_PAYLOAD))
 
@@ -299,7 +333,20 @@ class AioquicSessionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.negotiated().peer_role, zmux.Role.RESPONDER)
         self.assertFalse(hasattr(zmux_aioquic, "wrap_session_with_options"))
         self.assertFalse(hasattr(zmux_aioquic.SessionOptions, "defaults"))
-        self.assertNotIn("peer_addr", zmux_aioquic.SessionOptions.__dataclass_fields__)
+        self.assertIn("peer_addr", zmux_aioquic.SessionOptions.__dataclass_fields__)
+
+    async def test_adapter_addresses_accept_peer_alias(self):
+        options = zmux_aioquic.SessionOptions(local_addr="local", peer_addr="peer")
+        session = zmux_aioquic.wrap_session(FakeConnection(), options)
+
+        stream = await session.open_stream()
+
+        self.assertEqual(session.local_addr, "local")
+        self.assertEqual(session.remote_addr, "peer")
+        self.assertEqual(session.peer_addr, "peer")
+        self.assertEqual(stream.local_addr, "local")
+        self.assertEqual(stream.remote_addr, "peer")
+        self.assertEqual(stream.peer_addr, "peer")
 
     async def test_open_stream_writes_prelude_before_payload(self):
         conn = FakeConnection()
@@ -313,6 +360,8 @@ class AioquicSessionTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsInstance(stream, zmux.AsyncStream)
         self.assertIsInstance(session.stats, zmux.SessionStats)
         self.assertIsInstance(stream.metadata, zmux.StreamMetadata)
+        self.assertEqual(stream.open_info_len, 5)
+        self.assertTrue(stream.has_open_info)
         self.assertEqual(writer.bytes(), expected)
 
         written = await stream.write(b"payload")
@@ -348,9 +397,11 @@ class AioquicSessionTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(accepted, zmux.AsyncStream)
         self.assertEqual(await accepted.read(2, timeout=1.0), b"he")
-        buffer = bytearray(2)
-        self.assertEqual(await accepted.readinto(buffer, timeout=1.0), 2)
-        self.assertEqual(buffer, bytearray(b"ll"))
+        first = bytearray(1)
+        second = bytearray(1)
+        self.assertEqual(await accepted.read_vectored((first, second), timeout=1.0), 2)
+        self.assertEqual(first, bytearray(b"l"))
+        self.assertEqual(second, bytearray(b"l"))
         self.assertEqual(await accepted.read_exact(1, timeout=1.0), b"o")
 
     async def test_open_and_send_is_the_single_session_convenience_name(self):
@@ -471,6 +522,7 @@ class AioquicSessionTest(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(zmux.SessionWaitTimeout):
             await session.wait(0.001)
+        self.assertFalse(await session.wait_timeout(0.001))
 
     async def test_session_wait_marks_adapter_closed_after_backend_wait_returns(self):
         conn = WaitOnlyConnection()
@@ -481,6 +533,9 @@ class AioquicSessionTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(conn.waited)
         self.assertTrue(session.closed)
         self.assertEqual(session.state, zmux.SessionState.CLOSED)
+
+        session = zmux_aioquic.wrap_session(WaitOnlyConnection())
+        self.assertTrue(await session.wait_timeout(0.1))
 
     async def test_session_wait_treats_empty_application_close_as_normal(self):
         session = zmux_aioquic.wrap_session(NormalWaitCloseConnection())
@@ -502,12 +557,36 @@ class AioquicSessionTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(writer.reset_codes, [int(zmux.ErrorCode.INTERNAL)])
         self.assertEqual(session.stats.active_streams.total, 0)
 
+    async def test_open_and_send_cleanup_uses_write_error_code(self):
+        conn = FailingPayloadConnection()
+        session = zmux_aioquic.wrap_session(conn)
+
+        with self.assertRaises(zmux.ApplicationError):
+            await session.open_and_send(b"payload", timeout=1.0)
+
+        writer = conn.opened[0][1]
+        self.assertEqual(conn.stop_calls, [(writer.stream_id, 77)])
+        self.assertEqual(writer.reset_codes, [77])
+
     async def test_writer_bool_progress_is_rejected(self):
         session = zmux_aioquic.wrap_session(BoolProgressConnection())
         stream = await session.open_stream(zmux.OpenOptions())
 
         with self.assertRaises(zmux.SessionClosed):
             await stream.write(b"x")
+        self.assertTrue(stream.write_closed)
+        with self.assertRaises(zmux.SessionClosed):
+            await stream.write(b"again")
+
+    async def test_terminal_write_error_releases_send_only_stream(self):
+        session = zmux_aioquic.wrap_session(BoolProgressConnection())
+        stream = await session.open_uni_stream()
+
+        with self.assertRaises(zmux.SessionClosed):
+            await stream.write(b"x")
+
+        self.assertTrue(stream.write_closed)
+        self.assertEqual(session.stats.active_streams.total, 0)
 
     async def test_zero_write_is_noop_but_close_read_submits_prelude_first(self):
         conn = FakeConnection()
@@ -696,6 +775,19 @@ class AioquicSessionTest(unittest.IsolatedAsyncioTestCase):
             await stream.read(1)
         self.assertIs(again.exception, caught.exception)
 
+    async def test_terminal_read_error_releases_recv_only_stream(self):
+        conn = FakeConnection()
+        session = zmux_aioquic.wrap_session(conn)
+        prelude = zmux_aioquic.build_stream_prelude()
+        await session.add_incoming_stream(FailingAfterPreludeReader(prelude), None, 12, False)
+        stream = await session.accept_uni_stream(0.1)
+
+        with self.assertRaises(zmux.SessionClosed):
+            await stream.read(1)
+
+        self.assertTrue(stream.read_closed)
+        self.assertEqual(session.stats.active_streams.total, 0)
+
     async def test_read_eof_records_remote_graceful_close_for_future_reads(self):
         conn = FakeConnection()
         session = zmux_aioquic.wrap_session(conn)
@@ -779,6 +871,28 @@ class AioquicSessionTest(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(zmux.SessionClosed):
             await asyncio.wait_for(task, 0.1)
+
+    async def test_add_incoming_stream_wakes_when_accept_queue_full_and_session_closes(self):
+        session = zmux_aioquic.wrap_session(FakeConnection())
+        prelude = zmux_aioquic.build_stream_prelude()
+        for stream_id in range(zmux_aioquic.ACCEPTED_PRELUDE_RESULT_QUEUE_CAP):
+            await session.add_incoming_stream(
+                MemoryReader(prelude),
+                MemoryWriter(stream_id + 40),
+                stream_id + 40,
+            )
+        writer = MemoryWriter(999)
+        task = asyncio.create_task(
+            session.add_incoming_stream(MemoryReader(prelude), writer, 999)
+        )
+        await asyncio.sleep(0.01)
+        self.assertFalse(task.done())
+
+        await session.close()
+
+        with self.assertRaises(zmux.SessionClosed):
+            await asyncio.wait_for(task, 0.1)
+        self.assertEqual(writer.reset_codes, [int(zmux.ErrorCode.CANCELLED)])
 
     async def test_queue_incoming_stream_task_exposes_but_consumes_prepare_error(self):
         conn = FakeConnection()

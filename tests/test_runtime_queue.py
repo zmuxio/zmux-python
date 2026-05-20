@@ -286,7 +286,7 @@ class WriteQueuePolicyTests(unittest.TestCase):
         self.assertEqual(q.data_queued_bytes_for_stream(1), retained_frame_queue_cost(second))
         self.assertEqual(q.stats().data_queued_bytes, retained_frame_queue_cost(second))
 
-    def test_urgent_batch_is_separate_and_nonurgent_queue_is_fifo(self):
+    def test_urgent_and_nonurgent_share_one_batch_in_lane_order(self):
         q = WriteQueue(queue_limits(max_batch_frames=8))
         q.try_push(WriteJob.frame_job(data(1, b"d")))
         q.try_push(WriteJob.frame_job(priority_update(5, priority=2)))
@@ -294,16 +294,11 @@ class WriteQueuePolicyTests(unittest.TestCase):
         q.try_push(WriteJob.frame_job(frame(FrameType.GOAWAY, 0, encode_varint(1) * 3)))
         q.try_push(WriteJob.frame_job(frame(FrameType.PING, 0, b"12345678")))
 
-        urgent_batch = q.pop_batch()
-        nonurgent_batch = q.pop_batch()
+        batch = q.pop_batch()
 
         self.assertEqual(
-            [job.all_frames()[0].frame_type for job in urgent_batch],
-            [FrameType.CLOSE, FrameType.GOAWAY, FrameType.PING],
-        )
-        self.assertEqual(
-            [job.all_frames()[0].frame_type for job in nonurgent_batch],
-            [FrameType.DATA, FrameType.EXT],
+            [job.all_frames()[0].frame_type for job in batch],
+            [FrameType.CLOSE, FrameType.GOAWAY, FrameType.PING, FrameType.DATA, FrameType.EXT],
         )
 
         into = deque()
@@ -321,7 +316,6 @@ class WriteQueuePolicyTests(unittest.TestCase):
         q.try_push(WriteJob.frame_job(priority_update(1, priority=4)))
 
         stats = q.stats()
-        self.assertEqual(stats.advisory_jobs, 0)
         self.assertEqual(stats.ordinary_jobs, 2)
         self.assertEqual(
             [job.all_frames()[0].frame_type for job in q.pop_batch()],
@@ -341,20 +335,22 @@ class WriteQueuePolicyTests(unittest.TestCase):
         self.assertEqual(first[0].all_frames()[0].frame_type, FrameType.DATA)
         self.assertEqual(second[0].all_frames()[0].stream_id, 5)
         self.assertEqual(third[0].all_frames()[0].stream_id, 9)
-        self.assertEqual(q.stats().advisory_jobs, 0)
+        self.assertEqual(q.stats().ordinary_jobs, 0)
 
     def test_coalesces_max_data_and_priority_update_with_delta_budget(self):
         q = WriteQueue(queue_limits(pending_priority_max_bytes=16))
         q.try_push(WriteJob.frame_job(frame(FrameType.MAX_DATA, 0, encode_varint(1))))
         q.try_push(WriteJob.frame_job(frame(FrameType.MAX_DATA, 0, encode_varint(9))))
-        self.assertEqual(q.stats().pending_control_bytes, len(encode_varint(9)))
+        self.assertEqual(
+            q.stats().pending_control_bytes,
+            retained_frame_queue_cost(frame(FrameType.MAX_DATA, 0, encode_varint(9))),
+        )
 
         q.try_push(WriteJob.frame_job(priority_update(4, priority=1)))
         q.try_push(WriteJob.frame_job(priority_update(4, group=9)))
-        urgent_batch = q.pop_batch()
-        ordinary_batch = q.pop_batch()
-        max_data = urgent_batch[0].all_frames()[0]
-        update = ordinary_batch[0].all_frames()[0]
+        batch = q.pop_batch()
+        max_data = batch[0].all_frames()[0]
+        update = batch[1].all_frames()[0]
         parsed, valid = parse_priority_update_payload(update.payload)
 
         self.assertEqual(max_data.payload, encode_varint(9))
@@ -370,7 +366,7 @@ class WriteQueuePolicyTests(unittest.TestCase):
         )
         self.assertEqual(
             stream_control.stats().pending_control_bytes,
-            len(encode_varint(0x4000)) + len(encode_varint(1)),
+            retained_frame_queue_cost(frame(FrameType.BLOCKED, 0x4000, encode_varint(1))),
         )
 
         payload = priority_update(12, priority=1).payload
@@ -391,7 +387,7 @@ class WriteQueuePolicyTests(unittest.TestCase):
         invalid.try_push(WriteJob.frame_job(frame(FrameType.MAX_DATA, 0, b"\x00y")))
         self.assertEqual(
             [job.all_frames()[0].payload for job in invalid.pop_batch()],
-            [b"\x00x", b"\x00y"],
+            [b"\x00y"],
         )
 
     def test_capacity_errors_are_structured_and_distinct(self):
@@ -408,10 +404,11 @@ class WriteQueuePolicyTests(unittest.TestCase):
         terminal_urgent = WriteQueue(
             queue_limits(urgent_max_bytes=1, pending_control_max_bytes=1024)
         )
-        with self.assertRaisesRegex(Exception, URGENT_WRITER_QUEUE_FULL_MESSAGE):
-            terminal_urgent.try_push(
-                WriteJob.frame_job(frame(FrameType.RESET, 1, encode_varint(1)))
-            )
+        terminal_urgent.try_push(
+            WriteJob.frame_job(frame(FrameType.RESET, 1, encode_varint(1)))
+        )
+        self.assertEqual(terminal_urgent.stats().urgent_queued_bytes, 0)
+        self.assertGreater(terminal_urgent.stats().pending_control_bytes, 0)
         terminal_pending = WriteQueue(
             queue_limits(urgent_max_bytes=1024, pending_control_max_bytes=1)
         )

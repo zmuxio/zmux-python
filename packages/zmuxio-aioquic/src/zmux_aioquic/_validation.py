@@ -42,6 +42,23 @@ def _writable_memoryview(buffer: object) -> memoryview:
     return view
 
 
+def _writable_memoryviews(parts: Iterable[object]) -> Tuple[Tuple[memoryview, ...], int]:
+    if parts is None:
+        raise TypeError("buffers must be an iterable of writable bytes-like objects")
+    views = []
+    total = 0
+    for part in parts:
+        view = _writable_memoryview(part)
+        size = len(view)
+        if size == 0:
+            continue
+        if size > sys.maxsize - total:
+            raise OverflowError("vectored read buffers are too large")
+        views.append(view)
+        total += size
+    return tuple(views), total
+
+
 def _memoryviews(parts: Iterable[object]) -> Tuple[Tuple[memoryview, ...], int]:
     if parts is None:
         raise TypeError("parts must be an iterable of bytes-like objects")
@@ -85,6 +102,15 @@ def _stream_id_value(stream_id: Optional[int]) -> int:
     if value > MAX_VARINT62:
         raise AdapterUnsupported("zmux: QUIC stream id is out of range")
     return value
+
+
+def _normalize_stream_group(group: Optional[int]) -> Optional[int]:
+    if group is None:
+        return None
+    value = _nonnegative_int(group, "stream group")
+    if value > MAX_VARINT62:
+        raise AdapterUnsupported("zmux: stream group is out of range")
+    return None if value == 0 else value
 
 
 def _read_size(max_bytes: Optional[int]) -> int:

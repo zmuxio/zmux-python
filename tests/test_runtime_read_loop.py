@@ -193,7 +193,7 @@ class RuntimeReadLoopBudgetTests(unittest.TestCase):
             tracker.record_frame(Frame(FrameType.PONG, 0, 0, b"12345678"), now=1.2)
         tracker.record_frame(Frame(FrameType.PONG, 0, 0, b"12345678"), now=2.3)
 
-    def test_no_op_zero_data_clears_on_useful_data_but_ping_budget_does_not(self):
+    def test_no_op_zero_data_clears_independently_from_ping_budget(self):
         tracker = InboundBudgetTracker(
             ReadLoopAbuseConfig(
                 abuse_window=1.0,
@@ -217,6 +217,13 @@ class RuntimeReadLoopBudgetTests(unittest.TestCase):
         )
         with self.assertRaises(ProtocolError):
             tracker.record_inbound_ping(now=1.4)
+
+        tracker.update_no_op_zero_data(
+            stream_existed=False, app_len=0, flags=0, now=1.5
+        )
+        tracker.update_no_op_zero_data(
+            stream_existed=True, app_len=0, flags=0, now=1.6
+        )
 
     def test_late_data_tracker_uses_strict_greater_than_caps(self):
         tracker = LateDataTracker(aggregate_cap=4, per_stream_cap=3)
@@ -394,7 +401,7 @@ class RuntimeReadLoopFrameClassificationTests(unittest.TestCase):
         self.assertEqual(abuse.inbound_ext_bytes_budget, 256 * 1024)
         self.assertEqual(abuse.inbound_mixed_bytes_budget, 8192 * 64)
 
-    def test_abuse_config_zero_thresholds_fall_back_to_java_defaults(self):
+    def test_abuse_config_zero_overrides_use_go_defaults(self):
         config = Config(
             settings=Settings(
                 max_control_payload_bytes=8192,
@@ -420,21 +427,12 @@ class RuntimeReadLoopFrameClassificationTests(unittest.TestCase):
             visible_terminal_churn_threshold=0,
         )
         abuse = ReadLoopAbuseConfig.from_config(config)
-        self.assertEqual(abuse.abuse_window, DEFAULT_ABUSE_WINDOW)
-        self.assertEqual(
-            abuse.inbound_control_frame_budget,
-            DEFAULT_INBOUND_CONTROL_FRAME_BUDGET,
-        )
+        self.assertEqual(abuse.abuse_window, 0.0)
+        self.assertEqual(abuse.inbound_control_frame_budget, DEFAULT_INBOUND_CONTROL_FRAME_BUDGET)
         self.assertEqual(abuse.inbound_control_bytes_budget, 8192 * 64)
-        self.assertEqual(
-            abuse.inbound_ext_frame_budget,
-            DEFAULT_INBOUND_EXT_FRAME_BUDGET,
-        )
+        self.assertEqual(abuse.inbound_ext_frame_budget, DEFAULT_INBOUND_EXT_FRAME_BUDGET)
         self.assertEqual(abuse.inbound_ext_bytes_budget, 256 * 1024)
-        self.assertEqual(
-            abuse.inbound_mixed_frame_budget,
-            DEFAULT_INBOUND_CONTROL_FRAME_BUDGET,
-        )
+        self.assertEqual(abuse.inbound_mixed_frame_budget, DEFAULT_INBOUND_CONTROL_FRAME_BUDGET)
         self.assertEqual(abuse.inbound_mixed_bytes_budget, 8192 * 64)
         self.assertEqual(abuse.ignored_control_budget, DEFAULT_IGNORED_CONTROL_BUDGET)
         self.assertEqual(abuse.no_op_zero_data_budget, DEFAULT_NO_OP_ZERO_DATA_BUDGET)
@@ -445,6 +443,23 @@ class RuntimeReadLoopFrameClassificationTests(unittest.TestCase):
             abuse.no_op_priority_update_budget,
             DEFAULT_NO_OP_PRIORITY_UPDATE_BUDGET,
         )
+        self.assertEqual(abuse.group_rebucket_churn_budget, DEFAULT_GROUP_REBUCKET_CHURN_BUDGET)
+        self.assertEqual(abuse.hidden_abort_churn_window, 0.0)
+        self.assertEqual(abuse.hidden_abort_churn_budget, DEFAULT_HIDDEN_ABORT_CHURN_BUDGET)
+        self.assertEqual(abuse.visible_terminal_churn_window, 0.0)
+        self.assertEqual(
+            abuse.visible_terminal_churn_budget,
+            DEFAULT_VISIBLE_TERMINAL_CHURN_BUDGET,
+        )
+        tracker = InboundBudgetTracker(abuse)
+        tracker.record_frame(Frame(FrameType.PING, 0, 0, b"12345678"), now=1.0)
+
+    def test_abuse_config_accepts_go_named_no_op_control_threshold(self):
+        config = Config(ignored_control_budget=11, no_op_control_flood_threshold=22)
+
+        abuse = ReadLoopAbuseConfig.from_config(config)
+
+        self.assertEqual(abuse.ignored_control_budget, 22)
         self.assertEqual(
             abuse.group_rebucket_churn_budget,
             DEFAULT_GROUP_REBUCKET_CHURN_BUDGET,

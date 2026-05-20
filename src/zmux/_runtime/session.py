@@ -117,7 +117,6 @@ from ..config import (
     DEFAULT_RETAINED_PEER_REASON_BYTES_BUDGET,
     DEFAULT_SESSION_MEMORY_HARD_CAP_FLOOR,
     DEFAULT_STOP_SENDING_GRACEFUL_DRAIN_WINDOW,
-    DEFAULT_TOMBSTONE_LIMIT,
     Config,
     Settings,
     default_accept_backlog_bytes_limit,
@@ -284,6 +283,17 @@ def validate_local_go_away(
 def default_urgent_queue_max_bytes(local: Settings, peer: Settings) -> int:
     payload = min_nonzero(local.max_control_payload_bytes, peer.max_control_payload_bytes)
     return repo_default_urgent_lane_cap(payload)
+
+
+def default_hidden_control_opened_limit(pending_limit: int) -> int:
+    return admission_hard_cap(pending_limit)
+
+
+def hidden_control_soft_limit(hard_limit: int) -> int:
+    hard_limit = _nonnegative_int(hard_limit, "hard_limit")
+    if hard_limit <= 1:
+        return hard_limit
+    return max(1, hard_limit // 2)
 
 
 def default_pending_control_bytes_budget(peer: Settings, local: Settings) -> int:
@@ -456,8 +466,9 @@ class RuntimePolicy(object):
     pending_priority_bytes_budget: int
     accept_backlog_limit: int
     accept_backlog_bytes_limit: int
+    hidden_control_opened_limit: int
     tombstone_limit: int
-    marker_only_used_stream_limit: Optional[int]
+    marker_only_used_stream_limit: int
     retained_open_info_bytes_budget: int
     retained_peer_reason_bytes_budget: int
     aggregate_late_data_cap: int
@@ -502,65 +513,78 @@ class RuntimePolicy(object):
             else peer
         )
         payload = negotiated_frame_payload(local.settings, peer.settings)
-        per_stream_hwm = _positive_int_or_default(
-            config.per_stream_queued_data_hwm,
-            repo_default_per_stream_data_hwm(payload),
+        per_stream_hwm = (
+            config.per_stream_queued_data_hwm
+            if config.per_stream_queued_data_hwm is not None
+            else repo_default_per_stream_data_hwm(payload)
         )
-        session_hwm = _positive_int_or_default(
-            config.session_queued_data_hwm,
-            repo_default_session_data_hwm(per_stream_hwm),
+        per_stream_hwm = max(1, per_stream_hwm)
+        session_hwm = (
+            config.session_queued_data_hwm
+            if config.session_queued_data_hwm is not None
+            else repo_default_session_data_hwm(per_stream_hwm)
         )
-        accept_limit = _positive_int_or_default(
-            config.accept_backlog_limit,
-            DEFAULT_ACCEPT_BACKLOG_LIMIT,
+        session_hwm = max(1, session_hwm)
+        accept_limit = (
+            config.accept_backlog_limit
+            if config.accept_backlog_limit is not None
+            else DEFAULT_ACCEPT_BACKLOG_LIMIT
         )
-        accept_bytes = _positive_int_or_default(
-            config.accept_backlog_bytes_limit,
-            default_accept_backlog_bytes_limit(local.settings.max_frame_payload),
+        accept_bytes = (
+            config.accept_backlog_bytes_limit
+            if config.accept_backlog_bytes_limit is not None
+            else default_accept_backlog_bytes_limit(local.settings.max_frame_payload)
         )
-        provisional_hard = provisional_open_hard_cap(accept_limit)
+        hidden_control_limit = (
+            config.hidden_control_opened_limit
+            if config.hidden_control_opened_limit is not None
+            else default_hidden_control_opened_limit(accept_limit)
+        )
+        marker_only_limit = (
+            config.marker_only_used_stream_limit
+            if config.marker_only_used_stream_limit is not None
+            else config.used_marker_limit
+        )
         return cls(
             write_queue_max_bytes=max(0, config.write_queue_max_bytes),
             write_batch_max_frames=max(0, config.write_batch_max_frames or MAX_BATCH_FRAMES),
             session_memory_cap=config.session_memory_cap,
             per_stream_queued_data_hwm=per_stream_hwm,
             session_queued_data_hwm=session_hwm,
-            urgent_queued_bytes_cap=_positive_int_or_default(
-                config.urgent_queued_bytes_cap,
-                default_urgent_queue_max_bytes(local.settings, peer.settings),
+            urgent_queued_bytes_cap=(
+                config.urgent_queued_bytes_cap
+                if config.urgent_queued_bytes_cap is not None
+                else default_urgent_queue_max_bytes(local.settings, peer.settings)
             ),
-            pending_control_bytes_budget=_positive_int_or_default(
-                config.pending_control_bytes_budget,
-                default_pending_control_bytes_budget(peer.settings, local.settings),
+            pending_control_bytes_budget=(
+                config.pending_control_bytes_budget
+                if config.pending_control_bytes_budget is not None
+                else default_pending_control_bytes_budget(peer.settings, local.settings)
             ),
-            pending_priority_bytes_budget=_positive_int_or_default(
-                config.pending_priority_bytes_budget,
-                default_pending_priority_bytes_budget(peer.settings, local.settings),
+            pending_priority_bytes_budget=(
+                config.pending_priority_bytes_budget
+                if config.pending_priority_bytes_budget is not None
+                else default_pending_priority_bytes_budget(peer.settings, local.settings)
             ),
             accept_backlog_limit=max(0, accept_limit),
             accept_backlog_bytes_limit=max(0, accept_bytes),
-            tombstone_limit=_positive_int_or_default(
-                config.tombstone_limit,
-                DEFAULT_TOMBSTONE_LIMIT,
-            ),
-            marker_only_used_stream_limit=config.marker_only_used_stream_limit,
+            hidden_control_opened_limit=max(0, hidden_control_limit),
+            tombstone_limit=max(0, config.tombstone_limit),
+            marker_only_used_stream_limit=max(0, marker_only_limit),
             retained_open_info_bytes_budget=retained_open_info_budget(
                 local.settings, peer.settings, config.retained_open_info_bytes_budget
             ),
             retained_peer_reason_bytes_budget=retained_peer_reason_budget(
                 local.settings, config.retained_peer_reason_bytes_budget
             ),
-            aggregate_late_data_cap=_positive_int_or_default(
-                config.aggregate_late_data_cap,
-                aggregate_late_data_cap(local.settings.max_frame_payload),
+            aggregate_late_data_cap=(
+                config.aggregate_late_data_cap
+                if config.aggregate_late_data_cap is not None
+                else aggregate_late_data_cap(local.settings.max_frame_payload)
             ),
             late_data_per_stream_cap=config.late_data_per_stream_cap,
-            max_provisional_streams_bidi=(
-                    config.max_provisional_streams_bidi or provisional_hard
-            ),
-            max_provisional_streams_uni=(
-                    config.max_provisional_streams_uni or provisional_hard
-            ),
+            max_provisional_streams_bidi=max(0, config.max_provisional_streams_bidi),
+            max_provisional_streams_uni=max(0, config.max_provisional_streams_uni),
             provisional_open_max_age=PROVISIONAL_OPEN_MAX_AGE,
             stop_sending_graceful_drain_window=(
                 config.stop_sending_graceful_drain_window
@@ -643,7 +667,6 @@ class FlowState(object):
     send_session_max: int = 0
     send_session_used: int = 0
     queued_data_bytes: int = 0
-    advisory_queued_bytes: int = 0
     urgent_queued_bytes: int = 0
     read_buffer_overhead: int = 0
 
@@ -848,6 +871,13 @@ class RuntimeMetrics(object):
     def note_blocked_write(self, blocked: float) -> None:
         if blocked > 0:
             self.blocked_write_time = self.blocked_write_time + float(blocked)
+
+    def note_writer_failure(self, close_frame_attempted: bool = False) -> None:
+        close_frame_attempted = _require_bool(close_frame_attempted, "close_frame_attempted")
+        if close_frame_attempted:
+            self.close_frame_flush_error = saturating_add(self.close_frame_flush_error, 1)
+        else:
+            self.skipped_close_on_dead_io = saturating_add(self.skipped_close_on_dead_io, 1)
 
 
 @dataclass
@@ -1119,6 +1149,7 @@ class SessionRuntimeState(object):
     liveness: LivenessState = field(default_factory=LivenessState)
     control: SessionControlState = field(default_factory=SessionControlState)
     shutdown: ShutdownState = field(default_factory=ShutdownState)
+    inflight_data_by_stream: Dict[int, int] = field(default_factory=dict)
     open_streams: int = 0
     close_error: Optional[BaseException] = None
 
@@ -1158,13 +1189,31 @@ class SessionRuntimeState(object):
             retained_state_bytes = self.retained_state_breakdown().total_bytes
         total = self.flow.recv_session_used
         total = saturating_add(total, self.flow.queued_data_bytes)
-        total = saturating_add(total, self.flow.advisory_queued_bytes)
         total = saturating_add(total, self.flow.urgent_queued_bytes)
         total = saturating_add(total, self.flow.read_buffer_overhead)
         total = saturating_add(total, self.retention.retained_open_info_bytes)
         total = saturating_add(total, self.retention.retained_peer_reason_bytes)
         total = saturating_add(total, len(self.liveness.ping_payload))
         return saturating_add(total, retained_state_bytes)
+
+    def add_inflight_data(self, data: Any) -> None:
+        for stream_id, byte_count in _stream_value_items(data):
+            self.inflight_data_by_stream[stream_id] = saturating_add(
+                self.inflight_data_by_stream.get(stream_id, 0),
+                byte_count,
+            )
+
+    def remove_inflight_data(self, data: Any) -> None:
+        for stream_id, byte_count in _stream_value_items(data):
+            remaining = max(0, self.inflight_data_by_stream.get(stream_id, 0) - byte_count)
+            if remaining:
+                self.inflight_data_by_stream[stream_id] = remaining
+            else:
+                self.inflight_data_by_stream.pop(stream_id, None)
+
+    def inflight_data_for_stream(self, stream_id: int) -> int:
+        stream_id = _positive_int(stream_id, "stream_id")
+        return self.inflight_data_by_stream.get(stream_id, 0)
 
     def hard_cap(self) -> int:
         return session_memory_hard_cap(self.local_preface.settings, self.policy)
@@ -1176,15 +1225,7 @@ class SessionRuntimeState(object):
         return self.tracked_session_memory() >= self.high_threshold()
 
     def marker_only_used_stream_hard_cap(self, hard_cap: Optional[int] = None) -> int:
-        configured = self.policy.marker_only_used_stream_limit
-        if configured:
-            return configured
-        if hard_cap is None:
-            hard_cap = self.hard_cap()
-        derived = hard_cap // compact_terminal_state_unit()
-        if derived <= 1:
-            return 1
-        return min(derived, (1 << 31) - 1)
+        return self.policy.marker_only_used_stream_limit
 
     def retained_state_breakdown(self) -> RetainedStateBreakdown:
         retained_unit = retained_state_unit(self.local_preface.settings)
@@ -1241,7 +1282,7 @@ class SessionRuntimeState(object):
         self.liveness.ping_payload = b""
 
     def effective_late_data_per_stream_cap(self, initial_stream_window: int) -> int:
-        if self.policy.late_data_per_stream_cap:
+        if self.policy.late_data_per_stream_cap is not None:
             return self.policy.late_data_per_stream_cap
         payload = negotiated_frame_payload(self.local_preface.settings, self.peer_preface.settings)
         return late_data_per_stream_cap(initial_stream_window, payload)
@@ -1325,16 +1366,13 @@ class SessionRuntimeState(object):
         outbound_idle_for = 0.0
         if not terminal and self.liveness.last_transport_write_at is not None:
             outbound_idle_for = max(0.0, now - self.liveness.last_transport_write_at)
-        queued_bytes = saturating_add(
-            saturating_add(self.flow.queued_data_bytes, self.flow.advisory_queued_bytes),
-            self.flow.urgent_queued_bytes,
-        )
+        queued_bytes = saturating_add(self.flow.queued_data_bytes, self.flow.urgent_queued_bytes)
         abuse = self.policy.abuse
         accept_backlog_count = retained_breakdown.accept_backlog.count
         accept_backlog_bytes = retained_breakdown.accept_backlog.bytes
         hidden_retained = self.retention.hidden_control_retained
-        hidden_soft_cap = admission_soft_cap(self.policy.accept_backlog_limit)
-        hidden_hard_cap = admission_hard_cap(self.policy.accept_backlog_limit)
+        hidden_hard_cap = self.policy.hidden_control_opened_limit
+        hidden_soft_cap = hidden_control_soft_limit(hidden_hard_cap)
         return SessionStats(
             state=self.state,
             sent_frames=self.metrics.sent_frames,
@@ -1390,9 +1428,6 @@ class SessionRuntimeState(object):
                 tracked_buffered_limit=hard_cap,
                 tracked_buffered_high=tracked >= high_threshold,
                 tracked_buffered_at_cap=tracked >= hard_cap,
-                ordinary_queued_bytes=self.flow.queued_data_bytes,
-                advisory_queued_bytes=self.flow.advisory_queued_bytes,
-                urgent_queued_bytes=self.flow.urgent_queued_bytes,
                 buffered_receive_bytes=self.flow.recv_session_used,
                 buffered_receive_storage_bytes=self.flow.read_buffer_overhead,
                 recv_session_advertised_bytes=self.flow.recv_session_advertised,
@@ -1464,7 +1499,6 @@ class SessionRuntimeState(object):
                 max_bytes=self.policy.write_queue_max_bytes,
                 urgent_queued_bytes=self.flow.urgent_queued_bytes,
                 urgent_max_bytes=self.policy.urgent_queued_bytes_cap,
-                advisory_queued_bytes=self.flow.advisory_queued_bytes,
                 data_queued_bytes=self.flow.queued_data_bytes,
                 session_data_high_watermark=self.policy.session_queued_data_hwm,
                 per_stream_data_high_watermark=self.policy.per_stream_queued_data_hwm,
@@ -1997,6 +2031,34 @@ def _strict_nonnegative_int(value: int, name: str) -> int:
     return value
 
 
+def _positive_int(value: int, name: str) -> int:
+    value = _strict_nonnegative_int(value, name)
+    if value == 0:
+        raise ValueError("%s must be > 0" % name)
+    return value
+
+
+def _stream_value_items(data: Any) -> tuple[tuple[int, int], ...]:
+    if data is None:
+        return ()
+    values = data.items() if isinstance(data, dict) else data
+    out = []
+    try:
+        iterator = iter(values)
+    except TypeError as exc:
+        raise TypeError("data must be a mapping or iterable of pairs") from exc
+    for item in iterator:
+        try:
+            stream_id, byte_count = item
+        except (TypeError, ValueError) as exc:
+            raise TypeError("data entries must be stream/byte pairs") from exc
+        stream_id = _positive_int(stream_id, "stream_id")
+        byte_count = _strict_nonnegative_int(byte_count, "byte_count")
+        if byte_count:
+            out.append((stream_id, byte_count))
+    return tuple(out)
+
+
 def _require_varint62(value: int, name: str) -> int:
     return require_varint62(value, name)
 
@@ -2014,12 +2076,6 @@ def _require_bool(value: bool, name: str) -> bool:
     if not isinstance(value, bool):
         raise TypeError("%s must be a boolean" % name)
     return value
-
-
-def _positive_int_or_default(value: Optional[int], default: int) -> int:
-    if value is None or value <= 0:
-        return _nonnegative_int(default, "default")
-    return _nonnegative_int(value, "value")
 
 
 def _clamp_u64(value: int) -> int:
@@ -2117,6 +2173,7 @@ __all__ = (
     "compact_terminal_state_unit",
     "default_pending_control_bytes_budget",
     "default_pending_priority_bytes_budget",
+    "default_hidden_control_opened_limit",
     "default_urgent_queue_max_bytes",
     "earliest_nonzero_time",
     "effective_keepalive_timeout",
@@ -2127,6 +2184,7 @@ __all__ = (
     "go_away_drain_interval",
     "graceful_close_drain_timeout",
     "has_ping_padding_tag",
+    "hidden_control_soft_limit",
     "ignore_peer_non_close_frame",
     "ignore_peer_close",
     "init_keepalive_jitter_state",

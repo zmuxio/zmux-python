@@ -127,7 +127,16 @@ class PackageSurfaceTest(unittest.TestCase):
         self.assertEqual(zmux.default_settings().max_frame_payload, 16384)
         self.assertEqual(zmux.encode_varint(64), b"\x40\x40")
         self.assertEqual(zmux.parse_varint(b"\x40\x40"), (64, 2))
-        for name in ("write_frame", "join", "open", "client", "server"):
+        for name in (
+            "write_frame",
+            "join",
+            "open",
+            "client",
+            "server",
+            "open_io",
+            "client_io",
+            "server_io",
+        ):
             with self.subTest(name=name):
                 self.assertTrue(callable(getattr(zmux, name)))
         self.assertFalse(hasattr(zmux, "open_session"))
@@ -253,6 +262,7 @@ class PackageSurfaceTest(unittest.TestCase):
             remote_addr="remote",
         )
         self.assertEqual(stream.open_info, b"ssh")
+        self.assertEqual(stream.open_info_len, 3)
         self.assertTrue(stream.has_open_info)
         self.assertEqual(stream.local_addr, "local")
         self.assertEqual(stream.remote_addr, "remote")
@@ -356,14 +366,28 @@ class PackageSurfaceTest(unittest.TestCase):
 
         active = zmux.ActiveStreamStats(1, 2, 3, 4)
         self.assertEqual(active.total, 10)
-        queues = zmux.QueueStats(urgent=1, advisory=2, ordinary=3)
-        self.assertEqual(queues.total, 6)
-        backlog = zmux.AcceptBacklogStats(count=5, count_limit=5, bytes=8, bytes_limit=8)
+        queues = zmux.QueueStats(urgent=1, ordinary=3)
+        self.assertEqual(queues.total, 4)
+        backlog = zmux.AcceptBacklogStats(
+            bidi=2,
+            uni=3,
+            limit=5,
+            bytes=8,
+            bytes_limit=8,
+        )
         self.assertEqual(backlog.count, 5)
+        self.assertEqual(backlog.count_limit, 5)
+        self.assertEqual(backlog.bidi, 2)
+        self.assertEqual(backlog.uni, 3)
         self.assertTrue(backlog.at_count_limit())
         self.assertTrue(backlog.at_bytes_limit())
         self.assertTrue(backlog.at_count_cap)
         self.assertTrue(backlog.at_bytes_cap)
+        hidden = zmux.HiddenStats(retained=2, soft_cap=2, hard_cap=4)
+        self.assertEqual(hidden.soft_limit, 2)
+        self.assertEqual(hidden.hard_limit, 4)
+        self.assertTrue(hidden.at_soft_limit)
+        self.assertFalse(hidden.at_hard_limit)
         retained = zmux.RetainedStateBreakdownStats(
             hidden_control=zmux.RetainedBucketStats(1, 2),
             accept_backlog=zmux.RetainedBucketStats(3, 4),
@@ -387,6 +411,7 @@ class PackageSurfaceTest(unittest.TestCase):
         self.assertEqual(stats.state, zmux.SessionState.CLOSED)
         self.assertEqual(stats.active_streams.total, 0)
         self.assertEqual(stats.queues.total, 0)
+        self.assertIs(stats.provisional, stats.provisionals)
         detailed_stats = zmux.SessionStats(
             telemetry=zmux.TelemetryStats(
                 last_open_latency=0.5,
@@ -394,7 +419,6 @@ class PackageSurfaceTest(unittest.TestCase):
             ),
             writer_queue=zmux.WriterQueueStats(
                 urgent_jobs=1,
-                advisory_jobs=2,
                 ordinary_jobs=3,
                 queued_bytes=6,
             ),
@@ -511,6 +535,7 @@ class PackageSurfaceTest(unittest.TestCase):
             cfg.keepalive_max_ping_interval,
             zmux.DEFAULT_KEEPALIVE_MAX_PING_INTERVAL,
         )
+        self.assertEqual(cfg.keepalive_timeout, zmux.DEFAULT_KEEPALIVE_TIMEOUT)
         self.assertTrue(cfg.preface_padding)
         self.assertTrue(cfg.ping_padding)
         self.assertEqual(cfg.capabilities, zmux.DEFAULT_CAPABILITIES)
@@ -537,6 +562,7 @@ class PackageSurfaceTest(unittest.TestCase):
         self.assertEqual(zmux.DEFAULT_WRITE_BATCH_MAX_FRAMES, 32)
         self.assertEqual(zmux.DEFAULT_MAX_PROVISIONAL_STREAMS_BIDI, 64)
         self.assertEqual(zmux.DEFAULT_IGNORED_CONTROL_BUDGET, 128)
+        self.assertEqual(zmux.DEFAULT_NO_OP_CONTROL_BUDGET, 128)
         self.assertEqual(zmux.DEFAULT_URGENT_QUEUE_MAX_BYTES_FLOOR, 64 * 1024)
         self.assertEqual(
             zmux.DEFAULT_PER_STREAM_QUEUED_DATA_HIGH_WATERMARK_FLOOR,
@@ -559,6 +585,10 @@ class PackageSurfaceTest(unittest.TestCase):
         )
         flood_budget = replace(cfg, ignored_control_budget=22)
         self.assertEqual(flood_budget.ignored_control_budget, 22)
+        go_named_flood_budget = replace(cfg, no_op_control_flood_threshold=23)
+        self.assertEqual(go_named_flood_budget.no_op_control_flood_threshold, 23)
+        hidden_control = replace(cfg, hidden_control_opened_limit=17)
+        self.assertEqual(hidden_control.hidden_control_opened_limit, 17)
 
         zero_payload_limits = Settings(
             initial_max_data=123,
@@ -832,6 +862,8 @@ class PackageSurfaceTest(unittest.TestCase):
         self.assertEqual(zmux.PriorityUpdateUnavailable().scope, ErrorScope.STREAM)
         self.assertEqual(zmux.EmptyMetadataUpdate().scope, ErrorScope.STREAM)
         self.assertEqual(zmux.PingTimeout().direction, ErrorDirection.BOTH)
+        self.assertEqual(str(zmux.SessionWaitTimeout()), zmux.SESSION_WAIT_TIMEOUT_MESSAGE)
+        self.assertEqual(zmux.SessionWaitTimeout().operation, ErrorOperation.WAIT)
         transport_timeout = zmux.TransportError(TimeoutError("late"))
         self.assertEqual(transport_timeout.code, int(ErrorCode.INTERNAL))
         self.assertEqual(transport_timeout.source, ErrorSource.TRANSPORT)
@@ -1770,6 +1802,7 @@ class PackageSurfaceTest(unittest.TestCase):
         self.assertEqual(parsed.metadata.group, 9)
         self.assertEqual(parsed.open_info, b"ssh")
         self.assertTrue(parsed.metadata.has_open_info)
+        self.assertEqual(parsed.metadata.open_info_len, 3)
         self.assertEqual(parsed.app_data, b"app")
 
         priority_only = zmux.build_open_metadata_prefix(
@@ -1841,7 +1874,7 @@ class PackageSurfaceTest(unittest.TestCase):
 
         plain = zmux.parse_data_payload(b"app", 0)
         self.assertFalse(plain.has_metadata)
-        self.assertFalse(plain.metadata_valid)
+        self.assertTrue(plain.metadata_valid)
         self.assertEqual(plain.app_data, b"app")
         with self.assertRaises(TypeError):
             zmux.DataPayload(metadata_valid=1)
@@ -1872,6 +1905,7 @@ class PackageSurfaceTest(unittest.TestCase):
         self.assertEqual(view.metadata.priority, 7)
         self.assertEqual(view.open_info.tobytes(), b"ssh")
         self.assertTrue(view.metadata.has_open_info)
+        self.assertEqual(view.metadata.open_info_len, 3)
         self.assertEqual(view.app_data.tobytes(), b"payload")
 
         owned = zmux.parse_data_payload(raw, zmux.FRAME_FLAG_OPEN_METADATA)
