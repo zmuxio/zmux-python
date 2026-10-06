@@ -14,10 +14,12 @@ concurrency:
 
 jobs:
   validate:
-    name: Validate versions
+    name: Validate release
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
+      core_published: ${{ steps.published.outputs.core }}
+      aioquic_published: ${{ steps.published.outputs.aioquic }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -33,7 +35,56 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           python tools/check_release_version.py "${version}"
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Check existing PyPI versions
+        id: published
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          version_exists() {
+            python3 - "$1" "${VERSION}" <<'PY'
+          import sys
+          import urllib.error
+          import urllib.request
+
+          project, version = sys.argv[1], sys.argv[2]
+          request = urllib.request.Request(
+              f"https://pypi.org/pypi/{project}/{version}/json",
+              headers={"User-Agent": "zmux-python-release-workflow"},
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=20) as response:
+                  sys.exit(0 if response.status == 200 else 1)
+          except urllib.error.HTTPError as exc:
+              if exc.code == 404:
+                  sys.exit(1)
+              print(f"PyPI returned HTTP {exc.code} for {project} {version}", file=sys.stderr)
+              sys.exit(2)
+          except Exception as exc:
+              print(f"could not query PyPI for {project} {version}: {exc}", file=sys.stderr)
+              sys.exit(2)
+          PY
+          }
+
+          record_version_status() {
+            local project="$1"
+            local output="$2"
+            local status=0
+            version_exists "${project}" || status=$?
+            if [[ "${status}" -eq 0 ]]; then
+              echo "${output}=true" >> "${GITHUB_OUTPUT}"
+              echo "${project} ${VERSION} is already published; publish will be skipped."
+            elif [[ "${status}" -eq 1 ]]; then
+              echo "${output}=false" >> "${GITHUB_OUTPUT}"
+            else
+              exit "${status}"
+            fi
+          }
+
+          record_version_status zmuxio core
+          record_version_status zmuxio-aioquic aioquic
 
   test:
     name: Test (Python ${{ matrix.python }})
@@ -82,6 +133,13 @@ jobs:
           python -m build --outdir dist/zmuxio-aioquic packages/zmuxio-aioquic
           python -m twine check --strict dist/zmuxio/* dist/zmuxio-aioquic/*
 
+      - name: Install and import built wheels
+        run: |
+          python -m venv /tmp/release-smoke
+          /tmp/release-smoke/bin/python -m pip install dist/zmuxio/*.whl dist/zmuxio-aioquic/*.whl
+          cd /tmp
+          /tmp/release-smoke/bin/python -c "import zmux, zmux_aioquic; print('zmuxio', zmux.__version__)"
+
       - name: Upload distributions
         uses: actions/upload-artifact@v4
         with:
@@ -92,6 +150,7 @@ jobs:
   publish-core:
     name: Publish zmuxio
     needs: [validate, build]
+    if: needs.validate.outputs.core_published != 'true'
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -113,7 +172,13 @@ jobs:
 
   publish-aioquic:
     name: Publish zmuxio-aioquic
-    needs: [validate, publish-core]
+    needs: [validate, build, publish-core]
+    # Runs after the core was published here or had already been published by an earlier run of this tag.
+    if: >-
+      !cancelled()
+      && needs.build.result == 'success'
+      && (needs.publish-core.result == 'success' || needs.publish-core.result == 'skipped')
+      && needs.validate.outputs.aioquic_published != 'true'
     runs-on: ubuntu-latest
     environment:
       name: pypi-aioquic
