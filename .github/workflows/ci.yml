@@ -55,6 +55,9 @@ jobs:
         with:
           python-version: '3.13'
 
+      - name: Check release versions agree
+        run: python tools/check_release_version.py
+
       - name: Build distributions
         run: |
           python -m pip install build
