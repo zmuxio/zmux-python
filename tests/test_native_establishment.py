@@ -154,6 +154,16 @@ class _SocketReader(object):
         return self.socket.recv(max_bytes)
 
 
+def _assert_transport_closed(test, sock):
+    # Linux answers a close() that leaves unread inbound bytes with RST rather
+    # than FIN, so after the frames sent before the close have been read, the
+    # peer may see ECONNRESET instead of EOF. Both mean the transport closed.
+    try:
+        test.assertEqual(sock.recv(4096), b"")
+    except ConnectionResetError:
+        pass
+
+
 def _run(target, *args, **kwargs):
     result = {}
 
@@ -370,7 +380,7 @@ class EstablishmentTest(unittest.TestCase):
                 self.assertEqual(close.frame_type, zmux.FrameType.CLOSE)
                 code, _ = zmux.parse_error_payload(close.payload)
                 self.assertEqual(code, int(zmux.ErrorCode.PROTOCOL))
-                self.assertEqual(right.recv(4096), b"")
+                _assert_transport_closed(self, right)
             finally:
                 right.close()
 
