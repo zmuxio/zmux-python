@@ -16,7 +16,9 @@ from zmux._state.tombstone import (
     UsedStreamMarker,
     UsedStreamRange,
     StreamTombstoneRecord,
+    TOMBSTONE_QUEUE_COMPACT_MIN_DEAD,
     build_stream_tombstone,
+    coarsen_used_stream_ranges,
     should_compact_terminal,
     tombstone_late_data_action,
     tombstone_terminal_code,
@@ -114,6 +116,62 @@ class UsedStreamRangeTests(unittest.TestCase):
             [(4, 4, abortive), (8, 4 + 63 * 4, graceful)],
         )
         self.assertEqual(state.marker_only_retained(), 2)
+
+
+class UsedStreamRangeClassTests(unittest.TestCase):
+    """Used-stream ranges are partitioned by stream class (finding 43, D4)."""
+
+    def test_interleaved_stream_classes_merge_within_each_class(self):
+        graceful = marker()
+        ranges = []
+        for index in range(1, 2001):
+            for stream_class in (0, 1, 2):
+                upsert_used_stream_range(ranges, 4 * index + stream_class, graceful)
+
+        self.assertEqual(
+            [(r.start, r.end) for r in ranges],
+            [(4, 8000), (5, 8001), (6, 8002)],
+        )
+        for index in range(1, 2001):
+            for stream_class in (0, 1, 2):
+                stream_id = 4 * index + stream_class
+                self.assertEqual(
+                    used_stream_marker_for(ranges, {}, stream_id),
+                    (graceful, True),
+                )
+        self.assertEqual(used_stream_marker_for(ranges, {}, 7), (UsedStreamMarker(), False))
+        self.assertEqual(used_stream_marker_for(ranges, {}, 8004), (UsedStreamMarker(), False))
+
+    def test_range_of_another_class_inside_a_span_does_not_hide_ids(self):
+        graceful = marker()
+        abortive = marker(LateDataAction.IGNORE, LateDataCause.ABORT)
+        ranges = []
+        upsert_used_stream_range(ranges, 4, graceful)
+        upsert_used_stream_range(ranges, 8, graceful)
+        upsert_used_stream_range(ranges, 5, abortive)
+
+        self.assertEqual(used_stream_marker_for(ranges, {}, 8), (graceful, True))
+        self.assertEqual(used_stream_marker_for(ranges, {}, 4), (graceful, True))
+        self.assertEqual(used_stream_marker_for(ranges, {}, 5), (abortive, True))
+        self.assertEqual(used_stream_marker_for(ranges, {}, 9), (UsedStreamMarker(), False))
+
+    def test_coarsening_folds_lowest_ranges_of_largest_classes(self):
+        graceful = marker()
+        abortive = marker(LateDataAction.IGNORE, LateDataCause.ABORT)
+        ranges = []
+        for index in range(1, 9):
+            upsert_used_stream_range(
+                ranges, 4 * index, graceful if index % 2 else abortive
+            )
+        upsert_used_stream_range(ranges, 5, graceful)
+        floors = [None] * 4
+
+        coarsen_used_stream_ranges(ranges, floors, 4)
+
+        # Nine ranges (eight in class 0): the five lowest class-0 ranges fold.
+        self.assertEqual(len(ranges), 4)
+        self.assertEqual(floors, [20, None, None, None])
+        self.assertEqual([r.start for r in ranges], [24, 28, 32, 5])
 
 
 class StreamTombstonePrimitiveTests(unittest.TestCase):
@@ -547,6 +605,211 @@ class TerminalBookkeepingTests(unittest.TestCase):
         self.assertEqual(state.hidden_tombstone_order_ids(), [4, 12])
         self.assertEqual(state.tombstones[12].order_index, 2)
         self.assertEqual(state.tombstones[12].hidden_index, 2)
+
+    def test_marker_budget_is_enforced_by_coarsening_without_losing_used_ids(self):
+        state = TerminalBookkeepingState(tombstone_limit=4, marker_only_used_stream_limit=8)
+        graceful = marker()
+        abortive = marker(LateDataAction.ABORT_CLOSED, LateDataCause.RESET)
+        count = 4 * 8 * 4
+        for index in range(1, count + 1):
+            for stream_id in (4 * index, 4 * index + 1):
+                state.record_tombstone(
+                    stream_id,
+                    tombstone_record(
+                        action=abortive.action if index % 2 else graceful.action,
+                        cause=abortive.cause if index % 2 else graceful.cause,
+                    ),
+                )
+                self.assertLessEqual(state.marker_only_retained(), 8)
+                self.assertFalse(state.marker_only_limit_exceeded)
+
+        for index in range(1, count + 1):
+            for stream_id in (4 * index, 4 * index + 1):
+                self.assertTrue(state.has_terminal_marker(stream_id), stream_id)
+        # Never-used IDs stay unknown; coarsened ones are ignored.
+        self.assertFalse(state.has_terminal_marker(4 * (count + 1)))
+        self.assertFalse(state.has_terminal_marker(2))
+        self.assertEqual(
+            state.terminal_data_disposition_for(4).disposition,
+            disposition(LateDataAction.IGNORE, LateDataCause.NONE),
+        )
+        # The newest reaped markers keep their exact disposition.
+        newest_reaped = 4 * (count - 2)
+        self.assertNotIn(newest_reaped, state.tombstones)
+        self.assertEqual(
+            state.terminal_data_disposition_for(newest_reaped).disposition,
+            disposition(LateDataAction.ABORT_CLOSED, LateDataCause.RESET)
+            if (count - 2) % 2
+            else disposition(),
+        )
+
+    def test_forty_thousand_alternating_tombstones_keep_markers_bounded(self):
+        state = TerminalBookkeepingState(tombstone_limit=64, marker_only_used_stream_limit=256)
+        abortive = (LateDataAction.ABORT_CLOSED, LateDataCause.RESET)
+        for index in range(1, 40_001):
+            action, cause = abortive if index % 2 else (LateDataAction.IGNORE, LateDataCause.NONE)
+            state.record_tombstone(4 * index, tombstone_record(action=action, cause=cause))
+        self.assertLessEqual(len(state.used_stream_ranges), 256)
+        self.assertLessEqual(len(state.used_stream_data), 64)
+        self.assertEqual(state.tombstone_count_current(), 64)
+        self.assertTrue(state.has_terminal_marker(4))
+        self.assertTrue(state.has_terminal_marker(4 * 40_000))
+
+    def test_marker_limit_zero_coarsens_every_reaped_marker(self):
+        state = TerminalBookkeepingState(tombstone_limit=0, marker_only_used_stream_limit=0)
+        for stream_id in (4, 8, 9, 13, 2):
+            state.record_tombstone(stream_id, tombstone_record(cause=LateDataCause.RESET))
+        self.assertEqual(state.marker_only_retained(), 0)
+        for stream_id in (4, 8, 9, 13, 2):
+            self.assertTrue(state.has_terminal_marker(stream_id))
+        self.assertFalse(state.has_terminal_marker(12))
+        self.assertFalse(state.has_terminal_marker(3))
+
+    def test_marks_at_or_below_a_coarsened_floor_are_absorbed(self):
+        state = TerminalBookkeepingState(tombstone_limit=0, marker_only_used_stream_limit=4)
+        abortive = (LateDataAction.ABORT_CLOSED, LateDataCause.RESET)
+        for index in range(2, 40):
+            action, cause = abortive if index % 2 else (LateDataAction.IGNORE, LateDataCause.NONE)
+            state.record_tombstone(4 * index, tombstone_record(action=action, cause=cause))
+        self.assertGreater(state.used_stream_floors[0] or 0, 4)
+        ranges = [(r.start, r.end, r.marker) for r in state.used_stream_ranges]
+
+        # A long-lived stream below the floor that closes only now is already
+        # covered by the coarsened prefix: it adds no range.
+        state.record_tombstone(4, tombstone_record(action=abortive[0], cause=abortive[1]))
+        self.assertEqual([(r.start, r.end, r.marker) for r in state.used_stream_ranges], ranges)
+        self.assertEqual(state.terminal_data_disposition_for(4).disposition, disposition())
+
+    def test_retained_tombstones_are_not_marker_only_state(self):
+        state = TerminalBookkeepingState(tombstone_limit=128, marker_only_used_stream_limit=4)
+        for index in range(1, 101):
+            cause = LateDataCause.RESET if index % 2 else LateDataCause.NONE
+            state.record_tombstone(4 * index, tombstone_record(cause=cause))
+
+        # A retained tombstone classifies late frames itself; it becomes a
+        # used-stream marker only once it is reaped, so marker bookkeeping
+        # stays proportional to reaped IDs (finding 105).
+        self.assertEqual(state.marker_only_retained(), 0)
+        self.assertEqual(state.used_stream_data, {})
+        self.assertEqual(state.used_stream_ranges, [])
+        for index in range(1, 101):
+            self.assertTrue(state.has_terminal_marker(4 * index))
+        self.assertTrue(state.remove_tombstone(8))
+        self.assertEqual(state.marker_only_retained(), 1)
+        self.assertEqual(
+            state.terminal_data_disposition_for(8).disposition,
+            disposition(LateDataAction.IGNORE, LateDataCause.NONE),
+        )
+
+    def test_new_tombstones_are_appended_without_scanning_the_queue(self):
+        class CountingList(list):
+            reads = 0
+
+            def __getitem__(self, index):
+                self.reads += 1
+                return list.__getitem__(self, index)
+
+        state = TerminalBookkeepingState(tombstone_limit=4096)
+        order = CountingList()
+        state.tombstone_order = order
+        for index in range(1, 2001):
+            state.record_tombstone(4 * index, tombstone_record())
+
+        self.assertIs(state.tombstone_order, order)
+        self.assertEqual(state.tombstone_count_current(), 2000)
+        # A new record has no queue index yet, so it is appended directly;
+        # looking for it in the queue would read every live slot.
+        self.assertLessEqual(order.reads, 2000)
+        self.assertEqual(state.tombstone_head_id().stream_id, 4)
+        self.assertEqual(state.tombstones[4 * 2000].order_index, 1999)
+
+    def test_retained_late_data_follows_tombstone_lifetime(self):
+        state = TerminalBookkeepingState(tombstone_limit=2)
+        state.record_tombstone(4, tombstone_record(late_data_received=100))
+        state.record_tombstone(8, tombstone_record(late_data_received=10))
+        state.record_terminal_late_data(4, 5)
+        self.assertEqual(state.late_data_retained, 115)
+        # Late bytes on a marker-only ID are not retained by anything.
+        state.record_terminal_late_data(12, 7)
+        self.assertEqual(state.late_data_retained, 115)
+
+        state.record_tombstone(12, tombstone_record(late_data_received=1))
+        self.assertNotIn(4, state.tombstones)
+        self.assertEqual(state.late_data_retained, 11)
+        state.record_tombstone(8, tombstone_record(late_data_received=2))
+        self.assertEqual(state.late_data_retained, 3)
+        self.assertTrue(state.remove_tombstone(8))
+        self.assertTrue(state.remove_tombstone(12))
+        self.assertEqual(state.late_data_retained, 0)
+
+        state.record_tombstone(16, tombstone_record(late_data_received=9))
+        state.clear()
+        self.assertEqual(state.late_data_retained, 0)
+        self.assertEqual(state.used_stream_floors, [None] * 4)
+
+    def test_reaping_at_the_limit_does_not_rewrite_the_queue_each_time(self):
+        limit = 4096
+        state = TerminalBookkeepingState(tombstone_limit=limit)
+        for index in range(1, limit + 2):
+            state.record_tombstone(4 * index, tombstone_record())
+
+        # One reap moved the head; the queue was not rewritten for it.
+        self.assertEqual(state.tombstone_count_current(), limit)
+        self.assertEqual(state.tombstone_head, 1)
+        self.assertEqual(len(state.tombstone_order), limit + 1)
+
+        rewrites = 0
+        order = state.tombstone_order
+        extra = 5 * limit
+        for index in range(limit + 2, limit + 2 + extra):
+            state.record_tombstone(4 * index, tombstone_record())
+            if state.tombstone_order is not order:
+                rewrites += 1
+                order = state.tombstone_order
+            self.assertLessEqual(
+                len(state.tombstone_order),
+                2 * state.tombstone_count + TOMBSTONE_QUEUE_COMPACT_MIN_DEAD,
+            )
+        self.assertLessEqual(rewrites, extra // limit + 1)
+
+        last = limit + 1 + extra
+        oldest = last - limit + 1
+        self.assertEqual(state.tombstone_head_id().stream_id, 4 * oldest)
+        self.assertEqual(state.tombstone_order_ids(), [4 * i for i in range(oldest, last + 1)])
+        for stream_id in (4 * oldest, 4 * (oldest + 7), 4 * last):
+            record = state.tombstones[stream_id]
+            self.assertEqual(state.tombstone_order[record.order_index], stream_id)
+
+    def test_delayed_compaction_keeps_fifo_order_with_middle_removals(self):
+        state = TerminalBookkeepingState(tombstone_limit=8, hidden_tombstone_limit=8)
+        for index in range(1, 9):
+            state.record_tombstone(
+                4 * index,
+                tombstone_record(hidden=index % 3 == 0, cause=LateDataCause.ABORT),
+            )
+        self.assertTrue(state.remove_tombstone(12))
+        self.assertTrue(state.remove_tombstone(20))
+        for index in range(9, 200):
+            state.record_tombstone(
+                4 * index,
+                tombstone_record(hidden=index % 3 == 0, cause=LateDataCause.ABORT),
+            )
+            if index % 5 == 0:
+                middle = state.tombstone_order_ids()[3]
+                self.assertTrue(state.remove_tombstone(middle))
+            ids = state.tombstone_order_ids()
+            self.assertEqual(ids, sorted(ids))
+            self.assertEqual(state.tombstone_head_id().stream_id, ids[0])
+            for stream_id in ids:
+                record = state.tombstones[stream_id]
+                self.assertEqual(state.tombstone_order[record.order_index], stream_id)
+                if record.hidden:
+                    self.assertEqual(
+                        state.hidden_tombstone_order[record.hidden_index],
+                        stream_id,
+                    )
+            hidden_ids = state.hidden_tombstone_order_ids()
+            self.assertEqual(hidden_ids, [i for i in ids if state.tombstones[i].hidden])
 
     def test_remove_hidden_tombstone_falls_back_from_stale_hidden_index(self):
         state = TerminalBookkeepingState(tombstone_limit=16, hidden_tombstone_limit=16)

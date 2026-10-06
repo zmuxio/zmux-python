@@ -62,8 +62,10 @@ from zmux.config import (
     Config,
     Settings,
 )
+from zmux._wire.frame import read_session_frame
+from zmux._wire.varint import encode_varint
 from zmux.errors import FrameSizeError, ProtocolError
-from zmux.frame import Frame
+from zmux.frame import Frame, read_frame
 from zmux.payload import (
     MetadataUpdate,
     build_go_away_payload,
@@ -75,6 +77,7 @@ from zmux.protocol import (
     CAPABILITY_PRIORITY_HINTS,
     CAPABILITY_PRIORITY_UPDATE,
     CAPABILITY_STREAM_GROUPS,
+    EXT_PRIORITY_UPDATE,
     ErrorCode,
     FRAME_FLAG_OPEN_METADATA,
     FrameType,
@@ -230,8 +233,22 @@ class RuntimeReadLoopBudgetTests(unittest.TestCase):
         tracker.record(3, LateDataCause.RESET, hidden=True)
         self.assertEqual(tracker.after_reset, 3)
         self.assertEqual(tracker.hidden_unread_discarded, 3)
-        with self.assertRaises(ProtocolError):
+        with self.assertRaises(ProtocolError) as raised:
             tracker.record(1, LateDataCause.ABORT)
+        self.assertEqual(raised.exception.code, int(ErrorCode.PROTOCOL))
+
+    def test_late_data_tracker_aggregate_cap_never_fails(self):
+        # DESIGN D2: the aggregate only marks pressure; bytes from other
+        # streams keep being discarded without a session error.
+        tracker = LateDataTracker(aggregate_cap=4, per_stream_cap=3)
+        tracker.record(3, LateDataCause.CLOSE_READ, track_per_stream=False)
+        self.assertFalse(tracker.aggregate_at_cap)
+        tracker.record(3, LateDataCause.CLOSE_READ, track_per_stream=False)
+        self.assertTrue(tracker.aggregate_at_cap)
+        tracker.record(100, LateDataCause.RESET, track_per_stream=False)
+        self.assertEqual(tracker.aggregate_received, 106)
+        self.assertTrue(tracker.aggregate_at_cap)
+        self.assertFalse(LateDataTracker(per_stream_cap=3).aggregate_at_cap)
 
     def test_churn_window_boundary_is_strictly_greater_than_window_like_java(self):
         tracker = InboundBudgetTracker(
@@ -375,7 +392,6 @@ class RuntimeReadLoopFrameClassificationTests(unittest.TestCase):
             Frame(FrameType.ABORT, 1, 0, b""),
             Frame(FrameType.GOAWAY, 0, 0, b""),
             Frame(FrameType.CLOSE, 0, 0, b""),
-            Frame(FrameType.EXT, 1, 0, b""),
         )
         for frame in malformed:
             with self.subTest(frame_type=frame.frame_type):
@@ -387,6 +403,95 @@ class RuntimeReadLoopFrameClassificationTests(unittest.TestCase):
 
         with self.assertRaises(ProtocolError) as ctx:
             classify_inbound_frame(Frame(FrameType.MAX_DATA, 0, 0, b"\x00x"))
+        self.assertEqual(ctx.exception.code, int(ErrorCode.PROTOCOL))
+
+    def test_ext_payload_underflow_is_protocol_not_frame_size(self):
+        # SPEC 6.11: a payload too short for its ext_type is a session
+        # PROTOCOL error (empty, truncated or non-canonical ext_type).
+        for payload in (b"", b"\x40", b"\x40\x01"):
+            for capabilities in (0, CAPABILITY_PRIORITY_UPDATE):
+                with self.subTest(payload=payload, capabilities=capabilities):
+                    with self.assertRaises(ProtocolError) as ctx:
+                        classify_inbound_frame(
+                            Frame(FrameType.EXT, 1, 0, payload),
+                            capabilities=capabilities,
+                        )
+                    self.assertNotIsInstance(ctx.exception, FrameSizeError)
+                    self.assertEqual(ctx.exception.code, int(ErrorCode.PROTOCOL))
+
+    def test_priority_update_rules_apply_only_when_negotiated(self):
+        truncated_tlv = bytes((EXT_PRIORITY_UPDATE, 1, 1))
+        stream_zero = bytes((EXT_PRIORITY_UPDATE, 1, 1, 2))
+        duplicate_then_truncated = bytes((EXT_PRIORITY_UPDATE, 1, 1, 2, 1, 1, 3, 1))
+        duplicate_group_then_truncated = bytes((EXT_PRIORITY_UPDATE, 2, 1, 2, 2, 1, 3, 1))
+        # SPEC 7.6: without the capability the update is ignored unparsed.
+        for stream_id, payload in (
+                (1, truncated_tlv),
+                (0, stream_zero),
+                (1, duplicate_then_truncated),
+                (1, duplicate_group_then_truncated),
+        ):
+            with self.subTest(stream_id=stream_id, payload=payload):
+                parsed = classify_inbound_frame(Frame(FrameType.EXT, stream_id, 0, payload))
+                self.assertEqual(parsed.kind, ParsedFrameKind.EXT)
+                self.assertIsNone(parsed.priority_update)
+                self.assertTrue(parsed.priority_update_valid)
+        caps = CAPABILITY_PRIORITY_UPDATE | CAPABILITY_PRIORITY_HINTS
+        with self.assertRaises(ProtocolError) as ctx:
+            classify_inbound_frame(Frame(FrameType.EXT, 0, 0, stream_zero), capabilities=caps)
+        self.assertNotIsInstance(ctx.exception, FrameSizeError)
+        self.assertEqual(ctx.exception.code, int(ErrorCode.PROTOCOL))
+        for payload in (truncated_tlv, duplicate_then_truncated, duplicate_group_then_truncated):
+            with self.subTest(payload=payload), self.assertRaises(FrameSizeError):
+                classify_inbound_frame(Frame(FrameType.EXT, 1, 0, payload), capabilities=caps)
+
+    def test_dispatcher_leaves_priority_update_rules_to_the_capability_check(self):
+        caps = CAPABILITY_PRIORITY_UPDATE | CAPABILITY_PRIORITY_HINTS
+        for stream_id, payload, negotiated_error in (
+                (4, bytes((EXT_PRIORITY_UPDATE, 1, 1)), FrameSizeError),
+                (0, bytes((EXT_PRIORITY_UPDATE, 1, 1, 2)), ProtocolError),
+        ):
+            with self.subTest(stream_id=stream_id):
+                # Built by hand: the outbound codec refuses these frames.
+                body = bytes((int(FrameType.EXT),)) + encode_varint(stream_id) + payload
+                raw = encode_varint(len(body)) + body
+                frame = Frame(FrameType.EXT, stream_id, 0, payload)
+                # Not negotiated: read and dispatched, then ignored unparsed.
+                for result in (
+                        read_loop_once(io.BytesIO(raw), ReadLoopFrameDispatcher()),
+                        ReadLoopFrameDispatcher().handle_frame(frame),
+                ):
+                    self.assertEqual(result.parsed.kind, ParsedFrameKind.EXT)
+                    self.assertIsNone(result.parsed.priority_update)
+                    self.assertTrue(result.parsed.priority_update_valid)
+                # Negotiated: the same frames are session errors.
+                with self.assertRaises(negotiated_error) as ctx:
+                    read_loop_once(
+                        io.BytesIO(raw),
+                        ReadLoopFrameDispatcher(capabilities=caps),
+                    )
+                if negotiated_error is ProtocolError:
+                    self.assertNotIsInstance(ctx.exception, FrameSizeError)
+                with self.assertRaises(negotiated_error):
+                    ReadLoopFrameDispatcher(capabilities=caps).handle_frame(frame)
+
+    def test_session_frame_reader_defers_priority_update_rules(self):
+        for stream_id, payload in (
+                (4, bytes((EXT_PRIORITY_UPDATE, 1, 1))),
+                (0, bytes((EXT_PRIORITY_UPDATE, 1, 1, 2))),
+        ):
+            with self.subTest(stream_id=stream_id):
+                # Built by hand: the outbound codec refuses these frames.
+                body = bytes((int(FrameType.EXT),)) + encode_varint(stream_id) + payload
+                raw = encode_varint(len(body)) + body
+                frame = read_session_frame(io.BytesIO(raw))
+                self.assertEqual(frame.payload, payload)
+                # The public codec still validates PRIORITY_UPDATE strictly.
+                with self.assertRaises(ProtocolError):
+                    read_frame(io.BytesIO(raw))
+        with self.assertRaises(ProtocolError) as ctx:
+            read_session_frame(io.BytesIO(bytes((0x02, 0x0B, 0x00))))
+        self.assertNotIsInstance(ctx.exception, FrameSizeError)
         self.assertEqual(ctx.exception.code, int(ErrorCode.PROTOCOL))
 
     def test_abuse_config_derives_byte_budgets_from_config_settings(self):

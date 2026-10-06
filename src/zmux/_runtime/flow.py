@@ -314,12 +314,15 @@ def should_replenish_pending_window(
         force: bool = False,
 ) -> bool:
     pending = _nonnegative_int(pending, "pending")
-    if pending == 0:
-        return False
     force = _require_bool(force, "force")
+    remaining = _nonnegative_int(remaining, "remaining")
+    if pending == 0:
+        # Nothing was released.  Only a forced replenish of an exhausted
+        # window grants (up to the standing target); otherwise a zero initial
+        # window would never receive any credit.
+        return force and remaining == 0
     if force:
         return True
-    remaining = _nonnegative_int(remaining, "remaining")
     target = _nonnegative_int(target, "target")
     advertised = _nonnegative_int(advertised, "advertised")
     if remaining <= _nonnegative_int(emergency_threshold, "emergency_threshold"):

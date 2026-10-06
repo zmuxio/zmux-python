@@ -1835,10 +1835,11 @@ class PackageSurfaceTest(unittest.TestCase):
         append_tlv(duplicate_update, zmux.METADATA_STREAM_PRIORITY, encode_varint(2))
         _, valid = zmux.parse_priority_update_payload(duplicate_update)
         self.assertFalse(valid)
+        # A duplicate never hides a later structural error (SPEC 7.2).
         malformed_duplicate_update = bytearray(duplicate_update)
         malformed_duplicate_update.extend(b"\x40\x01\x00")
-        _, valid = zmux.parse_priority_update_payload(malformed_duplicate_update)
-        self.assertFalse(valid)
+        with self.assertRaises(ProtocolError):
+            zmux.parse_priority_update_payload(malformed_duplicate_update)
 
         with self.assertRaises(ProtocolError):
             zmux.build_open_metadata_prefix(0, open_info=b"ssh", max_frame_payload=1024)
@@ -1935,9 +1936,8 @@ class PackageSurfaceTest(unittest.TestCase):
         self.assertTrue(metadata_view.is_empty())
         malformed_duplicate = bytearray(duplicate)
         malformed_duplicate.extend(b"\x40\x01\x00")
-        metadata_view, valid = zmux.parse_stream_metadata_bytes_view(malformed_duplicate)
-        self.assertFalse(valid)
-        self.assertTrue(metadata_view.is_empty())
+        with self.assertRaises(ProtocolError):
+            zmux.parse_stream_metadata_bytes_view(malformed_duplicate)
 
         malformed_owned_payload = (
                 encode_varint(len(malformed_duplicate)) + bytes(malformed_duplicate)
@@ -1995,7 +1995,8 @@ class PackageSurfaceTest(unittest.TestCase):
         self.assertEqual(zmux.parse_diag_reason(duplicate_diag), "")
         malformed_duplicate_diag = bytearray(duplicate_diag)
         malformed_duplicate_diag.extend(b"\x40\x01\x00")
-        self.assertEqual(zmux.parse_diag_reason(malformed_duplicate_diag), "")
+        with self.assertRaises(ProtocolError):
+            zmux.parse_diag_reason(malformed_duplicate_diag)
 
         invalid_utf8 = bytearray()
         append_tlv(invalid_utf8, 1, b"\xff")

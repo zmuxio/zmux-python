@@ -22,6 +22,8 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Typing :: Typed",
     "Topic :: Internet",
     "Topic :: Software Development :: Libraries",
@@ -29,6 +31,9 @@ classifiers = [
 
 [project.optional-dependencies]
 aioquic = ["zmuxio-aioquic>=0.1.0"]
+# Lets tests/test_zmux_aioquic_loopback.py and the gated Go QUIC interop test
+# run instead of skipping (the adapter itself is imported from packages/).
+test = ["aioquic>=1.0", "cryptography"]
 
 [project.urls]
 Homepage = "https://github.com/zmuxio/zmux-python"

@@ -7,8 +7,9 @@ from typing import Optional
 
 import zmux
 from zmux.config import OpenOptions
-from zmux.errors import OpenMetadataTooLarge
+from zmux.errors import ErrorScope, OpenMetadataTooLarge, ProtocolError
 from zmux.payload import StreamMetadata, parse_stream_metadata_bytes_view
+from zmux.protocol import MAX_VARINT62
 from zmux.varint import encoded_len_from_first, parse_varint
 from ._constants import (
     DEFAULT_ACCEPTED_PRELUDE_READ_TIMEOUT,
@@ -55,13 +56,30 @@ def build_stream_prelude(options: Optional[OpenOptions] = None) -> bytes:
     """Build the QUIC stream adapter prelude for open-time metadata."""
 
     options = _normalize_open_options(options)
-    prefix = zmux.build_open_metadata_prefix(
-        OPEN_METADATA_CAPABILITIES,
-        options.initial_priority,
-        _normalize_stream_group(options.initial_group),
-        options.open_info,
-        STREAM_PRELUDE_MAX_PAYLOAD,
-    )
+    group = _normalize_stream_group(options.initial_group)
+    try:
+        prefix = zmux.build_open_metadata_prefix(
+            OPEN_METADATA_CAPABILITIES,
+            options.initial_priority,
+            group,
+            options.open_info,
+            STREAM_PRELUDE_MAX_PAYLOAD,
+        )
+    except OpenMetadataTooLarge:
+        raise
+    except ProtocolError as exc:
+        # The codec reports an oversized prefix as a generic open error.
+        # Rebuilding without the cap re-raises any other failure unchanged.
+        unbounded = zmux.build_open_metadata_prefix(
+            OPEN_METADATA_CAPABILITIES,
+            options.initial_priority,
+            group,
+            options.open_info,
+            MAX_VARINT62,
+        )
+        if len(unbounded) <= STREAM_PRELUDE_MAX_PAYLOAD:
+            raise
+        raise OpenMetadataTooLarge(scope=ErrorScope.STREAM) from exc
     return prefix if prefix else EMPTY_STREAM_PRELUDE
 
 

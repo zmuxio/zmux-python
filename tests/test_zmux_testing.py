@@ -366,7 +366,7 @@ class ZmuxTestingSurfaceTest(unittest.TestCase):
 
     def test_fixture_loader_locates_reads_caches_and_clones_json_values(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             fixtures = root / "testdata" / "fixtures"
             fixtures.mkdir(parents=True)
             (fixtures / "wire_valid.ndjson").write_text(
@@ -439,7 +439,7 @@ class ZmuxTestingSurfaceTest(unittest.TestCase):
 
     def test_fixture_loader_accepts_spec_layout_and_env_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             fixtures = root / "fixtures"
             fixtures.mkdir(parents=True)
             (fixtures / "wire_valid.ndjson").write_text('{"id":"one"}\n', encoding="utf-8")

@@ -17,6 +17,9 @@ from zmux.errors import (
     ReadClosed,
     ReadTimeout,
     SessionClosed,
+    TerminationKind,
+    WriteClosed,
+    WriteTimeout,
     ZmuxError,
 )
 from zmux.protocol import ErrorCode
@@ -56,7 +59,36 @@ def translate_read_error(error: BaseException) -> BaseException:
 def translate_write_error(error: BaseException) -> BaseException:
     if isinstance(error, ZmuxError):
         return error
+    if isinstance(error, asyncio.TimeoutError):
+        return WriteTimeout()
+    if isinstance(error, AssertionError) and "after reset" in str(error):
+        # aioquic resets the send half itself when the peer sends STOP_SENDING
+        # and then asserts on later writes; the session is still alive.
+        return WriteClosed(
+            source=ErrorSource.REMOTE,
+            termination_kind=TerminationKind.STOPPED,
+        )
     return translate_error(error)
+
+
+def _with_characters_written(error: BaseException, written: int) -> BaseException:
+    """Return ``error`` carrying ``characters_written`` like ``BlockingIOError``.
+
+    Native zmux sessions report bytes a failed write already handed to the
+    send path the same way.  Stored stream errors are raised to later callers
+    too, so the count is set on a shallow copy; the original is not modified.
+    """
+
+    if written <= 0:
+        return error
+    try:
+        annotated = error.__class__.__new__(error.__class__)
+        annotated.__dict__.update(error.__dict__)
+        annotated.args = error.args
+        annotated.characters_written = written
+    except (AttributeError, TypeError):
+        return error
+    return annotated.with_traceback(error.__traceback__)
 
 
 def _translate_wait_error(error: BaseException) -> Optional[BaseException]:

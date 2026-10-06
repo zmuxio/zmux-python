@@ -530,6 +530,55 @@ class TransportTest(unittest.TestCase):
         with self.assertRaisesRegex(OSError, "invalid progress"):
             zmux.BasicDuplexTransport(BytesIO(), BoolVectoredHalf()).write_vectored((b"x",))
 
+    def test_write_half_none_result_is_no_progress(self):
+        # A bare write() returning None (io.RawIOBase "would block") accepted
+        # nothing; it must not be reported as a complete write.
+        class NoneWriteHalf(object):
+            def __init__(self):
+                self.calls = 0
+
+            def write(self, data):
+                del data
+                self.calls += 1
+                return None
+
+        class PartialThenNoneHalf(object):
+            def __init__(self):
+                self.data = bytearray()
+
+            def write(self, data):
+                if self.data:
+                    return None
+                self.data.extend(memoryview(data)[:1])
+                return 1
+
+        none_half = NoneWriteHalf()
+        joined = zmux.join(RecordingReadHalf(), none_half)
+        with self.assertRaises(BlockingIOError):
+            joined.write_all(b"abc")
+        with self.assertRaises(BlockingIOError):
+            joined.write(b"abc")
+        self.assertEqual(none_half.calls, 2)
+
+        partial_half = PartialThenNoneHalf()
+        with self.assertRaises(BlockingIOError):
+            zmux.join(RecordingReadHalf(), partial_half).write_all(b"abc")
+        self.assertEqual(partial_half.data, bytearray(b"a"))
+
+        with self.assertRaises(BlockingIOError):
+            zmux.BasicDuplexTransport(BytesIO(), NoneWriteHalf()).write_all(b"x")
+
+    def test_vectored_write_half_none_result_is_no_progress(self):
+        class NoneVectoredHalf(object):
+            def write_vectored(self, parts):
+                del parts
+                return None
+
+        with self.assertRaises(BlockingIOError):
+            zmux.join(RecordingReadHalf(), NoneVectoredHalf()).write_vectored((b"a", b"bc"))
+        with self.assertRaises(BlockingIOError):
+            zmux.BasicDuplexTransport(BytesIO(), NoneVectoredHalf()).write_vectored((b"x",))
+
     def test_joined_transport_resume_replays_latest_read_deadline(self):
         joined = zmux.JoinedTransport(RecordingReadHalf(), None)
         paused = joined.pause_read()

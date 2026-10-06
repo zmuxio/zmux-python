@@ -184,22 +184,34 @@ def parse_priority_update_payload(payload: bytes) -> tuple[StreamMetadata, bool]
 
 
 def parse_priority_update_metadata(payload: bytes) -> tuple[StreamMetadata, bool]:
-    """Parse PRIORITY_UPDATE metadata TLVs after the subtype."""
+    """Parse PRIORITY_UPDATE metadata TLVs after the subtype.
+
+    A duplicate singleton drops the whole update, but only once the rest of
+    the TLV sequence parsed: a structural error anywhere in it still makes
+    the frame malformed (SPEC section 7.2).
+    """
 
     priority = None
     group = None
     seen = 0
+    invalid = False
     for tlv in iter_tlvs_view(payload):
+        if invalid:
+            continue
         if tlv.typ == METADATA_STREAM_PRIORITY:
             if seen & _SEEN_METADATA_PRIORITY:
-                return StreamMetadata(), False
+                invalid = True
+                continue
             seen |= _SEEN_METADATA_PRIORITY
             priority = parse_metadata_varint(tlv.value)
         elif tlv.typ == METADATA_STREAM_GROUP:
             if seen & _SEEN_METADATA_GROUP:
-                return StreamMetadata(), False
+                invalid = True
+                continue
             seen |= _SEEN_METADATA_GROUP
             group = parse_metadata_varint(tlv.value)
+    if invalid:
+        return StreamMetadata(), False
     return StreamMetadata(priority, group), True
 
 
@@ -318,17 +330,25 @@ def parse_stream_metadata_tlvs_view(
 
 
 def parse_stream_metadata_bytes_view(payload: bytes) -> tuple[StreamMetadataView, bool]:
-    """Parse encoded stream metadata TLVs lazily and retain value views."""
+    """Parse encoded stream metadata TLVs lazily and retain value views.
+
+    Like ``parse_priority_update_metadata``, a duplicate singleton only
+    invalidates the block after the whole TLV sequence parsed structurally.
+    """
 
     priority = None
     group = None
     open_info = memoryview(b"")
     seen = 0
+    invalid = False
     for tlv in iter_tlvs_view(payload):
+        if invalid:
+            continue
         seen_bit = _metadata_singleton_seen_bit(tlv.typ)
         if seen_bit:
             if seen & seen_bit:
-                return StreamMetadataView(), False
+                invalid = True
+                continue
             seen |= seen_bit
 
         if tlv.typ == METADATA_STREAM_PRIORITY:
@@ -337,6 +357,8 @@ def parse_stream_metadata_bytes_view(payload: bytes) -> tuple[StreamMetadataView
             group = parse_metadata_varint(tlv.value)
         elif tlv.typ == METADATA_OPEN_INFO:
             open_info = tlv.value
+    if invalid:
+        return StreamMetadataView(), False
     return StreamMetadataView(priority, group, open_info), True
 
 
@@ -446,16 +468,19 @@ def parse_error_payload(payload: bytes) -> tuple[int, str]:
 def parse_diag_reason(payload: bytes) -> str:
     seen = 0
     debug_text = None
+    duplicate = False
     for tlv in iter_tlvs_view(payload):
         seen_bit = _diag_singleton_seen_bit(tlv.typ)
-        if not seen_bit:
+        if duplicate or not seen_bit:
+            # Keep walking: structural errors after a duplicate still count.
             continue
         if seen & seen_bit:
-            return ""
+            duplicate = True
+            continue
         seen |= seen_bit
         if tlv.typ == DIAG_DEBUG_TEXT:
             debug_text = tlv.value.tobytes()
-    if not debug_text:
+    if duplicate or not debug_text:
         return ""
     try:
         return debug_text.decode("utf-8")

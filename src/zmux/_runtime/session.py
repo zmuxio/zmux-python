@@ -54,6 +54,7 @@ from .keepalive import (
     rate_bytes_per_second,
     send_rate_sample,
     saturating_duration_mul_add,
+    session_liveness_seed,
 )
 from .read_loop import (
     ReadLoopAbuseConfig,
@@ -125,7 +126,10 @@ from ..config import (
 )
 from ..errors import (
     ApplicationError,
+    FlowControlError,
+    FrameSizeError,
     OpenExpired,
+    ProtocolError,
     SessionClosed,
     error_code,
     error_reason,
@@ -427,8 +431,20 @@ def close_mapped_application_error(err: BaseException) -> ApplicationError:
         return err.clone()
     code = error_code(err)
     if code is None:
-        code = int(ErrorCode.INTERNAL)
+        code = _uncoded_close_code(err)
     return ApplicationError(code, error_reason(err) or str(err))
+
+
+def _uncoded_close_code(err: BaseException) -> int:
+    # Bare protocol exception classes carry no numeric code; map them by class
+    # so fatal CLOSE frames still report the session error domain.
+    if isinstance(err, FlowControlError):
+        return int(ErrorCode.FLOW_CONTROL)
+    if isinstance(err, FrameSizeError):
+        return int(ErrorCode.FRAME_SIZE)
+    if isinstance(err, ProtocolError):
+        return int(ErrorCode.PROTOCOL)
+    return int(ErrorCode.INTERNAL)
 
 
 def establishment_close_max_payload(local: Preface, peer: Optional[Preface]) -> int:
@@ -922,12 +938,10 @@ class LivenessState(object):
             keepalive_interval=policy.keepalive_interval,
             keepalive_max_ping_interval=policy.keepalive_max_ping_interval,
             keepalive_timeout=policy.keepalive_timeout,
-            keepalive_jitter_state=init_keepalive_jitter_state(
-                local.tie_breaker_nonce ^ peer.tie_breaker_nonce
-            ),
-            ping_nonce_state=init_session_nonce_state(
-                (local.tie_breaker_nonce << 1) ^ peer.tie_breaker_nonce
-            ),
+            # Per-session random seeds, as in the native session (DESIGN
+            # D11): tie-breaker nonces are zero for explicit roles.
+            keepalive_jitter_state=init_keepalive_jitter_state(session_liveness_seed()),
+            ping_nonce_state=init_session_nonce_state(session_liveness_seed()),
             ping_padding=policy.ping_padding,
             ping_padding_min=policy.ping_padding_min_bytes,
             ping_padding_max=policy.ping_padding_max_bytes,

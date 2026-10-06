@@ -928,7 +928,7 @@ class Session(Protocol):
 
     @property
     def peer_go_away_error(self) -> Optional[ApplicationError]:
-        """Return the peer GOAWAY application error when present."""
+        """Return the latest peer GOAWAY cause (code 0 included), else None."""
         raise NotImplementedError
 
     @property

@@ -23,6 +23,8 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Typing :: Typed",
     "Topic :: Internet",
     "Topic :: Software Development :: Libraries",
@@ -31,6 +33,11 @@ dependencies = [
     "zmuxio>=0.1.0",
     "aioquic>=1.0",
 ]
+
+[project.optional-dependencies]
+# The real-QUIC loopback and Go interop tests also build a self-signed
+# certificate with cryptography (otherwise only an aioquic dependency).
+test = ["cryptography"]
 
 [project.urls]
 Homepage = "https://github.com/zmuxio/zmux-python"

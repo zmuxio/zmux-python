@@ -48,13 +48,41 @@ session = zmux_aioquic.wrap_session(connection, options)
 ```
 
 Incoming streams can be accepted directly when the wrapped connection exposes
-`accept_stream(...)` / `accept_uni_stream(...)`. When aioquic gives incoming
-streams to a callback, enqueue them explicitly:
+`accept_stream(...)` / `accept_uni_stream(...)`. aioquic instead hands every
+peer-opened stream, unidirectional ones included, to the protocol's
+synchronous `stream_handler(reader, writer)` callback. Wrap the protocol when it
+is created and enqueue streams from that callback:
 
 ```python
-async def stream_handler(reader, writer) -> None:
-    session.queue_incoming_stream(reader, writer)
+from aioquic.asyncio import connect
+from aioquic.asyncio.protocol import QuicConnectionProtocol
+
+
+class ZmuxProtocol(QuicConnectionProtocol):
+    def __init__(self, quic, stream_handler=None):
+        super().__init__(quic, stream_handler=self._handle_stream)
+        self.session = zmux_aioquic.wrap_session(self)
+
+    def _handle_stream(self, reader, writer) -> None:
+        self.session.queue_incoming_stream(reader, writer)
+
+
+async with connect(host, port, configuration=configuration,
+                   create_protocol=ZmuxProtocol) as protocol:
+    stream = await protocol.session.accept_stream()
 ```
+
+`queue_incoming_stream(reader, writer)` takes the QUIC stream ID from
+`writer.get_extra_info("stream_id")` and the stream direction from that ID, so
+peer unidirectional streams are delivered by `accept_uni_stream(...)`. Pass
+`stream_id` / `bidirectional` explicitly only for backends that cannot report
+them; a direction that contradicts the QUIC stream ID is rejected with
+`zmux.AdapterUnsupported`.
+
+When the wrapped object is an aioquic `QuicConnectionProtocol`, the session
+installs a per-instance `quic_event_received` wrapper so it can observe
+`StreamReset`, `StopSendingReceived`, and `ConnectionTerminated` events before
+aioquic's default handling.
 
 ## Stable API Coverage
 
@@ -119,14 +147,32 @@ zmux_aioquic.set_default_accepted_prelude_max_concurrent(16)
 - `OpenOptions` supports binary open info, initial priority, and initial group.
 - `open_info` and `metadata` expose decoded opener metadata on accepted
   streams.
+- Open-time metadata is validated before the QUIC stream is created, so an
+  oversized `open_info` fails with `zmux.OpenMetadataTooLarge` without using a
+  QUIC stream ID.
 - `update_metadata(...)` works only before the local stream prelude is emitted.
   Later updates fail with `PriorityUpdateUnavailable`.
-- `close_read()` maps to QUIC read-side cancellation with
+- `close_read()` maps to QUIC read-side cancellation (STOP_SENDING) with
   `ErrorCode.CANCELLED`.
 - `cancel_read(code)` maps to QUIC read-side cancellation with that code.
-- `close_write()` maps to QUIC send-side graceful close.
-- `cancel_write(code)` maps to QUIC send-side reset with that code.
+- `close_write()` maps to QUIC send-side graceful close and returns once the
+  FIN is queued.
+- `cancel_write(code)` maps to QUIC send-side reset (RESET_STREAM) with that
+  code.
 - `close_with_error(code, reason)` is best-effort at stream scope.
+- Stream resets and stops issued through aioquic's `QuicConnection` are
+  followed by `transmit()`, so they reach the peer without waiting for other
+  traffic.
+- An accepted stream whose adapter prelude is malformed, oversized, or not
+  received in time is never exposed; it is rejected with STOP_SENDING and, for
+  bidirectional streams, RESET_STREAM carrying `ErrorCode.PROTOCOL`.
+- After the peer FIN has been consumed, `read(...)` keeps returning `b""`.
+  Ordinary zero-length writes return `0` without observing write-side state.
+- Writes either hand all of their bytes to the QUIC stream or raise. When an
+  error (such as `zmux.WriteTimeout`) comes after part of the data was already
+  handed to the QUIC stream, the error carries that count as
+  `characters_written`, like native sessions and `BlockingIOError`, so a retry
+  can resume after those bytes.
 
 Fresh write-side reset or abort visibility is not a portable adapter guarantee
 because QUIC can discard previously written but unacknowledged stream data,
@@ -134,12 +180,21 @@ including a just-submitted metadata prelude.
 
 ## Errors
 
-- QUIC connection application closes are normalized to `zmux.ApplicationError`.
-- QUIC stream reset and cancellation codes are surfaced as application errors
-  where aioquic exposes the numeric code.
+- A peer RESET_STREAM(code) fails reads on that stream with
+  `zmux.ApplicationError(code)` (remote, reset). The local send half is not
+  affected.
+- A peer STOP_SENDING(code) fails later writes on that stream with
+  `zmux.ApplicationError(code)` (remote, stopped). aioquic itself answers the
+  stop with RESET_STREAM carrying `NO_ERROR`, not the peer's code.
+- A peer QUIC application close with a nonzero code or a reason fails the
+  session with `zmux.ApplicationError(code, reason)`, reported by `wait()`,
+  `close_error`, and `peer_close_error`. A peer close with code 0 and no reason
+  is a graceful close. Transport errors and idle timeouts fail the session
+  with `zmux.SessionClosed`.
+- When the connection ends, blocked accepts fail with `zmux.SessionClosed`,
+  reads on streams without a peer FIN fail with the session error instead of
+  returning EOF, and writes fail with the session error.
 - QUIC stream-limit failures are normalized to `zmux.OpenLimited`.
-- QUIC transport or connection closure is normalized into the stable ZMux error
-  surface.
 
 Use helpers such as `zmux.error_code(...)`, `zmux.open_limited(...)`,
 `zmux.adapter_unsupported(...)`, `zmux.priority_update_unavailable(...)`,

@@ -56,6 +56,7 @@ from .._state.stream_id import (
     validate_stream_id_for_role as _state_validate_stream_id_for_role,
 )
 from .._state.tombstone import LateDataCause
+from .._wire.frame import normalize_limits, read_session_frame, validate_frame_parts
 from .._wire.varint import encode_varint, parse_varint
 from ..config import (
     DEFAULT_ABUSE_WINDOW,
@@ -86,7 +87,7 @@ from ..errors import (
     FrameSizeError,
     ProtocolError,
 )
-from ..frame import Frame, read_frame, validate_frame
+from ..frame import Frame
 from ..payload import (
     GoAwayPayload,
     StreamMetadata,
@@ -557,8 +558,17 @@ class InboundBudgetTracker(object):
         return cls(ReadLoopAbuseConfig.from_config(config))
 
     def record_frame(self, frame: Frame, now: Optional[float] = None) -> None:
+        """Charge ``frame`` to the raw control/EXT/mixed rate budgets.
+
+        MAX_DATA and BLOCKED are not charged here: a limit increase, or a
+        BLOCKED that reports a new limit or releases credit, is flow-control
+        progress whose rate scales with DATA volume.  The session charges
+        them with ``record_control``/``record_mixed`` only when they turn out
+        to be no-ops.
+        """
+
         payload_len = len(frame.payload)
-        if frame.frame_type == FrameType.DATA:
+        if frame.frame_type in (FrameType.DATA, FrameType.MAX_DATA, FrameType.BLOCKED):
             return
         if frame.frame_type == FrameType.EXT:
             self.record_ext(payload_len, now)
@@ -764,7 +774,13 @@ class ReplenishDecision(object):
 
 @dataclass
 class LateDataTracker(object):
-    """Late-data discard caps and counters."""
+    """Late-data discard caps and counters.
+
+    Exceeding ``per_stream_cap`` is a peer violation.  The aggregate cap only
+    marks pressure (``aggregate_at_cap``): late bytes keep being discarded and
+    their session credit released, and the session never fails for it
+    (API_SEMANTICS section 3, DESIGN D2).
+    """
 
     aggregate_cap: int = 0
     per_stream_cap: int = 0
@@ -817,9 +833,11 @@ class LateDataTracker(object):
             )
         self.check_caps()
 
+    @property
+    def aggregate_at_cap(self) -> bool:
+        return bool(self.aggregate_cap) and self.aggregate_received >= self.aggregate_cap
+
     def check_caps(self) -> None:
-        if self.aggregate_cap and self.aggregate_received > self.aggregate_cap:
-            raise _remote_protocol_error("late-data cap exceeded")
         if self.per_stream_cap and self.per_stream_received > self.per_stream_cap:
             raise _remote_protocol_error("late-data cap exceeded")
 
@@ -980,7 +998,15 @@ class ReadLoopFrameDispatcher(object):
     def handle_frame(
             self, frame: Frame, now: Optional[float] = None
     ) -> ReadLoopDispatchResult:
-        validate_frame(frame, self.limits, inbound=True)
+        validate_frame_parts(
+            frame.frame_type,
+            frame.flags,
+            frame.stream_id,
+            frame.payload,
+            normalize_limits(self.limits),
+            True,
+            session=True,
+        )
         self.budgets.record_frame(frame, now)
         parsed = classify_inbound_frame(
             frame,
@@ -1091,13 +1117,17 @@ def classify_inbound_frame(
     if frame_type == FrameType.EXT:
         try:
             ext_type, consumed = parse_varint(frame.payload)
-        except FrameSizeError:
-            raise
         except ProtocolError as exc:
-            raise _frame_size_error("invalid EXT payload") from exc
+            # A payload too short for its ext_type is a session PROTOCOL
+            # error, not FRAME_SIZE (SPEC section 6.11).
+            raise _remote_protocol_error("invalid EXT payload: %s" % exc) from exc
         priority = None
         valid = True
+        # Without the capability PRIORITY_UPDATE is ignored unparsed (SPEC
+        # section 7.6); the session reader leaves its checks to this point.
         if ext_type == EXT_PRIORITY_UPDATE and capabilities & CAPABILITY_PRIORITY_UPDATE:
+            if frame.stream_id == 0:
+                raise _remote_protocol_error("PRIORITY_UPDATE requires non-zero stream_id")
             try:
                 priority, valid = parse_priority_update_payload(frame.payload)
             except FrameSizeError:
@@ -1126,7 +1156,7 @@ def read_loop_once(
 ) -> ReadLoopDispatchResult:
     """Read one frame from ``reader`` and dispatch generic read-loop behavior."""
 
-    frame = read_frame(reader, limits if limits is not None else dispatcher.limits)
+    frame = read_session_frame(reader, limits if limits is not None else dispatcher.limits)
     return dispatcher.handle_frame(frame)
 
 

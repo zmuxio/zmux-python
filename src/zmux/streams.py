@@ -136,7 +136,13 @@ class SendStream(StreamHandle, Protocol):
         raise NotImplementedError
 
     def write(self, data: ReadableBuffer, *, timeout: Optional[float] = None) -> int:
-        """Write bytes into the local zmux send path."""
+        """Write bytes into the local zmux send path.
+
+        Returns ``len(data)`` once every byte was queued.  An error raised
+        after part of ``data`` was queued (those bytes are still sent) carries
+        that count as ``characters_written``, like ``BlockingIOError``; the
+        other write methods report partial progress the same way.
+        """
 
     def write_all(
             self, data: ReadableBuffer, *, timeout: Optional[float] = None
@@ -307,7 +313,11 @@ class AsyncSendStream(AsyncStreamHandle, Protocol):
     async def write(
             self, data: ReadableBuffer, *, timeout: Optional[float] = None
     ) -> int:
-        """Write bytes into the local zmux send path."""
+        """Write bytes into the local zmux send path.
+
+        Partial progress before an error is reported as on ``SendStream.write``:
+        the error carries the count as ``characters_written``.
+        """
 
     async def write_all(
             self, data: ReadableBuffer, *, timeout: Optional[float] = None

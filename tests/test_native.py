@@ -11,6 +11,7 @@ from zmux._runtime.keepalive import (
     pong_payload_for_ping,
 )
 from zmux._runtime.read_loop import InboundBudgetTracker
+from zmux._runtime.session import RuntimePolicy
 from zmux._state.tombstone import TerminalBookkeepingState
 from zmux.native import Conn, _PendingPing
 
@@ -348,16 +349,9 @@ class NativeSessionTest(unittest.TestCase):
             stream.update_metadata(zmux.MetadataUpdate(priority=2))
 
     def test_native_write_waits_for_peer_max_data_credit(self):
-        settings = zmux.Settings(
-            initial_max_stream_data_bidi_locally_opened=0,
-            initial_max_stream_data_bidi_peer_opened=0,
-            initial_max_stream_data_uni=0,
-            initial_max_data=0,
-            max_frame_payload=16384,
-            max_control_payload_bytes=4096,
-            max_extension_payload_bytes=4096,
-        )
-        client, server = session_pair_with_config(zmux.Config(settings=settings))
+        # A raw peer that advertises no credit and never grants on its own (a
+        # Python receiver now grants a zero window on the opener's BLOCKED).
+        client, peer = _python_client_with_raw_server(_ZERO_WINDOW_SETTINGS)
         try:
             outbound = client.open_stream(zmux.OpenOptions(open_info=b"flow"))
             result = {}
@@ -370,22 +364,29 @@ class NativeSessionTest(unittest.TestCase):
 
             thread = threading.Thread(target=write_data, daemon=True)
             thread.start()
-            inbound = server.accept_stream(timeout=1.0)
+            # A session BLOCKED may overtake it, but the stream's first frame
+            # must be its opener, never a stream BLOCKED.
+            opener = peer.read_stream_frame(outbound.stream_id)
+            self.assertEqual(opener.frame_type, zmux.FrameType.DATA)
+            self.assertEqual(opener.stream_id, outbound.stream_id)
+            self.assertTrue(opener.flags & zmux.FRAME_FLAG_OPEN_METADATA)
             time.sleep(0.05)
             self.assertNotIn("written", result)
             self.assertNotIn("error", result)
 
-            server._send_frame(zmux.Frame(zmux.FrameType.MAX_DATA, 0, 0, zmux.encode_varint(3)))
-            server._send_frame(
-                zmux.Frame(zmux.FrameType.MAX_DATA, inbound.stream_id, 0, zmux.encode_varint(3))
+            peer.send_frame(zmux.Frame(zmux.FrameType.MAX_DATA, 0, 0, zmux.encode_varint(3)))
+            peer.send_frame(
+                zmux.Frame(zmux.FrameType.MAX_DATA, outbound.stream_id, 0, zmux.encode_varint(3))
             )
             thread.join(1.0)
             if "error" in result:
                 raise result["error"]
             self.assertEqual(result.get("written"), 3)
-            self.assertEqual(inbound.read_exact(3, timeout=1.0), b"abc")
+            data = peer.read_frame_of(zmux.FrameType.DATA)
+            self.assertEqual((data.stream_id, data.payload), (outbound.stream_id, b"abc"))
         finally:
-            close_pair(client, server)
+            client.close_with_error(int(zmux.ErrorCode.CANCELLED))
+            peer.close()
 
     def test_native_stop_sending_closes_writer(self):
         client, server = session_pair()
@@ -509,13 +510,7 @@ class NativeSessionTest(unittest.TestCase):
             close_pair(client, server)
 
     def test_native_set_write_deadline_wakes_blocked_write(self):
-        settings = zmux.Settings(
-            initial_max_stream_data_bidi_locally_opened=0,
-            initial_max_stream_data_bidi_peer_opened=0,
-            initial_max_stream_data_uni=0,
-            initial_max_data=0,
-        )
-        client, server = session_pair_with_config(zmux.Config(settings=settings))
+        client, peer = _python_client_with_raw_server(_ZERO_WINDOW_SETTINGS)
         try:
             outbound = client.open_stream(timeout=1.0)
             result = {}
@@ -535,7 +530,8 @@ class NativeSessionTest(unittest.TestCase):
             self.assertIsInstance(result.get("error"), zmux.WriteTimeout)
             self.assertNotIn("done", result)
         finally:
-            close_pair(client, server)
+            client.close_with_error(int(zmux.ErrorCode.CANCELLED))
+            peer.close()
 
     def test_ping_uses_native_session_not_adapter(self):
         client, server = session_pair()
@@ -626,7 +622,8 @@ class NativeSessionTest(unittest.TestCase):
 
         conn._handle_pong(b"12345678")
         with self.assertRaises(zmux.ProtocolError):
-            conn._handle_blocked()
+            # A limit that was never advertised reports no progress.
+            conn._handle_blocked(0, conn._recv_session_advertised + 1)
 
         client, server = session_pair_with_config(zmux.Config(no_op_zero_data_budget=1))
         try:
@@ -688,8 +685,18 @@ class NativeSessionTest(unittest.TestCase):
                 client.stats.last_pong_at is not None
                 or server.stats.last_pong_at is not None
             )
-            self.assertFalse(client.stats.ping_outstanding)
-            self.assertFalse(server.stats.ping_outstanding)
+            # Idle keepalive keeps probing every 20 ms, so a fresh PING may
+            # be in flight at any instant: the PINGs must get answered.
+            outstanding = (True, True)
+            deadline = time.monotonic() + 1.0
+            while any(outstanding) and time.monotonic() < deadline:
+                outstanding = (
+                    client.stats.ping_outstanding,
+                    server.stats.ping_outstanding,
+                )
+                if any(outstanding):
+                    time.sleep(0.002)
+            self.assertEqual(outstanding, (False, False))
         finally:
             close_pair(client, server)
 
@@ -769,8 +776,9 @@ class NativeSessionTest(unittest.TestCase):
         )
         client, server = session_pair_with_config(config)
         try:
-            with self.assertRaisesRegex(zmux.ProtocolError, "max_data exceeded"):
+            with self.assertRaisesRegex(zmux.FlowControlError, "session max_data exceeded") as raised:
                 server._dispatch_frame(zmux.Frame(zmux.FrameType.DATA, 4, 0, b"12345"))
+            self.assertEqual(raised.exception.code, int(zmux.ErrorCode.FLOW_CONTROL))
         finally:
             close_pair(client, server)
 
@@ -826,7 +834,10 @@ class NativeSessionTest(unittest.TestCase):
         finally:
             close_pair(client, server)
 
-    def test_native_late_data_on_terminal_stream_is_capped(self):
+    def test_native_late_data_over_aggregate_cap_is_discarded_without_failing(self):
+        # The aggregate late-data cap only bounds retained accounting:
+        # exceeding it discards and releases credit, it never fails the
+        # session (DESIGN D2; this test used to expect ProtocolError).
         config = zmux.Config(aggregate_late_data_cap=3)
         client, server = session_pair_with_config(config)
         try:
@@ -843,11 +854,13 @@ class NativeSessionTest(unittest.TestCase):
             while inbound.stream_id in server._streams and time.monotonic() < deadline:
                 time.sleep(0.01)
 
-            with self.assertRaises(zmux.ProtocolError):
-                server._dispatch_frame(
-                    zmux.Frame(zmux.FrameType.DATA, inbound.stream_id, 0, b"late")
-                )
-            self.assertEqual(server.stats.pressure.aggregate_late_data_bytes, 4)
+            server._dispatch_frame(
+                zmux.Frame(zmux.FrameType.DATA, inbound.stream_id, 0, b"late")
+            )
+            pressure = server.stats.pressure
+            self.assertEqual(pressure.aggregate_late_data_bytes, 4)
+            self.assertTrue(pressure.aggregate_late_data_at_cap)
+            self.assertFalse(server.closed)
         finally:
             close_pair(client, server)
 
@@ -1069,9 +1082,85 @@ class _DispatchConn(Conn):
         self._read_idle_ping_due_at = None
         self._write_idle_ping_due_at = None
         self._max_ping_due_at = None
+        self._state = zmux.SessionState.READY
+        self._streams = {}
+        self._runtime_policy = RuntimePolicy.from_config(
+            self._config,
+            self._local_preface,
+            self._peer_preface,
+            self._negotiated,
+        )
+        self._recv_session_received = 0
+        self._recv_session_advertised = self._local_preface.settings.initial_max_data
+        self._recv_session_buffered = 0
+        self._recv_session_pending = 0
+        self._peer_session_blocked_at = -1
+        self._peer_session_blocked_floor = 0
+        self._queued_data_bytes = 0
 
     def _send_frame(self, frame):
         self.sent.append(frame)
+
+    def _queue_frame(self, frame, **_kwargs):
+        self.sent.append(frame)
+
+
+_ZERO_WINDOW_SETTINGS = zmux.Settings(
+    initial_max_stream_data_bidi_locally_opened=0,
+    initial_max_stream_data_bidi_peer_opened=0,
+    initial_max_stream_data_uni=0,
+    initial_max_data=0,
+)
+
+
+class _RawPeer(object):
+    """Hand-driven zmux endpoint that only does what a test tells it to."""
+
+    def __init__(self, sock):
+        self.socket = sock
+        self.socket.settimeout(2.0)
+
+    def read(self, max_bytes):
+        return self.socket.recv(max_bytes)
+
+    def read_frame(self):
+        return zmux.read_frame(self)
+
+    def read_stream_frame(self, stream_id):
+        while True:
+            frame = self.read_frame()
+            if frame.stream_id == stream_id:
+                return frame
+
+    def read_frame_of(self, frame_type):
+        while True:
+            frame = self.read_frame()
+            if frame.frame_type == frame_type:
+                return frame
+
+    def send_frame(self, frame):
+        self.socket.sendall(frame.marshal())
+
+    def close(self):
+        try:
+            self.socket.close()
+        except OSError:
+            pass
+
+
+def _python_client_with_raw_server(settings):
+    left, right = socket.socketpair()
+    peer = _RawPeer(right)
+    config = zmux.Config(
+        role=zmux.Role.RESPONDER,
+        settings=settings,
+        preface_padding=False,
+        ping_padding=False,
+    )
+    peer.socket.sendall(config.local_preface_payload())
+    client = zmux.client(left, zmux.Config(keepalive_interval=None))
+    zmux.read_preface(peer)
+    return client, peer
 
 
 if __name__ == "__main__":

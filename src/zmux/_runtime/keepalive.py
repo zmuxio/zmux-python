@@ -8,6 +8,7 @@ paths advance the same SplitMix64-style state without depending on session I/O.
 from __future__ import annotations
 
 import math
+import secrets
 import sys
 from dataclasses import dataclass
 from struct import pack_into
@@ -19,7 +20,12 @@ from .._validation import (
     require_bool as _shared_require_bool,
     require_nonnegative_duration as _duration_seconds,
 )
-from ..config import DEFAULT_PING_PADDING_MAX_BYTES, DEFAULT_PING_PADDING_MIN_BYTES, Settings
+from ..config import (
+    DEFAULT_PING_PADDING_MAX_BYTES,
+    DEFAULT_PING_PADDING_MIN_BYTES,
+    Settings,
+    random_varint62,
+)
 
 KEEPALIVE_JITTER_GAMMA = 0x9E3779B97F4A7C15
 SPLITMIX64_MUL1 = 0xBF58476D1CE4E5B9
@@ -39,7 +45,9 @@ _NANOS_PER_SECOND = 1_000_000_000
 _MAX_DURATION_SECONDS = ((1 << 63) - 1) / _NANOS_PER_SECOND
 _PING_BLOCK_BYTES = 8
 
-_seed_counter = 0
+# Last-resort fallback only (sessions draw seeds with session_liveness_seed);
+# it starts at a random offset so it is not the same sequence in every process.
+_seed_counter = secrets.randbits(64)
 _seed_lock = Lock()
 
 
@@ -53,9 +61,9 @@ def splitmix64_from_state(state: int) -> int:
 
 def init_keepalive_jitter_state(seed: int) -> int:
     """Preserve explicit non-zero seeds and allocate distinct default seeds."""
+    global _seed_counter
     seed = _uint64(seed, "seed")
-    if seed == 0:
-        global _seed_counter
+    while seed == 0:
         with _seed_lock:
             _seed_counter = (_seed_counter + KEEPALIVE_JITTER_GAMMA) & MAX_UINT64
             seed = _seed_counter
@@ -64,6 +72,22 @@ def init_keepalive_jitter_state(seed: int) -> int:
 
 def init_session_nonce_state(seed: int) -> int:
     return init_keepalive_jitter_state(seed)
+
+
+def session_liveness_seed(nonce_source: Any = None) -> int:
+    """Return a fresh non-zero seed for one session's jitter or PING state.
+
+    Drawn from the configured nonce source, falling back to the CSPRNG, so
+    independent sessions (also across processes) never share keepalive jitter
+    or PING tokens.  Preface tie-breaker nonces are not used: they are zero for
+    explicit roles and visible on the wire otherwise.
+    """
+    try:
+        seed = random_varint62(nonce_source)
+    except Exception:
+        # A failing configured source falls back to the CSPRNG, like Go.
+        seed = secrets.randbits(64)
+    return seed or init_keepalive_jitter_state(0)
 
 
 def next_keepalive_jitter_value_from_state(state: int) -> tuple[int, int]:
@@ -573,5 +597,6 @@ __all__ = (
     "rate_bytes_per_second",
     "send_rate_sample",
     "saturating_duration_mul_add",
+    "session_liveness_seed",
     "splitmix64_from_state",
 )

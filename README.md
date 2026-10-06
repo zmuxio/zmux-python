@@ -121,7 +121,13 @@ stream.update_metadata(zmux.MetadataUpdate(priority=3))
 ```
 
 If metadata cannot be represented by the current backend, implementations raise
-`zmux.PriorityUpdateUnavailable` or `zmux.AdapterUnsupported`.
+`zmux.PriorityUpdateUnavailable` or `zmux.AdapterUnsupported`. Opener metadata
+the session cannot carry (`open_info` without negotiated open metadata, or a
+prefix larger than the peer's `max_frame_payload`) makes `open_stream()` raise
+`zmux.OpenInfoUnavailable` or `zmux.OpenMetadataTooLarge` without using a
+stream ID. An update made while the stream's first write is in progress waits
+for that write (bounded by the write deadline) and then goes out as a priority
+update. Stream group `0` means "no explicit group" and is reported as `None`.
 
 ## Transports
 
@@ -134,6 +140,12 @@ class SyncByteStream(object):
     def write_all(self, data: bytes) -> None: ...
     def close(self) -> None: ...
 ```
+
+A transport passed to `zmux.client()`/`zmux.server()` without `write_all()` or
+`sendall()` is driven through `write()`, which must return the number of bytes
+written, as `io.RawIOBase.write()` does; short writes are retried. `None` means
+nothing was written (a non-blocking raw stream) and fails the session with
+`zmux.TransportError` rather than being taken as a full write.
 
 When a transport exposes read and write halves separately, join them:
 
@@ -158,6 +170,40 @@ session.close()
 session.close_with_error(0x100, "bye")
 session.wait()
 ```
+
+`stream.close()` sends DATA|FIN if the send half is still open (falling back to
+`RESET(CANCELLED)` when the FIN cannot be queued before the write deadline) and
+STOP_SENDING if the read half is still open; halves the peer already finished
+or reset are not an error. A repeated `close_with_error()` is a no-op, while
+`close_write()` on a finished, reset or aborted send half raises. Once a peer
+RESET or ABORT, a local abort, or session termination is visible, unread bytes
+are dropped and reads raise that error with its code. DATA the peer already
+had in flight when `close_read()` or `close_with_error()` took effect is
+discarded with its session credit returned, up to the stream credit that was
+still outstanding, and never fails the session; a stopped read half that gets
+more than that is aborted with `FLOW_CONTROL`. A read returns EOF only
+after the peer's FIN: when a session ends (even with `NO_ERROR`) before the peer
+finished a stream, its reads raise the session error instead.
+
+`session.close()` stops admitting local opens at once (they raise
+`SessionClosed`), fails opened-but-never-written streams with
+`REFUSED_STREAM`, and then waits only for streams with local send work still
+outstanding; unaccepted or unread peer streams do not delay it.
+
+On native sessions, `session.go_away(bidi, uni)` never lets the advertised
+watermarks increase: a request an earlier GOAWAY already covers returns
+without sending, and watermarks that are invalid or would increase raise a
+local `ProtocolError`. `session.peer_go_away_error` reports the latest peer
+GOAWAY cause, including code 0 with its reason. At most one locally originated
+PING is outstanding; `ping()` waits (within its timeout) while another PING is
+in flight, and an echo that does not fit both sides' control-payload limits
+raises `FrameSizeError`.
+
+Native stream writes either queue all of their bytes or raise. When an error
+(such as `WriteTimeout`) comes after part of the data was already queued,
+those bytes are still sent and the error carries their count as
+`characters_written`, like `BlockingIOError`, so a retry can resume after them.
+`zmuxio-aioquic` streams report partial writes the same way.
 
 Use error helpers instead of matching exception text:
 
@@ -184,6 +230,17 @@ Common helpers include `session_closed`, `read_closed`, `write_closed`,
 from `zmux.default_config()` when an implementation accepts a config object.
 Use `zmux.configure_default_config(...)` during process startup to adjust the
 process-wide default template.
+
+`Config.establishment_timeout` bounds session establishment: the local preface
+is written while the peer preface is read, and both must finish within the
+bound. It defaults to `zmux.DEFAULT_ESTABLISHMENT_TIMEOUT` (10 seconds); `None`
+or `0` select the default and `math.inf` disables it. A stalled establishment
+fails with an `INTERNAL`-coded error.
+
+Native sessions hand every outbound frame to one writer thread, so stream
+write timeouts, `ping(timeout=...)`, `close()` and keepalive stay bounded even
+when the peer stops reading. A stream write that times out may already have
+queued part of its data; that part is still delivered in order.
 
 The public codec helpers are available for diagnostics, proxies, and
 conformance tests:

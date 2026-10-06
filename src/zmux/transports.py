@@ -1268,7 +1268,9 @@ def _write_to_half(half: object, data: ReadableBuffer) -> None:
     while offset < total:
         n = method(view[offset:])
         if n is None:
-            return
+            # io.RawIOBase semantics: None means a non-blocking half accepted
+            # nothing.  Treating it as a full write would silently drop bytes.
+            raise BlockingIOError("zmux: write returned no progress")
         if isinstance(n, bool) or not isinstance(n, int):
             raise OSError("zmux: write reported invalid progress")
         if n <= 0 or n > total - offset:
@@ -1305,7 +1307,9 @@ def _write_vectored_views_to_half(half: object, vectors: Tuple[memoryview, ...])
         except socket.timeout as exc:
             raise WriteTimeout() from exc
         if written is None:
-            return total
+            # Same as _write_to_half: None means nothing was accepted, so it
+            # must not be reported as a complete write.
+            raise BlockingIOError("zmux: vectored write returned no progress")
         if isinstance(written, bool) or not isinstance(written, int):
             raise OSError("zmux: vectored write reported invalid progress")
         if written < 0 or written > total:

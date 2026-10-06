@@ -13,6 +13,9 @@ from zmux.errors import (
     AdapterUnsupported,
     ApplicationError,
     EmptyMetadataUpdate,
+    ErrorDirection,
+    ErrorOperation,
+    ErrorScope,
     ErrorSource,
     PriorityUpdateUnavailable,
     ReadClosed,
@@ -27,7 +30,7 @@ from zmux.errors import (
 from zmux.payload import MetadataUpdate, StreamMetadata
 from zmux.protocol import ErrorCode
 from ._constants import EMPTY_STREAM_PRELUDE, WRITEV_COALESCE_MAX_BYTES
-from ._errors import translate_read_error, translate_write_error
+from ._errors import _with_characters_written, translate_read_error, translate_write_error
 from ._io import (
     _await_with_timeout,
     _cancel_read,
@@ -36,6 +39,7 @@ from ._io import (
     _operation_timeout,
     _read_some,
     _remaining_timeout,
+    _retire_writer,
     _write_all,
 )
 from ._prelude import AcceptedStreamMetadata, build_stream_prelude
@@ -77,6 +81,7 @@ class _StreamBase(object):
             active_kind: "_ActiveKind",
             options: Optional[OpenOptions] = None,
             accepted_metadata: Optional[AcceptedStreamMetadata] = None,
+            prelude: Optional[bytes] = None,
     ) -> None:
         self._session = session
         self._reader = reader
@@ -91,6 +96,8 @@ class _StreamBase(object):
         self._write_operation_lock = asyncio.Lock()
         self._read_closed = reader is None
         self._write_closed = writer is None
+        # Set once the peer's FIN has been consumed; reads keep returning EOF.
+        self._read_eof = False
         self._read_error: Optional[BaseException] = None
         self._write_error: Optional[BaseException] = None
         self._prelude_sent = not opened_locally
@@ -109,6 +116,10 @@ class _StreamBase(object):
                 options.open_info,
             )
             self._metadata_valid = True
+            if prelude is not None and self._has_peer_visible_open_metadata():
+                # Validated before the QUIC stream was created; reuse it as-is.
+                self._prelude = prelude
+                self._prelude_frozen = True
         else:
             meta = accepted_metadata or AcceptedStreamMetadata()
             self._options = OpenOptions()
@@ -188,6 +199,14 @@ class _StreamBase(object):
         self._write_deadline = _deadline_from_timeout(timeout, "write timeout")
 
     async def close(self) -> None:
+        if self._session.closed:
+            # Nothing can reach the peer once the session has ended; ordinary
+            # close only releases local stream state.
+            self._read_closed = True
+            self._write_closed = True
+            _retire_writer(self._writer)
+            self._maybe_finish_active()
+            return
         error: Optional[BaseException] = None
         if self._writer is not None and not self._write_closed:
             try:
@@ -250,8 +269,12 @@ class _StreamBase(object):
     async def read(
             self, max_bytes: int = -1, *, timeout: Optional[float] = None
     ) -> bytes:
-        self._require_readable()
         max_bytes = _read_size(max_bytes)
+        if self._read_eof:
+            return b""
+        self._require_readable()
+        if max_bytes == 0:
+            return b""
         start = time.monotonic()
         timeout = _operation_timeout(
             start, timeout, _remaining_deadline(self._read_deadline, self._deadline)
@@ -266,6 +289,7 @@ class _StreamBase(object):
             raise translated
         if data == b"":
             self._read_closed = True
+            self._read_eof = True
             self._read_error = ReadClosed(
                 source=ErrorSource.REMOTE,
                 termination_kind=TerminationKind.GRACEFUL,
@@ -371,6 +395,8 @@ class _StreamBase(object):
             self, data: object, *, timeout: Optional[float] = None
     ) -> int:
         view = _memoryview(data)
+        if len(view) == 0:
+            return self._zero_length_write()
         start = time.monotonic()
         await self._acquire_write_operation(start, timeout)
         try:
@@ -382,8 +408,6 @@ class _StreamBase(object):
             self, view: memoryview, start: float, timeout: Optional[float]
     ) -> int:
         self._require_writable()
-        if len(view) == 0:
-            return 0
         await self._ensure_open_prelude(timeout=self._remaining_write_timeout(start, timeout))
         self._require_writable()
         await self._write_view(view, timeout=_remaining_timeout(start, timeout))
@@ -399,6 +423,8 @@ class _StreamBase(object):
             self, parts: Iterable[object], *, timeout: Optional[float] = None
     ) -> int:
         views, total = _memoryviews(parts)
+        if total == 0:
+            return self._zero_length_write()
         start = time.monotonic()
         await self._acquire_write_operation(start, timeout)
         try:
@@ -414,8 +440,6 @@ class _StreamBase(object):
             timeout: Optional[float],
     ) -> int:
         self._require_writable()
-        if total == 0:
-            return 0
         await self._ensure_open_prelude(timeout=self._remaining_write_timeout(start, timeout))
         self._require_writable()
         if total <= WRITEV_COALESCE_MAX_BYTES:
@@ -498,7 +522,7 @@ class _StreamBase(object):
         await self._ensure_open_prelude(timeout=self._remaining_write_timeout(start, timeout))
         async with self._lock:
             if self._write_closed:
-                raise WriteClosed()
+                raise self._write_error or WriteClosed()
             self._write_closed = True
         try:
             timeout = _operation_timeout(
@@ -651,6 +675,12 @@ class _StreamBase(object):
             self, views: Tuple[memoryview, ...], *, timeout: Optional[float] = None
     ) -> None:
         start = time.monotonic()
+        written = 0
+
+        def advance(n: int) -> None:
+            nonlocal written
+            written += n
+
         try:
             async with self._write_lock:
                 for view in views:
@@ -659,13 +689,21 @@ class _StreamBase(object):
                         timeout,
                         _remaining_deadline(self._write_deadline, self._deadline),
                     )
-                    await _write_all(self._writer, view, remaining)
+                    await _write_all(self._writer, view, remaining, progress=advance)
         except asyncio.TimeoutError:
-            raise WriteTimeout()
+            raise self._partial_write_error(WriteTimeout(), written)
         except Exception as exc:
             translated = translate_write_error(exc)
             self._store_write_error(translated)
-            raise translated
+            raise self._partial_write_error(translated, written)
+
+    def _partial_write_error(self, error: BaseException, written: int) -> BaseException:
+        # Bytes the writer already accepted are still sent: count them and
+        # report them as characters_written, like native sessions, so a retry
+        # resumes after them instead of duplicating them.
+        if written:
+            self._session.note_sent(written)
+        return _with_characters_written(error, written)
 
     def _store_read_error(self, error: BaseException) -> None:
         self._read_error = error
@@ -692,6 +730,34 @@ class _StreamBase(object):
             raise StreamNotWritable()
         if self._write_closed:
             raise self._write_error or WriteClosed()
+        error = self._session._terminated_error(ErrorOperation.WRITE)
+        if error is not None:
+            raise error
+
+    def _zero_length_write(self) -> int:
+        # An ordinary empty write is a local no-op: it neither emits the prelude
+        # nor observes write-side terminal state (API_SEMANTICS 4).
+        if self._writer is None:
+            raise StreamNotWritable()
+        return 0
+
+    def _note_peer_stop_sending(self, code: int) -> None:
+        """Record a peer STOP_SENDING for this stream's send half."""
+
+        if self._writer is None or self._write_closed:
+            return
+        self._write_closed = True
+        self._write_error = ApplicationError(
+            code,
+            scope=ErrorScope.STREAM,
+            operation=ErrorOperation.WRITE,
+            source=ErrorSource.REMOTE,
+            direction=ErrorDirection.WRITE,
+            termination_kind=TerminationKind.STOPPED,
+        )
+        # aioquic already reset the send half; a later FIN would be invalid.
+        _retire_writer(self._writer)
+        self._maybe_finish_active()
 
     def _maybe_finish_active(self) -> None:
         if self._active_finished:
@@ -712,6 +778,7 @@ class AioquicStream(_StreamBase):
             writer: object,
             stream_id: Optional[int],
             options: Optional[OpenOptions],
+            prelude: Optional[bytes] = None,
     ) -> "AioquicStream":
         return cls(
             session,
@@ -722,6 +789,7 @@ class AioquicStream(_StreamBase):
             True,
             _ActiveKind.LOCAL_BIDI,
             options=options,
+            prelude=prelude,
         )
 
     @classmethod
@@ -755,6 +823,7 @@ class AioquicSendStream(_StreamBase):
             writer: object,
             stream_id: Optional[int],
             options: Optional[OpenOptions],
+            prelude: Optional[bytes] = None,
     ) -> "AioquicSendStream":
         return cls(
             session,
@@ -765,6 +834,7 @@ class AioquicSendStream(_StreamBase):
             False,
             _ActiveKind.LOCAL_UNI,
             options=options,
+            prelude=prelude,
         )
 
 

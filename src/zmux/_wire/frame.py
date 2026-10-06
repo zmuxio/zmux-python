@@ -77,6 +77,7 @@ __all__ = (
     "parse_frame",
     "parse_frame_view",
     "read_frame",
+    "read_session_frame",
     "validate_data_payload",
     "validate_error_and_diag_payload",
     "validate_exact_one_varint_payload",
@@ -214,6 +215,23 @@ def parse_frame_view(
 def read_frame(reader: BinaryIO, limits: Optional[Limits] = None) -> Frame:
     """Read and parse one complete frame from a binary stream."""
 
+    return _read_frame(reader, limits, session=False)
+
+
+def read_session_frame(reader: BinaryIO, limits: Optional[Limits] = None) -> Frame:
+    """Read one inbound frame for a session read loop.
+
+    Like ``read_frame``, except that an EXT frame's subtype-specific rules
+    are left to the session, which knows what was negotiated: SPEC section
+    7.6 makes a receiver ignore PRIORITY_UPDATE when ``priority_update`` was
+    not negotiated, so neither its payload nor its stream scope is judged
+    here (``classify_inbound_frame`` does so after the capability check).
+    """
+
+    return _read_frame(reader, limits, session=True)
+
+
+def _read_frame(reader: BinaryIO, limits: Optional[Limits], *, session: bool) -> Frame:
     limits = normalize_limits(limits)
     frame_len = _read_frame_length(reader)
     if frame_len < 2:
@@ -245,7 +263,15 @@ def read_frame(reader: BinaryIO, limits: Optional[Limits] = None) -> Frame:
         flags,
         _read_exact(reader, payload_len, "truncated frame"),
     )
-    validate_frame(frame, limits, True)
+    validate_frame_parts(
+        frame.frame_type,
+        frame.flags,
+        frame.stream_id,
+        frame.payload,
+        limits,
+        True,
+        session=session,
+    )
     return frame
 
 
@@ -286,7 +312,11 @@ def validate_frame_parts(
         payload: bytes,
         limits: Limits,
         inbound: bool,
+        *,
+        session: bool = False,
 ) -> None:
+    """Validate a frame; ``session`` defers EXT subtype rules (see read_session_frame)."""
+
     validate_frame_envelope(frame_type, flags, stream_id, payload, limits, inbound)
 
     if frame_type == FrameType.DATA:
@@ -306,7 +336,7 @@ def validate_frame_parts(
     elif frame_type == FrameType.GOAWAY:
         validate_go_away_payload(payload)
     elif frame_type == FrameType.EXT:
-        validate_ext_payload(stream_id, payload)
+        validate_ext_payload(stream_id, payload, subtype=not session)
     else:
         raise _protocol_read(ERR_INVALID_FRAME_TYPE)
 
@@ -394,13 +424,21 @@ def validate_go_away_payload(payload: bytes) -> None:
         raise _frame_size_read("malformed GOAWAY diagnostics: %s" % exc)
 
 
-def validate_ext_payload(stream_id: int, payload: bytes) -> None:
+def validate_ext_payload(stream_id: int, payload: bytes, *, subtype: bool = True) -> None:
+    """Validate an EXT payload.
+
+    A payload too short for its ext_type varint (empty, truncated or
+    non-canonical) is a session PROTOCOL error, the frame-specific exception
+    to the FRAME_SIZE rule for truncated payloads (SPEC section 6.11).
+    ``subtype`` also applies the PRIORITY_UPDATE rules.
+    """
+
     payload_view = memoryview(payload)
     try:
         ext_type, consumed = parse_varint(payload_view)
     except ProtocolError as exc:
-        raise _frame_size_read("malformed EXT payload: %s" % exc)
-    if ext_type == EXT_PRIORITY_UPDATE:
+        raise _protocol_read("malformed EXT payload: %s" % exc)
+    if subtype and ext_type == EXT_PRIORITY_UPDATE:
         if stream_id == 0:
             raise _protocol_read("PRIORITY_UPDATE requires non-zero stream_id")
         try:

@@ -57,6 +57,7 @@ DEFAULT_HIDDEN_ABORT_CHURN_BUDGET = 128
 DEFAULT_VISIBLE_TERMINAL_CHURN_WINDOW = 1.0
 DEFAULT_VISIBLE_TERMINAL_CHURN_BUDGET = 128
 DEFAULT_CLOSE_DRAIN_TIMEOUT = 0.5
+DEFAULT_ESTABLISHMENT_TIMEOUT = 10.0
 DEFAULT_GO_AWAY_DRAIN_INTERVAL = 0.01
 DEFAULT_KEEPALIVE_TIMEOUT = 0.0
 DEFAULT_ACCEPT_BACKLOG_LIMIT = 128
@@ -281,6 +282,9 @@ class Config(object):
     stop_sending_graceful_tail_cap: Optional[int] = None
     graceful_close_drain_timeout: Optional[float] = DEFAULT_CLOSE_DRAIN_TIMEOUT
     go_away_drain_interval: Optional[float] = DEFAULT_GO_AWAY_DRAIN_INTERVAL
+    # Bounds session establishment (peer preface read plus local preface
+    # write). None or 0 selects the default; math.inf disables the bound.
+    establishment_timeout: Optional[float] = DEFAULT_ESTABLISHMENT_TIMEOUT
     event_handler: Optional[EventHandler] = None
 
     def __post_init__(self) -> None:
@@ -370,6 +374,11 @@ class Config(object):
                 name,
                 _normalize_optional_duration(getattr(self, name), "config " + name),
             )
+        object.__setattr__(
+            self,
+            "establishment_timeout",
+            _normalize_establishment_timeout(self.establishment_timeout),
+        )
         if self.event_handler is not None and not callable(self.event_handler):
             raise TypeError("config event_handler must be callable or None")
 
@@ -664,6 +673,26 @@ def _normalize_optional_duration(value: Optional[float], field_name: str) -> Opt
     return value
 
 
+def _normalize_establishment_timeout(value: Optional[float]) -> float:
+    """Return the effective peer-preface establishment bound in seconds.
+
+    ``None`` and ``0`` select :data:`DEFAULT_ESTABLISHMENT_TIMEOUT`;
+    ``math.inf`` disables the bound.
+    """
+
+    field_name = "config establishment_timeout"
+    if value is None:
+        return DEFAULT_ESTABLISHMENT_TIMEOUT
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError("%s must be a number of seconds" % field_name)
+    value = float(value)
+    if math.isnan(value) or value < 0:
+        raise ValueError("%s must be >= 0 or math.inf" % field_name)
+    if value == 0:
+        return DEFAULT_ESTABLISHMENT_TIMEOUT
+    return value
+
+
 def _validate_nonce_source(source: Optional[Any]) -> None:
     if source is None:
         return
@@ -798,6 +827,7 @@ __all__ = [
     "DEFAULT_ABUSE_WINDOW",
     "DEFAULT_CAPABILITIES",
     "DEFAULT_CLOSE_DRAIN_TIMEOUT",
+    "DEFAULT_ESTABLISHMENT_TIMEOUT",
     "DEFAULT_GO_AWAY_DRAIN_INTERVAL",
     "DEFAULT_GROUP_REBUCKET_CHURN_BUDGET",
     "DEFAULT_HIDDEN_ABORT_CHURN_BUDGET",

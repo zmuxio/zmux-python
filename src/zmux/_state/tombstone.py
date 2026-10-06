@@ -4,6 +4,12 @@ The Go implementation keeps compact state for fully terminal streams so late
 DATA on a used stream can still be classified after the full stream object is
 released.  This module mirrors that behavior as a pure Python state object:
 visible tombstones, hidden control-opened tombstones, and marker-only ranges.
+
+Marker-only ranges are kept ordered by stream class (``stream_id & 3``) and
+then by start, so merges and lookups only ever see ranges of one class.  When
+their count exceeds the marker budget, the oldest ranges of a class are folded
+into a per-class floor: every ID of that class at or below the floor is
+treated as used with the conservative "ignore" disposition (DESIGN D4).
 """
 
 from __future__ import annotations
@@ -25,6 +31,10 @@ INVALID_TOMBSTONE_INDEX = -1
 MAX_TOMBSTONES = DEFAULT_TOMBSTONE_LIMIT
 DEFAULT_MARKER_ONLY_USED_STREAM_LIMIT = DEFAULT_USED_MARKER_LIMIT
 MARKER_ONLY_RANGE_COMPACT_THRESHOLD = 64
+# Order queues are rewritten only once their dead slots reach the live count
+# (and at least this many), so reaping the oldest entry is amortized O(1).
+TOMBSTONE_QUEUE_COMPACT_MIN_DEAD = 64
+STREAM_CLASS_COUNT = 4
 HIDDEN_CONTROL_RETAINED_HARD_CAP = 64
 HIDDEN_CONTROL_RETAINED_MAX_AGE = 1.0
 DEFAULT_RETAINED_STATE_UNIT = 4 << 10
@@ -426,6 +436,49 @@ def used_stream_marker_for(
     return UsedStreamMarker(), False
 
 
+def coarsen_used_stream_ranges(
+        ranges: list[UsedStreamRange],
+        floors: list[Optional[int]],
+        target: int,
+) -> None:
+    """Fold the oldest ranges into per-class floors until ``target`` remain.
+
+    Ranges are taken from the classes holding the most ranges, lowest IDs
+    first.  ``floors[stream_id & 3]`` becomes the end of the last folded range
+    of that class, so every ID of the class up to it stays known as used.
+    """
+
+    target = max(0, target)
+    excess = len(ranges) - target
+    if excess <= 0:
+        return
+    bounds = [
+        _first_class_range_index(ranges, stream_class)
+        for stream_class in range(STREAM_CLASS_COUNT)
+    ]
+    bounds.append(len(ranges))
+    counts = [bounds[index + 1] - bounds[index] for index in range(STREAM_CLASS_COUNT)]
+    folded = [0] * STREAM_CLASS_COUNT
+    while excess > 0:
+        stream_class = max(
+            range(STREAM_CLASS_COUNT),
+            key=lambda index: counts[index] - folded[index],
+        )
+        folded[stream_class] += 1
+        excess -= 1
+    kept: list[UsedStreamRange] = []
+    for stream_class in range(STREAM_CLASS_COUNT):
+        start = bounds[stream_class]
+        end = bounds[stream_class + 1]
+        fold = folded[stream_class]
+        if fold:
+            floor = ranges[start + fold - 1].end
+            current = floors[stream_class]
+            floors[stream_class] = floor if current is None else max(current, floor)
+        kept.extend(ranges[start + fold: end])
+    ranges[:] = kept
+
+
 def used_stream_marker_from_tombstone(
         tombstone: StreamTombstone,
         cause: LateDataCause,
@@ -454,7 +507,14 @@ class TerminalBookkeepingState(object):
     used_stream_data: dict[int, UsedStreamMarker] = field(default_factory=dict)
     used_stream_ranges: list[UsedStreamRange] = field(default_factory=list)
     used_stream_range_mode: bool = False
+    # Per-class coarsening floor (index ``stream_id & 3``); None means none.
+    used_stream_floors: list[Optional[int]] = field(
+        default_factory=lambda: [None] * STREAM_CLASS_COUNT
+    )
     marker_only_limit_exceeded: bool = False
+    # Late DATA bytes counted by the tombstones currently retained; dropped
+    # again when a tombstone is reaped or replaced (DESIGN D2).
+    late_data_retained: int = 0
 
     def __post_init__(self) -> None:
         self.tombstone_limit = _require_u64(self.tombstone_limit, "tombstone_limit")
@@ -475,6 +535,7 @@ class TerminalBookkeepingState(object):
             self.marker_only_limit_exceeded,
             "marker_only_limit_exceeded",
         )
+        self.late_data_retained = _require_u64(self.late_data_retained, "late_data_retained")
 
     def tombstone_for(self, stream_id: int) -> StreamTombstoneLookup:
         stream_id = _require_u64(stream_id, "stream_id")
@@ -506,6 +567,7 @@ class TerminalBookkeepingState(object):
         tombstone = self.tombstones.get(stream_id)
         if tombstone is None:
             return TerminalLateDataResult()
+        self.late_data_retained = _saturating_add_u64(self.late_data_retained, length)
         return TerminalLateDataResult(
             tombstone.hidden,
             tombstone.record_late_data(length),
@@ -528,11 +590,25 @@ class TerminalBookkeepingState(object):
 
         self.ensure_tombstone_queue()
         previous = self.tombstones.get(stream_id)
-        if previous is not None and previous.hidden and not tombstone.hidden:
-            self.remove_hidden_tombstone(stream_id, previous)
+        if previous is not None:
+            self.late_data_retained = max(
+                0,
+                self.late_data_retained - previous.late_data_received,
+            )
+            if tombstone.order_index == INVALID_TOMBSTONE_INDEX:
+                # Keep the replaced record's queue slot; a record without a
+                # queue index is otherwise appended as a new entry.
+                tombstone.order_index = previous.order_index
+            if previous.hidden and not tombstone.hidden:
+                self.remove_hidden_tombstone(stream_id, previous)
 
-        self.mark_used_stream(stream_id, tombstone.used_stream_marker())
+        # The tombstone itself classifies late frames while it is retained;
+        # its used-stream marker is recorded when it is reaped.
         self.tombstones[stream_id] = tombstone
+        self.late_data_retained = _saturating_add_u64(
+            self.late_data_retained,
+            tombstone.late_data_received,
+        )
         self.append_tombstone(stream_id)
 
         if tombstone.hidden:
@@ -554,20 +630,36 @@ class TerminalBookkeepingState(object):
         stream_id = _require_u64(stream_id, "stream_id")
         marker = _coerce_marker(marker)
         if self.used_stream_range_mode:
-            upsert_used_stream_range(self.used_stream_ranges, stream_id, marker)
+            self._upsert_marker_range(stream_id, marker)
             self.drop_used_stream_map_entry(stream_id)
-            self.enforce_marker_only_used_stream_limit()
-            return
-        self.used_stream_data[stream_id] = marker
-        self.compact_marker_only_ranges()
-        self.enforce_marker_only_used_stream_limit(check_only=True)
+        else:
+            self.used_stream_data[stream_id] = marker
+        self.enforce_marker_only_used_stream_limit()
 
     def drop_used_stream_map_entry(self, stream_id: int) -> None:
         stream_id = _require_u64(stream_id, "stream_id")
         self.used_stream_data.pop(stream_id, None)
 
     def used_stream_marker_for(self, stream_id: int) -> tuple[UsedStreamMarker, bool]:
-        return used_stream_marker_for(self.used_stream_ranges, self.used_stream_data, stream_id)
+        marker, present = used_stream_marker_for(
+            self.used_stream_ranges,
+            self.used_stream_data,
+            stream_id,
+        )
+        if present or not self._below_used_stream_floor(stream_id):
+            return marker, present
+        # Coarsened: used, with the conservative ignore disposition.
+        return UsedStreamMarker(), True
+
+    def _below_used_stream_floor(self, stream_id: int) -> bool:
+        floor = self.used_stream_floors[stream_id & 3]
+        return floor is not None and stream_id <= floor
+
+    def _upsert_marker_range(self, stream_id: int, marker: UsedStreamMarker) -> None:
+        if self._below_used_stream_floor(stream_id):
+            # Already covered by the coarsened prefix of its class.
+            return
+        upsert_used_stream_range(self.used_stream_ranges, stream_id, marker)
 
     def compact_marker_only_ranges(self) -> None:
         marker_only_count = self.marker_only_map_count()
@@ -589,7 +681,7 @@ class TerminalBookkeepingState(object):
         for stream_id in stream_ids:
             marker = self.used_stream_data.pop(stream_id, None)
             if marker is not None:
-                upsert_used_stream_range(self.used_stream_ranges, stream_id, marker)
+                self._upsert_marker_range(stream_id, marker)
         self.used_stream_range_mode = True
 
     def marker_only_map_count(self) -> int:
@@ -609,8 +701,23 @@ class TerminalBookkeepingState(object):
         return self.marker_only_used_stream_limit
 
     def enforce_marker_only_used_stream_limit(self, check_only: bool = False) -> bool:
+        """Keep marker-only state within the marker budget.
+
+        Exceeding the budget never fails the session: the oldest ranges are
+        coarsened into per-class floors, halving the range count so the work
+        is amortized (DESIGN D4).
+        """
+
         if not check_only:
             self.compact_marker_only_ranges()
+            hard_cap = self.marker_only_hard_cap()
+            if self.marker_only_retained() > hard_cap:
+                budget = max(0, hard_cap - self.marker_only_map_count())
+                coarsen_used_stream_ranges(
+                    self.used_stream_ranges,
+                    self.used_stream_floors,
+                    budget // 2,
+                )
         self.marker_only_limit_exceeded = self.marker_only_retained() > self.marker_only_hard_cap()
         return not self.marker_only_limit_exceeded
 
@@ -769,10 +876,11 @@ class TerminalBookkeepingState(object):
         self.tombstone_order[index] = None
         self.tombstone_count = max(0, self.tombstone_count - 1)
         tombstone = entry.tombstone
-        self.mark_used_stream(entry.stream_id, tombstone.used_stream_marker())
         tombstone.order_index = INVALID_TOMBSTONE_INDEX
         self.remove_hidden_tombstone(entry.stream_id, tombstone)
         self.tombstones.pop(entry.stream_id, None)
+        self.late_data_retained = max(0, self.late_data_retained - tombstone.late_data_received)
+        self.mark_used_stream(entry.stream_id, tombstone.used_stream_marker())
         if index == self.tombstone_head:
             self.advance_tombstone_head()
         self.maybe_compact_tombstone_queue()
@@ -1005,21 +1113,28 @@ class TerminalBookkeepingState(object):
         self.used_stream_data.clear()
         self.used_stream_ranges = []
         self.used_stream_range_mode = False
+        self.used_stream_floors = [None] * STREAM_CLASS_COUNT
         self.marker_only_limit_exceeded = False
+        self.late_data_retained = 0
 
     def _append_indexed_tombstone(self, stream_id: int, hidden: bool) -> None:
         tombstone = self.tombstones.get(stream_id)
         if tombstone is None or (hidden and not tombstone.hidden):
             return
-        lookup = (
-            self.hidden_tombstone_index(stream_id, tombstone.queue_index(True))
-            if hidden
-            else self.tombstone_index(stream_id, tombstone.queue_index(False))
-        )
-        if lookup.found():
-            if tombstone.queue_index(hidden) != lookup.index:
-                tombstone.set_queue_index(hidden, lookup.index)
-            return
+        hint = tombstone.queue_index(hidden)
+        if hint != INVALID_TOMBSTONE_INDEX:
+            lookup = (
+                self.hidden_tombstone_index(stream_id, hint)
+                if hidden
+                else self.tombstone_index(stream_id, hint)
+            )
+            if lookup.found():
+                if hint != lookup.index:
+                    tombstone.set_queue_index(hidden, lookup.index)
+                return
+        # A record without a queue index is new to this queue (a replaced
+        # record inherits its predecessor's slot), so it is appended without
+        # scanning the queue.
         order = self.hidden_tombstone_order if hidden else self.tombstone_order
         tombstone.set_queue_index(hidden, len(order))
         order.append(stream_id)
@@ -1044,7 +1159,10 @@ class TerminalBookkeepingState(object):
                 self.tombstone_count = 0
                 self.tombstones_init = True
             return
-        if head == 0 and len(order) <= 2 * count:
+        # Rewriting the queue costs O(count): only do it once the dead slots
+        # (reaped head entries and removed holes) reach the live count, so
+        # reaping the oldest tombstone on every close stays amortized O(1).
+        if len(order) - count < max(count, TOMBSTONE_QUEUE_COMPACT_MIN_DEAD):
             return
 
         compacted = []
@@ -1078,11 +1196,28 @@ class TerminalBookkeepingState(object):
 
 
 def _first_range_starting_after(ranges: Sequence[UsedStreamRange], stream_id: int) -> int:
+    # Ranges are ordered by (stream class, start): ranges of different
+    # classes never interleave, so neighbours always share a class.
+    stream_class = stream_id & 3
     low = 0
     high = len(ranges)
     while low < high:
         mid = (low + high) >> 1
-        if ranges[mid].start > stream_id:
+        start = ranges[mid].start
+        start_class = start & 3
+        if start_class > stream_class or (start_class == stream_class and start > stream_id):
+            high = mid
+        else:
+            low = mid + 1
+    return low
+
+
+def _first_class_range_index(ranges: Sequence[UsedStreamRange], stream_class: int) -> int:
+    low = 0
+    high = len(ranges)
+    while low < high:
+        mid = (low + high) >> 1
+        if ranges[mid].start & 3 >= stream_class:
             high = mid
         else:
             low = mid + 1
@@ -1176,6 +1311,8 @@ __all__ = (
     "MAX_TOMBSTONES",
     "MAX_UINT64",
     "QueueIndexLookup",
+    "STREAM_CLASS_COUNT",
+    "TOMBSTONE_QUEUE_COMPACT_MIN_DEAD",
     "StreamTombstoneLookup",
     "StreamTombstoneRecord",
     "TerminalBookkeepingState",
@@ -1189,6 +1326,7 @@ __all__ = (
     "UsedStreamRange",
     "StreamTombstone",
     "build_stream_tombstone",
+    "coarsen_used_stream_ranges",
     "merge_used_stream_range_around",
     "same_used_stream_marker",
     "set_contained_used_stream_marker",

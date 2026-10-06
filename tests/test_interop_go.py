@@ -3,6 +3,7 @@ import pathlib
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -20,6 +21,8 @@ import (
     "io"
     "net"
     "os"
+    "strconv"
+    "sync"
     "time"
 
     zmux "github.com/zmuxio/zmux-go"
@@ -54,6 +57,12 @@ func main() {
         runClient(false)
     case "client-large":
         runClient(true)
+    case "server-zero-window":
+        runZeroWindowServer()
+    case "server-many":
+        runManyStreamsServer()
+    case "client-cancelled-upload":
+        runCancelledUploadClient()
     default:
         fatal("unknown mode %q", os.Args[1])
     }
@@ -114,6 +123,109 @@ func runServer() {
     _ = session.Wait(ctx)
 }
 
+// runZeroWindowServer advertises no initial stream credit for peer-opened
+// bidirectional streams: the peer must open with a zero-length DATA before
+// any stream BLOCKED, or this side fails the session with PROTOCOL.
+func runZeroWindowServer() {
+    if len(os.Args) != 4 {
+        fatal("usage: helper server-zero-window <addr> <ready-file>")
+    }
+    listener, err := net.Listen("tcp", os.Args[2])
+    if err != nil {
+        fatal("listen: %v", err)
+    }
+    defer listener.Close()
+    if err := os.WriteFile(os.Args[3], []byte(listener.Addr().String()), 0600); err != nil {
+        fatal("ready file: %v", err)
+    }
+    raw, err := listener.Accept()
+    if err != nil {
+        fatal("accept: %v", err)
+    }
+    cfg := config()
+    cfg.Settings = zmux.DefaultSettings()
+    cfg.Settings.InitialMaxStreamDataBidiPeerOpened = 0
+    session, err := zmux.Server(raw, cfg)
+    if err != nil {
+        fatal("server: %v", err)
+    }
+    defer session.Close()
+
+    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+    stream, err := session.AcceptStream(ctx)
+    if err != nil {
+        fatal("accept stream: %v", err)
+    }
+    if _, err := stream.WriteFinal([]byte("accepted")); err != nil {
+        fatal("write final: %v", err)
+    }
+    if err := session.Wait(ctx); err != nil && ctx.Err() != nil {
+        fatal("wait: %v", err)
+    }
+}
+
+// runManyStreamsServer accepts streams the peer opened concurrently.  Their
+// openers must arrive in stream-ID order, or this side fails the session with
+// PROTOCOL (SPEC section 3.1).
+func runManyStreamsServer() {
+    if len(os.Args) != 5 {
+        fatal("usage: helper server-many <addr> <ready-file> <count>")
+    }
+    count, err := strconv.Atoi(os.Args[4])
+    if err != nil {
+        fatal("count: %v", err)
+    }
+    listener, err := net.Listen("tcp", os.Args[2])
+    if err != nil {
+        fatal("listen: %v", err)
+    }
+    defer listener.Close()
+    if err := os.WriteFile(os.Args[3], []byte(listener.Addr().String()), 0600); err != nil {
+        fatal("ready file: %v", err)
+    }
+    raw, err := listener.Accept()
+    if err != nil {
+        fatal("accept: %v", err)
+    }
+    session, err := zmux.Server(raw, config())
+    if err != nil {
+        fatal("server: %v", err)
+    }
+    defer session.Close()
+
+    ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+    defer cancel()
+    var wg sync.WaitGroup
+    errs := make(chan error, count)
+    for i := 0; i < count; i++ {
+        stream, err := session.AcceptStream(ctx)
+        if err != nil {
+            fatal("accept stream %d: %v", i, err)
+        }
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            payload, err := io.ReadAll(stream)
+            if err != nil {
+                errs <- fmt.Errorf("read stream %d: %w", stream.StreamID(), err)
+                return
+            }
+            if _, err := stream.WriteFinal([]byte(strconv.Itoa(len(payload)))); err != nil {
+                errs <- fmt.Errorf("write stream %d: %w", stream.StreamID(), err)
+            }
+        }()
+    }
+    wg.Wait()
+    close(errs)
+    for err := range errs {
+        fatal("%v", err)
+    }
+    if err := session.Wait(ctx); err != nil && ctx.Err() != nil {
+        fatal("wait: %v", err)
+    }
+}
+
 func runClient(large bool) {
     if len(os.Args) != 3 {
         fatal("usage: helper client <addr>")
@@ -164,6 +276,64 @@ func runClient(large bool) {
         }
     } else if got := string(response); got != "python:go->python" {
         fatal("response = %q", got)
+    }
+    _ = session.Close()
+    _ = session.Wait(ctx)
+}
+
+// runCancelledUploadClient keeps writing on streams the Python side stops
+// reading or aborts mid-transfer, so a full stream window of DATA is in flight
+// when the stop lands.  The session must survive: every later stream still
+// round-trips.
+func runCancelledUploadClient() {
+    if len(os.Args) != 4 {
+        fatal("usage: helper client-cancelled-upload <addr> <rounds>")
+    }
+    rounds, err := strconv.Atoi(os.Args[3])
+    if err != nil {
+        fatal("rounds: %v", err)
+    }
+    raw, err := net.Dial("tcp", os.Args[2])
+    if err != nil {
+        fatal("dial: %v", err)
+    }
+    session, err := zmux.Client(raw, config())
+    if err != nil {
+        fatal("client: %v", err)
+    }
+    defer session.Close()
+
+    ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+    defer cancel()
+    chunk := make([]byte, 16384)
+    for i := range chunk {
+        chunk[i] = 'u'
+    }
+    for round := 0; round < rounds; round++ {
+        upload, err := session.OpenStream(ctx)
+        if err != nil {
+            fatal("open upload %d: %v", round, err)
+        }
+        for written := 0; written < 4<<20; written += len(chunk) {
+            if _, err := upload.Write(chunk); err != nil {
+                break
+            }
+        }
+        _ = upload.CloseWithError(uint64(zmux.CodeCancelled), "")
+        check, err := session.OpenStream(ctx)
+        if err != nil {
+            fatal("open check %d: %v", round, err)
+        }
+        if _, err := check.WriteFinal([]byte("after")); err != nil {
+            fatal("write check %d: %v", round, err)
+        }
+        response, err := io.ReadAll(check)
+        if err != nil {
+            fatal("read check %d: %v", round, err)
+        }
+        if got := string(response); got != "python:after" {
+            fatal("check response %d = %q", round, got)
+        }
     }
     _ = session.Close()
     _ = session.Wait(ctx)
@@ -271,6 +441,73 @@ class GoNativeInteropTest(unittest.TestCase):
         finally:
             self._terminate(process)
 
+    def test_python_client_opens_stream_on_go_server_with_zero_stream_window(self):
+        # The opener must be a zero-length DATA: a stream BLOCKED first is a
+        # session PROTOCOL error at the Go receiver (SPEC section 9.1).
+        ready = self.work / "go-zero-window.ready"
+        process = self._spawn("server-zero-window", "127.0.0.1:0", str(ready))
+        try:
+            host, port = self._wait_ready(ready).rsplit(":", 1)
+            session = zmux.client(socket.create_connection((host, int(port)), timeout=2), _interop_config())
+            try:
+                stream = session.open_stream(timeout=5.0)
+                try:
+                    stream.write(b"hello", timeout=0.5)
+                except zmux.WriteTimeout:
+                    pass  # the receiver may keep its zero window closed
+                self.assertEqual(stream.read(timeout=5.0), b"accepted")
+                self.assertIsNone(session.close_error)
+                stream.close_with_error(int(zmux.ErrorCode.CANCELLED))
+            finally:
+                session.close()
+            self._assert_process_success(process)
+        finally:
+            self._terminate(process)
+
+    def test_python_client_concurrent_opens_reach_go_server_in_id_order(self):
+        # Every thread opens a stream and writes at once; the Go receiver fails
+        # the session if an opener ever overtakes a lower stream ID.
+        count = 64
+        ready = self.work / "go-many.ready"
+        process = self._spawn("server-many", "127.0.0.1:0", str(ready), str(count))
+        switch_interval = sys.getswitchinterval()
+        # A tiny GIL switch interval widens any window between assigning a
+        # stream ID and queueing that stream's opener.
+        sys.setswitchinterval(1e-5)
+        try:
+            host, port = self._wait_ready(ready).rsplit(":", 1)
+            session = zmux.client(socket.create_connection((host, int(port)), timeout=2), _interop_config())
+            try:
+                start = threading.Barrier(count)
+                errors = []
+
+                def open_and_write(index):
+                    try:
+                        options = zmux.OpenOptions(initial_priority=index % 8)
+                        stream = session.open_stream(options, timeout=5.0)
+                        start.wait(5.0)
+                        stream.write_final(b"x" * 100, timeout=5.0)
+                        self.assertEqual(stream.read(timeout=5.0), b"100")
+                    except BaseException as exc:
+                        errors.append(exc)
+
+                threads = [
+                    threading.Thread(target=open_and_write, args=(index,), daemon=True)
+                    for index in range(count)
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(10.0)
+                self.assertEqual(errors, [])
+                self.assertIsNone(session.close_error)
+            finally:
+                session.close()
+            self._assert_process_success(process)
+        finally:
+            sys.setswitchinterval(switch_interval)
+            self._terminate(process)
+
     def test_go_client_talks_to_python_server_with_open_metadata(self):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         listener.bind(("127.0.0.1", 0))
@@ -346,6 +583,61 @@ class GoNativeInteropTest(unittest.TestCase):
         try:
             self._assert_process_success(process)
             thread.join(10)
+            self.assertFalse(thread.is_alive())
+            if "error" in result:
+                raise result["error"]
+        finally:
+            self._terminate(process)
+
+    def test_python_stop_or_abort_mid_upload_keeps_go_session(self):
+        # A Go sender may have a whole stream window in flight when the Python
+        # receiver stops reading or aborts; those bytes must be discarded, not
+        # turned into a session PROTOCOL error (SPEC 9.3/9.5, DESIGN D2).
+        rounds = 6
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        result = {}
+
+        def serve():
+            raw = None
+            session = None
+            try:
+                raw, _ = listener.accept()
+                session = zmux.server(raw, _interop_config())
+                for round_index in range(rounds):
+                    upload = session.accept_stream(timeout=10.0)
+                    self.assertGreater(len(upload.read(16384, timeout=10.0)), 0)
+                    if round_index % 2:
+                        upload.close_with_error(int(zmux.ErrorCode.CANCELLED))
+                    else:
+                        upload.close_read()
+                    check = session.accept_stream(timeout=10.0)
+                    payload = check.read(timeout=10.0)
+                    self.assertEqual(payload, b"after")
+                    check.write_final(b"python:" + payload, timeout=5.0)
+                    upload.close()
+                self.assertIsNone(session.close_error)
+                session.wait(timeout=10.0)
+            except BaseException as exc:
+                result["error"] = exc
+            finally:
+                if session is not None:
+                    session.close()
+                elif raw is not None:
+                    raw.close()
+                listener.close()
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        process = self._spawn(
+            "client-cancelled-upload",
+            "%s:%d" % listener.getsockname(),
+            str(rounds),
+        )
+        try:
+            self._assert_process_success(process)
+            thread.join(15)
             self.assertFalse(thread.is_alive())
             if "error" in result:
                 raise result["error"]

@@ -99,6 +99,7 @@ from ..errors import (
     ApplicationError,
     ErrorDirection,
     ErrorOperation,
+    ErrorScope,
     ErrorSource,
     ProtocolError,
     ReadClosed,
@@ -1732,7 +1733,14 @@ def merge_pending_priority_update(
         return update
     pending, valid = parse_priority_update_payload(pending_payload)
     if not valid:
-        raise ProtocolError("invalid pending priority update payload")
+        raise ProtocolError(
+            "invalid pending priority update payload",
+            code=int(ErrorCode.INTERNAL),
+            scope=ErrorScope.SESSION,
+            operation=ErrorOperation.WRITE,
+            source=ErrorSource.LOCAL,
+            direction=ErrorDirection.WRITE,
+        )
     return MetadataUpdate(
         update.priority if update.priority is not None else pending.priority,
         update.group if update.group is not None else pending.group,
