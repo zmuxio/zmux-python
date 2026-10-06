@@ -116,7 +116,7 @@ jobs:
     needs: [validate, publish-core]
     runs-on: ubuntu-latest
     environment:
-      name: pypi
+      name: pypi-aioquic
       url: https://pypi.org/p/zmuxio-aioquic
     permissions:
       id-token: write

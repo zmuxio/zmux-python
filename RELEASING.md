@@ -11,8 +11,14 @@ Releases are automated from tag `vX.Y.Z`. The workflow (`.github/workflows/relea
 test suite on every supported Python version, builds and checks both distributions, publishes `zmuxio`, waits until
 PyPI serves it, and publishes `zmuxio-aioquic`.
 
-Publishing uses PyPI Trusted Publishing (GitHub OIDC), so no PyPI token is stored in the repository. Each PyPI project
-has a trusted publisher with owner `zmuxio`, repository `zmux-python`, workflow `release.yml` and environment `pypi`.
+Publishing uses PyPI Trusted Publishing (GitHub OIDC), so no PyPI token is stored in the repository. Both PyPI projects
+trust owner `zmuxio`, repository `zmux-python` and workflow `release.yml`; they differ only in the GitHub environment,
+because PyPI requires each pending publisher configuration to be unique:
+
+| PyPI project | Environment |
+| --- | --- |
+| `zmuxio` | `pypi` |
+| `zmuxio-aioquic` | `pypi-aioquic` |
 
 ## Version Rules
 
