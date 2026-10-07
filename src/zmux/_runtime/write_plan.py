@@ -38,6 +38,11 @@ from .write_policy import (
     tx_fragment_cap,
     write_burst_limit,
 )
+from .._validation import (
+    coerce_int_enum as _coerce_enum,
+    require_bool as _shared_require_bool,
+    require_nonnegative_int as _nonnegative_int,
+)
 from ..errors import (
     ErrorDirection,
     ErrorOperation,
@@ -55,13 +60,9 @@ from ..protocol import (
     SchedulerHint,
 )
 from ..streams import ReadableBuffer
-from .._validation import (
-    coerce_int_enum as _coerce_enum,
-    require_bool as _shared_require_bool,
-    require_nonnegative_int as _nonnegative_int,
-)
 
 FrameBuffer = List[Frame]
+
 
 class OpenerVisibilityMark(IntEnum):
     UNCHANGED = 0

@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Protocol, Tuple
 
 from ._containers import clear_attrs
 from ._errors import frame_size_error, local_internal_error
+from .batch_scheduler import BatchScheduler
 from .queue import (
     MAX_UINT64,
     MAX_WRITE_BATCH_FRAMES,
@@ -34,7 +35,6 @@ from .queue import (
     tx_frames_queue_cost,
     write_all,
 )
-from .batch_scheduler import BatchScheduler
 from .sched_core import (
     FALLBACK_GROUP_BUCKET,
     MAX_EXPLICIT_GROUPS,
@@ -47,13 +47,13 @@ from .sched_core import (
     coerce_scheduler_hint as _coerce_scheduler_hint,
     order_batch_indices,
 )
+from .stream import SendHalfState, StreamRuntimeState
 from .write_plan import rate_limited_fragment_cap, saturating_add
 from .._validation import (
     coerce_int_enum as _coerce_enum,
     require_bool as _shared_require_bool,
     require_nonnegative_int as _nonnegative_int,
 )
-from .stream import SendHalfState, StreamRuntimeState
 from .._wire.frame import append_frame_header_trusted, normalize_limits
 from .._wire.varint import parse_varint
 from ..config import Settings, default_settings
@@ -1448,11 +1448,11 @@ def _retain_writable_frame(
             not _frame_is_priority_update(frame)
             or allow_opening_priority_update
             or _writable_frame_decision(
-                streams,
-                frame.stream_id,
-                session_closed,
-                cache,
-            ).priority_update
+        streams,
+        frame.stream_id,
+        session_closed,
+        cache,
+    ).priority_update
     )
 
 

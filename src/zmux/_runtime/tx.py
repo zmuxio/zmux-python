@@ -18,6 +18,9 @@ from dataclasses import dataclass, field, replace
 from enum import Enum, IntEnum
 from typing import Callable, Dict, List, Optional, Protocol, Tuple
 
+from .flow import queue_would_block as _flow_queue_would_block
+from .stream import SendHalfState, effective_deadline
+from .write_plan import OpenerVisibilityMark
 from .._validation import (
     require_bool as _require_bool,
     require_nonnegative_duration as _nonnegative_duration,
@@ -25,9 +28,6 @@ from .._validation import (
     require_stream_id as _require_stream_id,
     require_varint62 as _require_varint62,
 )
-from .flow import queue_would_block as _flow_queue_would_block
-from .stream import SendHalfState, effective_deadline
-from .write_plan import OpenerVisibilityMark
 from .._wire.frame import normalize_limits, validate_frame
 from .._wire.varint import append_varint, parse_varint, varint_len
 from ..config import DEFAULT_WRITE_BATCH_MAX_FRAMES, Limits
@@ -75,6 +75,8 @@ QUEUED_WRITE_DISCARDED_MESSAGE = "zmux: queued write was discarded"
 DEFAULT_URGENCY_RANK = 100
 _POLL_WAIT_CAP_SECONDS = 3600.0
 POLL_WAIT_CAP_SECONDS = _POLL_WAIT_CAP_SECONDS
+
+
 class BatchOrder(Protocol):
     def __call__(self, batch: List[object]) -> Iterable[object]:
         ...
@@ -2150,7 +2152,6 @@ internal_queue_error = _internal_queue_error
 nonnegative_duration = _nonnegative_duration
 order_urgent_jobs_in_place = _order_urgent_jobs_in_place
 saturating_add = _saturating_add
-
 
 __all__ = (
     "DEFAULT_URGENCY_RANK",

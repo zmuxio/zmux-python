@@ -7,7 +7,6 @@ import inspect
 import time
 from collections.abc import Awaitable, Iterable
 from typing import Optional, Tuple
-
 from zmux.errors import (
     AdapterUnsupported,
     ErrorDirection,
@@ -17,6 +16,7 @@ from zmux.errors import (
     ZmuxError,
 )
 from zmux.protocol import ErrorCode
+
 from ._constants import FINISH_WRITER_WAIT_TIMEOUT
 from ._errors import _protocol_prelude_error
 from ._validation import (

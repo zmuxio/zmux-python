@@ -7,7 +7,6 @@ import time
 from collections.abc import Iterable
 from types import TracebackType
 from typing import Optional, Tuple
-
 from zmux.config import OpenOptions
 from zmux.errors import (
     AdapterUnsupported,
@@ -29,6 +28,7 @@ from zmux.errors import (
 )
 from zmux.payload import MetadataUpdate, StreamMetadata
 from zmux.protocol import ErrorCode
+
 from ._constants import EMPTY_STREAM_PRELUDE, WRITEV_COALESCE_MAX_BYTES
 from ._errors import _with_characters_written, translate_read_error, translate_write_error
 from ._io import (

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from .._validation import require_nonnegative_int as _nonnegative_int
 from .flow import saturating_mul_div_floor
+from .._validation import require_nonnegative_int as _nonnegative_int
 from ..config import default_settings
 from ..protocol import SchedulerHint
 

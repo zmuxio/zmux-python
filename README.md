@@ -34,7 +34,6 @@ the initiator and responder:
 import socket
 import zmux
 
-
 sock = socket.create_connection(("example.com", 443))
 
 with zmux.client(sock) as session:
@@ -137,7 +136,9 @@ transport protocols and helpers for custom integrations:
 ```python
 class SyncByteStream(object):
     def read(self, max_bytes: int = 16384) -> bytes: ...
+
     def write_all(self, data: bytes) -> None: ...
+
     def close(self) -> None: ...
 ```
 
@@ -162,9 +163,9 @@ methods.
 Stream close operations follow the same stable shape across implementations:
 
 ```python
-stream.close_write()                  # graceful send-half close
-stream.close_read()                   # cancel local interest in reads
-stream.close_with_error(0x100, "bye") # stream application error
+stream.close_write()  # graceful send-half close
+stream.close_read()  # cancel local interest in reads
+stream.close_with_error(0x100, "bye")  # stream application error
 
 session.close()
 session.close_with_error(0x100, "bye")
@@ -199,8 +200,8 @@ PING is outstanding; `ping()` waits (within its timeout) while another PING is
 in flight, and an echo that does not fit both sides' control-payload limits
 raises `FrameSizeError`.
 
-Native stream writes either queue all of their bytes or raise. When an error
-(such as `WriteTimeout`) comes after part of the data was already queued,
+Native stream writes either queue all of their bytes or raise. When an error (such as `WriteTimeout`) comes after part
+of the data was already queued,
 those bytes are still sent and the error carries their count as
 `characters_written`, like `BlockingIOError`, so a retry can resume after them.
 `zmuxio-aioquic` streams report partial writes the same way.

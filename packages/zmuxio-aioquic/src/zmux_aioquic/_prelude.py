@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
+import zmux
 from dataclasses import dataclass, field
 from typing import Optional
-
-import zmux
 from zmux.config import OpenOptions
 from zmux.errors import ErrorScope, OpenMetadataTooLarge, ProtocolError
 from zmux.payload import StreamMetadata, parse_stream_metadata_bytes_view
 from zmux.protocol import MAX_VARINT62
 from zmux.varint import encoded_len_from_first, parse_varint
+
 from ._constants import (
     DEFAULT_ACCEPTED_PRELUDE_READ_TIMEOUT,
     EMPTY_STREAM_PRELUDE,

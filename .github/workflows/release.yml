@@ -94,7 +94,7 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        python: ['3.10', '3.11', '3.12', '3.13', '3.14']
+        python: [ '3.10', '3.11', '3.12', '3.13', '3.14' ]
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -149,7 +149,7 @@ jobs:
 
   publish-core:
     name: Publish zmuxio
-    needs: [validate, build]
+    needs: [ validate, build ]
     if: needs.validate.outputs.core_published != 'true'
     runs-on: ubuntu-latest
     environment:
@@ -172,7 +172,7 @@ jobs:
 
   publish-aioquic:
     name: Publish zmuxio-aioquic
-    needs: [validate, build, publish-core]
+    needs: [ validate, build, publish-core ]
     # Runs after the core was published here or had already been published by an earlier run of this tag.
     if: >-
       !cancelled()

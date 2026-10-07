@@ -128,14 +128,14 @@ class PackageSurfaceTest(unittest.TestCase):
         self.assertEqual(zmux.encode_varint(64), b"\x40\x40")
         self.assertEqual(zmux.parse_varint(b"\x40\x40"), (64, 2))
         for name in (
-            "write_frame",
-            "join",
-            "open",
-            "client",
-            "server",
-            "open_io",
-            "client_io",
-            "server_io",
+                "write_frame",
+                "join",
+                "open",
+                "client",
+                "server",
+                "open_io",
+                "client_io",
+                "server_io",
         ):
             with self.subTest(name=name):
                 self.assertTrue(callable(getattr(zmux, name)))

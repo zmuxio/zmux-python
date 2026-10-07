@@ -180,10 +180,10 @@ including a just-submitted metadata prelude.
 
 ## Errors
 
-- A peer RESET_STREAM(code) fails reads on that stream with
+- A peer RESET_STREAM (code) fails reads on that stream with
   `zmux.ApplicationError(code)` (remote, reset). The local send half is not
   affected.
-- A peer STOP_SENDING(code) fails later writes on that stream with
+- A peer STOP_SENDING (code) fails later writes on that stream with
   `zmux.ApplicationError(code)` (remote, stopped). aioquic itself answers the
   stop with RESET_STREAM carrying `NO_ERROR`, not the peer's code.
 - A peer QUIC application close with a nonzero code or a reason fails the

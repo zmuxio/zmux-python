@@ -27,8 +27,8 @@ if str(_AIOQUIC_SRC) not in sys.path:
 import zmux_aioquic
 
 HAVE_AIOQUIC = (
-    importlib.util.find_spec("aioquic") is not None
-    and importlib.util.find_spec("cryptography") is not None
+        importlib.util.find_spec("aioquic") is not None
+        and importlib.util.find_spec("cryptography") is not None
 )
 
 ALPN = "zmux-python-go-quic-interop"
@@ -264,7 +264,6 @@ func runClient(addr string) {
 }
 '''.replace("ALPN_PLACEHOLDER", ALPN)
 
-
 if HAVE_AIOQUIC:
     from aioquic.asyncio import connect, serve
     from aioquic.asyncio.protocol import QuicConnectionProtocol
@@ -273,6 +272,7 @@ if HAVE_AIOQUIC:
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import ec
     from cryptography.x509.oid import NameOID
+
 
     class ZmuxProtocol(QuicConnectionProtocol):
         def __init__(self, quic, stream_handler=None):

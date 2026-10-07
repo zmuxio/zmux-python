@@ -56,6 +56,13 @@ from .._state.stream_id import (
     validate_stream_id_for_role as _state_validate_stream_id_for_role,
 )
 from .._state.tombstone import LateDataCause
+from .._validation import (
+    require_bool as _require_bool,
+    require_nonnegative_duration as _nonnegative_duration,
+    require_nonnegative_int as _nonnegative_int,
+    require_stream_id as _require_stream_id,
+    require_varint62 as _require_varint62,
+)
 from .._wire.frame import normalize_limits, read_session_frame, validate_frame_parts
 from .._wire.varint import encode_varint, parse_varint
 from ..config import (
@@ -111,13 +118,6 @@ from ..protocol import (
     capabilities_can_carry_group_on_open,
     capabilities_can_carry_priority_in_update,
     capabilities_can_carry_priority_on_open,
-)
-from .._validation import (
-    require_bool as _require_bool,
-    require_nonnegative_duration as _nonnegative_duration,
-    require_nonnegative_int as _nonnegative_int,
-    require_stream_id as _require_stream_id,
-    require_varint62 as _require_varint62,
 )
 
 PING_TOKEN_BYTES = 8

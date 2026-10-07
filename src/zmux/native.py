@@ -12,20 +12,6 @@ from types import TracebackType
 from typing import Callable, Deque, Iterable, Optional, Tuple, TypeVar
 
 from ._buffers import byte_view
-from ._runtime.keepalive import (
-    build_padded_ping_echo,
-    build_ping_payload,
-    effective_keepalive_timeout,
-    init_keepalive_jitter_state,
-    init_session_nonce_state,
-    keepalive_lead_jittered_delay,
-    next_session_nonce,
-    ping_payload_len,
-    ping_payload_limit,
-    pong_payload_for_ping,
-    pong_payload_matches_ping,
-    session_liveness_seed,
-)
 from ._runtime.flow import (
     late_data_per_stream_cap,
     negotiated_frame_payload,
@@ -39,6 +25,20 @@ from ._runtime.flow import (
     stream_emergency_threshold,
     stream_window_target,
     window_remaining,
+)
+from ._runtime.keepalive import (
+    build_padded_ping_echo,
+    build_ping_payload,
+    effective_keepalive_timeout,
+    init_keepalive_jitter_state,
+    init_session_nonce_state,
+    keepalive_lead_jittered_delay,
+    next_session_nonce,
+    ping_payload_len,
+    ping_payload_limit,
+    pong_payload_for_ping,
+    pong_payload_matches_ping,
+    session_liveness_seed,
 )
 from ._runtime.read_loop import (
     InboundBudgetTracker,
@@ -261,12 +261,12 @@ class _WriteRequest(object):
     )
 
     def __init__(
-        self,
-        frame: Frame,
-        data: bytes,
-        *,
-        droppable: bool = False,
-        final: bool = False,
+            self,
+            frame: Frame,
+            data: bytes,
+            *,
+            droppable: bool = False,
+            final: bool = False,
     ) -> None:
         self.frame = frame
         self.data = data
@@ -284,10 +284,10 @@ class _BackgroundCall(object):
     __slots__ = ("_done", "_error", "_notify", "_result")
 
     def __init__(
-        self,
-        name: str,
-        target,
-        notify: Optional[threading.Event] = None,
+            self,
+            name: str,
+            target,
+            notify: Optional[threading.Event] = None,
     ) -> None:
         self._done = threading.Event()
         self._notify = notify
@@ -467,13 +467,13 @@ class Conn(object):
     )
 
     def __init__(
-        self,
-        transport: object,
-        io: "_FrameIO",
-        config: Config,
-        local_preface: Preface,
-        peer_preface: Preface,
-        negotiated: Negotiated,
+            self,
+            transport: object,
+            io: "_FrameIO",
+            config: Config,
+            local_preface: Preface,
+            peer_preface: Preface,
+            negotiated: Negotiated,
     ) -> None:
         self._transport = transport
         self._io = io
@@ -677,10 +677,10 @@ class Conn(object):
 
     # noinspection PyTypeHints
     def __exit__(
-        self,
-        exc_type: Optional[type[BaseException]],
-        exc: Optional[BaseException],
-        tb: Optional[TracebackType],
+            self,
+            exc_type: Optional[type[BaseException]],
+            exc: Optional[BaseException],
+            tb: Optional[TracebackType],
     ) -> None:
         self.close()
 
@@ -691,21 +691,21 @@ class Conn(object):
         return self._accept(self._accept_uni, timeout)
 
     def open_stream(
-        self, options: Optional[OpenOptions] = None, *, timeout: Optional[float] = None
+            self, options: Optional[OpenOptions] = None, *, timeout: Optional[float] = None
     ) -> "NativeStream":
         return self._open_stream(True, options, timeout)
 
     def open_uni_stream(
-        self, options: Optional[OpenOptions] = None, *, timeout: Optional[float] = None
+            self, options: Optional[OpenOptions] = None, *, timeout: Optional[float] = None
     ) -> "NativeStream":
         return self._open_stream(False, options, timeout)
 
     def open_and_send(
-        self,
-        data: ReadableBuffer,
-        options: Optional[OpenOptions] = None,
-        *,
-        timeout: Optional[float] = None,
+            self,
+            data: ReadableBuffer,
+            options: Optional[OpenOptions] = None,
+            *,
+            timeout: Optional[float] = None,
     ) -> "NativeStream":
         start = time.monotonic()
         stream = self.open_stream(options, timeout=timeout)
@@ -717,11 +717,11 @@ class Conn(object):
         return stream
 
     def open_uni_and_send(
-        self,
-        data: ReadableBuffer,
-        options: Optional[OpenOptions] = None,
-        *,
-        timeout: Optional[float] = None,
+            self,
+            data: ReadableBuffer,
+            options: Optional[OpenOptions] = None,
+            *,
+            timeout: Optional[float] = None,
     ) -> "NativeStream":
         start = time.monotonic()
         stream = self.open_uni_stream(options, timeout=timeout)
@@ -753,11 +753,11 @@ class Conn(object):
                 self._lock_notify_all()
 
     def _register_ping(
-        self,
-        echo_bytes: bytes,
-        deadline: Optional[float] = None,
-        *,
-        wait: bool = True,
+            self,
+            echo_bytes: bytes,
+            deadline: Optional[float] = None,
+            *,
+            wait: bool = True,
     ) -> Optional[Tuple[bytes, _PendingPing]]:
         """Claim the session's single outstanding-PING slot and build the PING.
 
@@ -810,11 +810,11 @@ class Conn(object):
         return payload, pending
 
     def go_away(
-        self,
-        last_accepted_bidi: int,
-        last_accepted_uni: int,
-        code: int = 0,
-        reason: str = "",
+            self,
+            last_accepted_bidi: int,
+            last_accepted_uni: int,
+            code: int = 0,
+            reason: str = "",
     ) -> None:
         self._check_open(ErrorOperation.CLOSE)
         self._validate_local_go_away(last_accepted_bidi, last_accepted_uni)
@@ -843,17 +843,17 @@ class Conn(object):
         # A valid bidirectional watermark is never MAX_VARINT62 (that ID is
         # unidirectional), so the initial sentinel pair means "none sent".
         return (
-            self._local_go_away_bidi != MAX_VARINT62
-            or self._local_go_away_uni != MAX_VARINT62
+                self._local_go_away_bidi != MAX_VARINT62
+                or self._local_go_away_uni != MAX_VARINT62
         )
 
     def _queue_local_go_away_locked(
-        self,
-        last_accepted_bidi: int,
-        last_accepted_uni: int,
-        payload: bytes,
-        *,
-        best_effort: bool = False,
+            self,
+            last_accepted_bidi: int,
+            last_accepted_uni: int,
+            payload: bytes,
+            *,
+            best_effort: bool = False,
     ) -> bool:
         """Commit a local GOAWAY and queue it in the same ``_lock`` hold.
 
@@ -872,9 +872,9 @@ class Conn(object):
         current_bidi = self._local_go_away_bidi
         current_uni = self._local_go_away_uni
         if (
-            self._local_go_away_issued_locked()
-            and last_accepted_bidi >= current_bidi
-            and last_accepted_uni >= current_uni
+                self._local_go_away_issued_locked()
+                and last_accepted_bidi >= current_bidi
+                and last_accepted_uni >= current_uni
         ):
             return False
         if last_accepted_bidi > current_bidi or last_accepted_uni > current_uni:
@@ -939,12 +939,12 @@ class Conn(object):
             return
         if await_existing:
             bound = (
-                drain_timeout
-                + go_away_drain_interval(
-                    self._runtime_policy.go_away_drain_interval,
-                    self._last_ping_rtt,
-                )
-                + self._close_completion_bound()
+                    drain_timeout
+                    + go_away_drain_interval(
+                self._runtime_policy.go_away_drain_interval,
+                self._last_ping_rtt,
+            )
+                    + self._close_completion_bound()
             )
             if not self._closed_event.wait(bound):
                 raise GracefulCloseTimeout()
@@ -965,8 +965,8 @@ class Conn(object):
                 refined_bidi = min(self._local_go_away_bidi, self._last_accepted_peer_bidi)
                 refined_uni = min(self._local_go_away_uni, self._last_accepted_peer_uni)
                 if (
-                    refined_bidi < self._local_go_away_bidi
-                    or refined_uni < self._local_go_away_uni
+                        refined_bidi < self._local_go_away_bidi
+                        or refined_uni < self._local_go_away_uni
                 ):
                     self._queue_graceful_go_away_locked(refined_bidi, refined_uni)
             self._reclaim_graceful_close_local_streams()
@@ -1090,10 +1090,10 @@ class Conn(object):
                 default=None,
             )
             ping_stalled = (
-                ping_outstanding
-                and oldest_ping is not None
-                and keepalive_timeout > 0
-                and now - oldest_ping > keepalive_timeout / 2
+                    ping_outstanding
+                    and oldest_ping is not None
+                    and keepalive_timeout > 0
+                    and now - oldest_ping > keepalive_timeout / 2
             )
             inbound_idle_for = (
                 0.0
@@ -1169,20 +1169,20 @@ class Conn(object):
                 pressure=PressureStats(
                     receive_backlog_bytes=self._recv_session_buffered,
                     receive_backlog_high=(
-                        self._recv_session_advertised > 0
-                        and self._recv_session_buffered
-                        >= self._recv_session_advertised // 2
+                            self._recv_session_advertised > 0
+                            and self._recv_session_buffered
+                            >= self._recv_session_advertised // 2
                     ),
                     aggregate_late_data_bytes=aggregate_late_data,
                     aggregate_late_data_at_cap=(
-                        self._runtime_policy.aggregate_late_data_cap > 0
-                        and aggregate_late_data
-                        >= self._runtime_policy.aggregate_late_data_cap
+                            self._runtime_policy.aggregate_late_data_cap > 0
+                            and aggregate_late_data
+                            >= self._runtime_policy.aggregate_late_data_cap
                     ),
                     tracked_buffered_bytes=tracked_memory,
                     tracked_buffered_limit=memory_hard_cap,
                     tracked_buffered_high=(
-                        tracked_memory >= session_memory_high_threshold(memory_hard_cap)
+                            tracked_memory >= session_memory_high_threshold(memory_hard_cap)
                     ),
                     tracked_buffered_at_cap=tracked_memory >= memory_hard_cap,
                     buffered_receive_bytes=self._recv_session_buffered,
@@ -1272,7 +1272,7 @@ class Conn(object):
         self._forget_stream(stream)
 
     def _accept(
-        self, queue: Deque["NativeStream"], timeout: Optional[float]
+            self, queue: Deque["NativeStream"], timeout: Optional[float]
     ) -> "NativeStream":
         deadline = deadline_after(timeout)
         stream = None
@@ -1313,10 +1313,10 @@ class Conn(object):
         return stream
 
     def _open_stream(
-        self,
-        bidirectional: bool,
-        options: Optional[OpenOptions],
-        timeout: Optional[float],
+            self,
+            bidirectional: bool,
+            options: Optional[OpenOptions],
+            timeout: Optional[float],
     ) -> "NativeStream":
         if maybe_timeout(timeout) == 0:
             from .errors import OpenTimeout
@@ -1351,9 +1351,9 @@ class Conn(object):
                 1
                 for stream in self._streams.values()
                 if (
-                    stream.opened_locally
-                    and stream.bidirectional == bidirectional
-                    and not stream.closed
+                        stream.opened_locally
+                        and stream.bidirectional == bidirectional
+                        and not stream.closed
                 )
             )
             queue = self._provisional_queue_locked(bidirectional)
@@ -1414,11 +1414,11 @@ class Conn(object):
         self._wait_write(self._queue_frame(frame))
 
     def _queue_frame(
-        self,
-        frame: Frame,
-        *,
-        from_reader: bool = False,
-        droppable: bool = False,
+            self,
+            frame: Frame,
+            *,
+            from_reader: bool = False,
+            droppable: bool = False,
     ) -> Optional[_WriteRequest]:
         """Queue ``frame`` for the writer thread without blocking.
 
@@ -1448,10 +1448,10 @@ class Conn(object):
         return request
 
     def _queue_frame_locked(
-        self,
-        frame: Frame,
-        data: bytes,
-        droppable: bool,
+            self,
+            frame: Frame,
+            data: bytes,
+            droppable: bool,
     ) -> Optional[_WriteRequest]:
         frame_type = frame.frame_type
         stream_id = frame.stream_id
@@ -1472,12 +1472,12 @@ class Conn(object):
             request.data_lane = True
             self._queued_data_bytes = _sat_add(self._queued_data_bytes, len(data))
             self._queued_data_by_stream[stream_id] = (
-                self._queued_data_by_stream.get(stream_id, 0) + 1
+                    self._queued_data_by_stream.get(stream_id, 0) + 1
             )
         elif (
-            stream_id != 0
-            and frame_type != FrameType.MAX_DATA
-            and self._queued_data_by_stream.get(stream_id)
+                stream_id != 0
+                and frame_type != FrameType.MAX_DATA
+                and self._queued_data_by_stream.get(stream_id)
         ):
             request.data_lane = True
         if request.data_lane:
@@ -1495,9 +1495,9 @@ class Conn(object):
         return request
 
     def _wait_write(
-        self,
-        request: Optional[_WriteRequest],
-        deadline_source=None,
+            self,
+            request: Optional[_WriteRequest],
+            deadline_source=None,
     ) -> None:
         """Wait for ``request`` to reach the transport.
 
@@ -1556,7 +1556,7 @@ class Conn(object):
             self._finish(exc, failed=True, close_transport=True)
 
     def _take_write_batch_locked(
-        self,
+            self,
     ) -> Tuple[Tuple[_WriteRequest, ...], Optional[_WriteRequest]]:
         batch = []
         size = 0
@@ -1572,9 +1572,9 @@ class Conn(object):
                 break
         if final is None:
             while (
-                self._data_writes
-                and len(batch) < max_frames
-                and (not batch or size + len(self._data_writes[0].data) <= _WRITER_BATCH_MAX_BYTES)
+                    self._data_writes
+                    and len(batch) < max_frames
+                    and (not batch or size + len(self._data_writes[0].data) <= _WRITER_BATCH_MAX_BYTES)
             ):
                 request = self._data_writes.popleft()
                 self._mark_write_started_locked(request)
@@ -1605,9 +1605,9 @@ class Conn(object):
             )
 
     def _complete_requests_locked(
-        self,
-        requests: Iterable[_WriteRequest],
-        error: Optional[BaseException],
+            self,
+            requests: Iterable[_WriteRequest],
+            error: Optional[BaseException],
     ) -> None:
         for request in requests:
             if not request.done:
@@ -1616,10 +1616,10 @@ class Conn(object):
         self._write_cond.notify_all()
 
     def _drop_queued_writes_locked(
-        self,
-        error: BaseException,
-        *,
-        include_urgent: bool,
+            self,
+            error: BaseException,
+            *,
+            include_urgent: bool,
     ) -> None:
         dropped = list(self._data_writes)
         self._data_writes.clear()
@@ -1649,9 +1649,9 @@ class Conn(object):
             self._lock_notify_all()
 
     def _shutdown_writer(
-        self,
-        close_payload: Optional[bytes],
-        error: BaseException,
+            self,
+            close_payload: Optional[bytes],
+            error: BaseException,
     ) -> bool:
         """Stop admitting writes and emit at most one bounded CLOSE.
 
@@ -1675,9 +1675,9 @@ class Conn(object):
                 close_request = None
         with self._write_cond:
             writer_usable = (
-                not self._writer_closed
-                and self._writer_thread.is_alive()
-                and threading.current_thread() is not self._writer_thread
+                    not self._writer_closed
+                    and self._writer_thread.is_alive()
+                    and threading.current_thread() is not self._writer_thread
             )
             self._writer_closed = True
             if close_request is not None and writer_usable:
@@ -1842,11 +1842,11 @@ class Conn(object):
         if app_data:
             if stream.read_closed:
                 if not self._record_late_peer_data(
-                    stream,
-                    len(app_data),
-                    hidden=not stream.opened_locally
-                    and stream not in self._accept_bidi
-                    and stream not in self._accept_uni,
+                        stream,
+                        len(app_data),
+                        hidden=not stream.opened_locally
+                               and stream not in self._accept_bidi
+                               and stream not in self._accept_uni,
                 ):
                     # Beyond the stream credit still outstanding when this
                     # side stopped reading (SPEC section 8).
@@ -1880,12 +1880,12 @@ class Conn(object):
             stream.receive_fin()
 
     def _handle_terminal_data(
-        self,
-        stream_id: int,
-        length: int,
-        disposition: TerminalDataDisposition,
-        *,
-        fin: bool = False,
+            self,
+            stream_id: int,
+            length: int,
+            disposition: TerminalDataDisposition,
+            *,
+            fin: bool = False,
     ) -> None:
         self._record_terminal_late_peer_data(stream_id, length, disposition.cause)
         if disposition.action is LateDataAction.ABORT_CLOSED:
@@ -1918,10 +1918,10 @@ class Conn(object):
             )
 
     def _reject_live_stream(
-        self,
-        stream: "NativeStream",
-        code: ErrorCode,
-        local_reason: str = "",
+            self,
+            stream: "NativeStream",
+            code: ErrorCode,
+            local_reason: str = "",
     ) -> None:
         """Answer a peer stream-level violation on a live stream with ABORT(code).
 
@@ -1975,7 +1975,7 @@ class Conn(object):
         )
 
     def _get_or_create_peer_stream(
-        self, stream_id: int, metadata: StreamMetadata
+            self, stream_id: int, metadata: StreamMetadata
     ) -> Optional["NativeStream"]:
         refused = ()
         refuse_above_go_away = False
@@ -2016,10 +2016,10 @@ class Conn(object):
         return stream
 
     def _admit_peer_stream_locked(
-        self,
-        stream_id: int,
-        bidirectional: bool,
-        metadata: StreamMetadata,
+            self,
+            stream_id: int,
+            bidirectional: bool,
+            metadata: StreamMetadata,
     ) -> Tuple[Optional["NativeStream"], Tuple["NativeStream", ...]]:
         """Consume the next expected peer ID and admit or refuse its stream.
 
@@ -2062,7 +2062,7 @@ class Conn(object):
                 stream_id,
                 LateDataCause.ABORT,
                 late_data_cap=self._late_data_allowance_locked(stream, stopped_locally=True)
-                or None,
+                              or None,
             )
             self._lock_notify_all()
             return None, (stream,)
@@ -2078,11 +2078,11 @@ class Conn(object):
         return stream, refused
 
     def _record_late_peer_data(
-        self,
-        stream: "NativeStream",
-        length: int,
-        *,
-        hidden: bool,
+            self,
+            stream: "NativeStream",
+            length: int,
+            *,
+            hidden: bool,
     ) -> bool:
         """Discard DATA for a live stream whose receive half no longer takes it.
 
@@ -2101,9 +2101,9 @@ class Conn(object):
         cause = stream._receive_late_data_cause()
         with self._lock:
             if receive_window_exceeded(
-                self._recv_session_received,
-                self._recv_session_advertised,
-                length,
+                    self._recv_session_received,
+                    self._recv_session_advertised,
+                    length,
             ):
                 raise FlowControlError(
                     "session max_data exceeded",
@@ -2112,13 +2112,13 @@ class Conn(object):
             self._recv_session_received = _sat_add(self._recv_session_received, length)
             self._received_data_bytes = _sat_add(self._received_data_bytes, length)
             if (
-                stream._read_stopped
-                and stream._read_error is None
-                and receive_window_exceeded(
-                    stream._recv_received,
-                    stream._recv_advertised,
-                    length,
-                )
+                    stream._read_stopped
+                    and stream._read_error is None
+                    and receive_window_exceeded(
+                stream._recv_received,
+                stream._recv_advertised,
+                length,
+            )
             ):
                 self._release_discarded_session_credit_locked(length)
                 return False
@@ -2136,10 +2136,10 @@ class Conn(object):
         return True
 
     def _record_terminal_late_peer_data(
-        self,
-        stream_id: int,
-        length: int,
-        cause: LateDataCause,
+            self,
+            stream_id: int,
+            length: int,
+            cause: LateDataCause,
     ) -> None:
         """Discard DATA for a compacted stream.
 
@@ -2152,9 +2152,9 @@ class Conn(object):
             return
         with self._lock:
             if receive_window_exceeded(
-                self._recv_session_received,
-                self._recv_session_advertised,
-                length,
+                    self._recv_session_received,
+                    self._recv_session_advertised,
+                    length,
             ):
                 raise FlowControlError(
                     "session max_data exceeded",
@@ -2199,10 +2199,10 @@ class Conn(object):
         return _sat_add(self._live_late_data_retained, self._terminal_state.late_data_retained)
 
     def _late_data_allowance_locked(
-        self,
-        stream: "NativeStream",
-        *,
-        stopped_locally: Optional[bool] = None,
+            self,
+            stream: "NativeStream",
+            *,
+            stopped_locally: Optional[bool] = None,
     ) -> int:
         """Return the per-direction late-data allowance (0: unlimited).
 
@@ -2220,7 +2220,7 @@ class Conn(object):
         if cap == 0 or not stopped_locally:
             return cap
         outstanding = stream._recv_advertised - (
-            stream._recv_received - stream._late_data_received
+                stream._recv_received - stream._late_data_received
         )
         return max(cap, outstanding)
 
@@ -2237,9 +2237,9 @@ class Conn(object):
             return
         with self._lock:
             if receive_window_exceeded(
-                self._recv_session_received,
-                self._recv_session_advertised,
-                length,
+                    self._recv_session_received,
+                    self._recv_session_advertised,
+                    length,
             ):
                 raise FlowControlError(
                     "session max_data exceeded",
@@ -2269,9 +2269,9 @@ class Conn(object):
             matched = None
             for ping_payload, pending in self._pings.items():
                 if pong_payload_matches_ping(
-                    payload,
-                    ping_payload,
-                    allow_padding=pending.allows_padded_pong,
+                        payload,
+                        ping_payload,
+                        allow_padding=pending.allows_padded_pong,
                 ):
                     matched_payload = ping_payload
                     matched = pending
@@ -2310,10 +2310,10 @@ class Conn(object):
                 # that races session termination changes nothing.
                 return
             changed = (
-                self._peer_go_away_bidi is None
-                or self._peer_go_away_uni is None
-                or parsed.last_accepted_bidi < self._peer_go_away_bidi
-                or parsed.last_accepted_uni < self._peer_go_away_uni
+                    self._peer_go_away_bidi is None
+                    or self._peer_go_away_uni is None
+                    or parsed.last_accepted_bidi < self._peer_go_away_bidi
+                    or parsed.last_accepted_uni < self._peer_go_away_uni
             )
             self._peer_go_away_bidi = parsed.last_accepted_bidi
             self._peer_go_away_uni = parsed.last_accepted_uni
@@ -2349,10 +2349,10 @@ class Conn(object):
         self._finish(app, failed=app is not None, close_transport=True)
 
     def _handle_stop_sending(
-        self,
-        stream_id: int,
-        payload: bytes,
-        now: Optional[float] = None,
+            self,
+            stream_id: int,
+            payload: bytes,
+            now: Optional[float] = None,
     ) -> None:
         code, reason = parse_error_payload(payload)
         stream = self._streams.get(stream_id)
@@ -2397,10 +2397,10 @@ class Conn(object):
         )
 
     def _handle_reset(
-        self,
-        stream_id: int,
-        payload: bytes,
-        now: Optional[float] = None,
+            self,
+            stream_id: int,
+            payload: bytes,
+            now: Optional[float] = None,
     ) -> None:
         code, reason = parse_error_payload(payload)
         stream = self._streams.get(stream_id)
@@ -2434,10 +2434,10 @@ class Conn(object):
         self._finish_peer_terminal_control(stream, now)
 
     def _handle_abort(
-        self,
-        stream_id: int,
-        payload: bytes,
-        now: Optional[float] = None,
+            self,
+            stream_id: int,
+            payload: bytes,
+            now: Optional[float] = None,
     ) -> None:
         code, reason = parse_error_payload(payload)
         stream = self._streams.get(stream_id)
@@ -2464,9 +2464,9 @@ class Conn(object):
         self._finish_peer_terminal_control(stream, now)
 
     def _finish_peer_terminal_control(
-        self,
-        stream: "NativeStream",
-        now: Optional[float],
+            self,
+            stream: "NativeStream",
+            now: Optional[float],
     ) -> None:
         """Account a peer RESET, STOP_SENDING or ABORT that changed a stream.
 
@@ -2480,10 +2480,10 @@ class Conn(object):
         self._inbound_budget.clear_no_op_control_budgets()
         with self._lock:
             churn = (
-                not stream.opened_locally
-                and not stream._churn_counted
-                and stream.stream_id in self._accept_visibility
-                and stream.closed
+                    not stream.opened_locally
+                    and not stream._churn_counted
+                    and stream.stream_id in self._accept_visibility
+                    and stream.closed
             )
             if churn:
                 stream._churn_counted = True
@@ -2491,10 +2491,10 @@ class Conn(object):
             self._inbound_budget.record_visible_terminal_churn(now)
 
     def _ignore_terminal_control_or_raise(
-        self,
-        stream_id: int,
-        frame_name: str,
-        now: Optional[float] = None,
+            self,
+            stream_id: int,
+            frame_name: str,
+            now: Optional[float] = None,
     ) -> None:
         with self._lock:
             if self._terminal_state.has_terminal_marker(stream_id):
@@ -2573,11 +2573,11 @@ class Conn(object):
         self._lock_notify_all()
 
     def _handle_ext(
-        self,
-        stream_id: int,
-        metadata: Optional[StreamMetadata],
-        valid: bool,
-        now: Optional[float] = None,
+            self,
+            stream_id: int,
+            metadata: Optional[StreamMetadata],
+            valid: bool,
+            now: Optional[float] = None,
     ) -> None:
         if not valid:
             # A negotiated PRIORITY_UPDATE with an unusable TLV block.
@@ -2605,11 +2605,11 @@ class Conn(object):
             self._inbound_budget.clear_no_op_priority_update()
 
     def _handle_max_data(
-        self,
-        stream_id: int,
-        value: Optional[int],
-        now: Optional[float] = None,
-        payload_len: int = 0,
+            self,
+            stream_id: int,
+            value: Optional[int],
+            now: Optional[float] = None,
+            payload_len: int = 0,
     ) -> None:
         if value is None:
             return
@@ -2646,11 +2646,11 @@ class Conn(object):
             self._inbound_budget.record_no_op_max_data(now)
 
     def _handle_blocked(
-        self,
-        stream_id: int,
-        blocked_at: Optional[int],
-        now: Optional[float] = None,
-        payload_len: int = 0,
+            self,
+            stream_id: int,
+            blocked_at: Optional[int],
+            now: Optional[float] = None,
+            payload_len: int = 0,
     ) -> None:
         if blocked_at is None:
             return
@@ -2694,7 +2694,7 @@ class Conn(object):
         self._inbound_budget.record_mixed(payload_len, now)
 
     def _note_peer_blocked_locked(
-        self, stream: Optional["NativeStream"], blocked_at: int
+            self, stream: Optional["NativeStream"], blocked_at: int
     ) -> bool:
         """Return whether a peer BLOCKED reports a new limiting offset.
 
@@ -2760,9 +2760,9 @@ class Conn(object):
             return True
         with self._lock:
             if receive_window_exceeded(
-                self._recv_session_received,
-                self._recv_session_advertised,
-                byte_count,
+                    self._recv_session_received,
+                    self._recv_session_advertised,
+                    byte_count,
             ):
                 raise FlowControlError(
                     "session max_data exceeded",
@@ -2770,9 +2770,9 @@ class Conn(object):
                 )
             self._recv_session_received = _sat_add(self._recv_session_received, byte_count)
             if receive_window_exceeded(
-                stream._recv_received,
-                stream._recv_advertised,
-                byte_count,
+                    stream._recv_received,
+                    stream._recv_advertised,
+                    byte_count,
             ):
                 self._received_data_bytes = _sat_add(self._received_data_bytes, byte_count)
                 self._release_discarded_session_credit_locked(byte_count)
@@ -2848,13 +2848,13 @@ class Conn(object):
             if self._streams.get(stream.stream_id) is not stream:
                 return
             if not stream.opened_locally and not window_remaining(
-                stream._recv_advertised,
-                stream._recv_received,
+                    stream._recv_advertised,
+                    stream._recv_received,
             ):
                 self._replenish_stream_locked(stream, force=True)
             if not window_remaining(
-                self._recv_session_advertised,
-                self._recv_session_received,
+                    self._recv_session_advertised,
+                    self._recv_session_received,
             ):
                 self._replenish_session_locked(force=True)
 
@@ -2869,13 +2869,13 @@ class Conn(object):
         target = self._session_window_target_locked()
         payload = self._receive_frame_payload_locked()
         if not should_replenish_pending_window(
-            window_remaining(advertised, received),
-            target,
-            advertised,
-            pending,
-            session_emergency_threshold(payload),
-            replenish_min_pending(target, payload),
-            force=force,
+                window_remaining(advertised, received),
+                target,
+                advertised,
+                pending,
+                session_emergency_threshold(payload),
+                replenish_min_pending(target, payload),
+                force=force,
         ):
             return False
         desired = next_credit_limit(
@@ -2898,7 +2898,7 @@ class Conn(object):
         return True
 
     def _replenish_stream_locked(
-        self, stream: "NativeStream", *, force: bool = False
+            self, stream: "NativeStream", *, force: bool = False
     ) -> bool:
         """Re-advertise released stream credit; return whether MAX_DATA was queued."""
 
@@ -2913,13 +2913,13 @@ class Conn(object):
         target = self._stream_window_target_locked(stream)
         payload = self._receive_frame_payload_locked()
         if not should_replenish_pending_window(
-            window_remaining(advertised, received),
-            target,
-            advertised,
-            pending,
-            stream_emergency_threshold(target, payload),
-            replenish_min_pending(target, payload),
-            force=force,
+                window_remaining(advertised, received),
+                target,
+                advertised,
+                pending,
+                stream_emergency_threshold(target, payload),
+                replenish_min_pending(target, payload),
+                force=force,
         ):
             return False
         desired = next_credit_limit(
@@ -2943,12 +2943,12 @@ class Conn(object):
 
     def _stream_accepts_peer_data_locked(self, stream: "NativeStream") -> bool:
         return (
-            stream._local_receive
-            and not stream._read_closed
-            and not stream._read_finished
-            and stream._read_error is None
-            and not self._state.terminal()
-            and self._streams.get(stream.stream_id) is stream
+                stream._local_receive
+                and not stream._read_closed
+                and not stream._read_finished
+                and stream._read_error is None
+                and not self._state.terminal()
+                and self._streams.get(stream.stream_id) is stream
         )
 
     def _queue_max_data_locked(self, stream_id: int, value: int) -> None:
@@ -3005,10 +3005,10 @@ class Conn(object):
             stream._recv_advertised = max(stream._recv_advertised, value)
 
     def _reserve_send_credit(
-        self,
-        stream: "NativeStream",
-        byte_count: int,
-        timeout_deadline: Optional[float],
+            self,
+            stream: "NativeStream",
+            byte_count: int,
+            timeout_deadline: Optional[float],
     ) -> int:
         if byte_count <= 0:
             return 0
@@ -3043,9 +3043,9 @@ class Conn(object):
                     blocked.append((0, self._send_session_max))
                     self._session_blocked_sent_at = self._send_session_max
                 if (
-                    stream_credit == 0
-                    and stream._opened_sent
-                    and stream._blocked_sent_at != stream._send_max
+                        stream_credit == 0
+                        and stream._opened_sent
+                        and stream._blocked_sent_at != stream._send_max
                 ):
                     blocked.append((stream.stream_id, stream._send_max))
                     stream._blocked_sent_at = stream._send_max
@@ -3117,11 +3117,11 @@ class Conn(object):
         )
 
     def _finish(
-        self,
-        error: Optional[BaseException],
-        *,
-        failed: bool,
-        close_transport: bool,
+            self,
+            error: Optional[BaseException],
+            *,
+            failed: bool,
+            close_transport: bool,
     ) -> None:
         """Terminate without emitting CLOSE (peer CLOSE or transport failure)."""
 
@@ -3142,13 +3142,13 @@ class Conn(object):
         self._terminate(error, failed=True, close_for_error=True)
 
     def _terminate(
-        self,
-        error: Optional[BaseException],
-        *,
-        failed: bool,
-        close_payload: Optional[bytes] = None,
-        close_for_error: bool = False,
-        close_transport: bool = True,
+            self,
+            error: Optional[BaseException],
+            *,
+            failed: bool,
+            close_payload: Optional[bytes] = None,
+            close_for_error: bool = False,
+            close_transport: bool = True,
     ) -> bool:
         """Commit terminal state, then emit CLOSE (bounded) and close the transport.
 
@@ -3217,8 +3217,8 @@ class Conn(object):
         return True
 
     def _fatal_close_payload_locked(
-        self,
-        error: Optional[BaseException],
+            self,
+            error: Optional[BaseException],
     ) -> Optional[bytes]:
         if error is None:
             return None
@@ -3358,7 +3358,7 @@ class Conn(object):
         return self._provisional_bidi if bidirectional else self._provisional_uni
 
     def _fail_provisional_locked(
-        self, stream: "NativeStream", error: BaseException
+            self, stream: "NativeStream", error: BaseException
     ) -> None:
         stream._provisional_created_at = None
         with stream._cond:
@@ -3372,14 +3372,14 @@ class Conn(object):
         self._lock_notify_all()
 
     def _abort_provisional_open(
-        self, stream: "NativeStream", error: BaseException
+            self, stream: "NativeStream", error: BaseException
     ) -> bool:
         with self._lock:
             if (
-                stream is None
-                or stream._opened_sent
-                or stream._stream_id != 0
-                or not stream.opened_locally
+                    stream is None
+                    or stream._opened_sent
+                    or stream._stream_id != 0
+                    or not stream.opened_locally
             ):
                 return False
             queue = self._provisional_queue_locked(stream.bidirectional)
@@ -3391,7 +3391,7 @@ class Conn(object):
             return True
 
     def _reap_expired_provisionals_locked(
-        self, bidirectional: bool, now: float
+            self, bidirectional: bool, now: float
     ) -> None:
         queue = self._provisional_queue_locked(bidirectional)
         max_age = provisional_open_max_age(self._last_ping_rtt)
@@ -3399,12 +3399,12 @@ class Conn(object):
             stream = queue[0]
             created = stream._provisional_created_at
             if (
-                created is None
-                or max_age <= 0
-                # Only idle provisional time counts: a stream waiting for its
-                # commit turn does not age.
-                or stream._provisional_commit_waiters
-                or now - created <= max_age
+                    created is None
+                    or max_age <= 0
+                    # Only idle provisional time counts: a stream waiting for its
+                    # commit turn does not age.
+                    or stream._provisional_commit_waiters
+                    or now - created <= max_age
             ):
                 return
             queue.popleft()
@@ -3429,7 +3429,7 @@ class Conn(object):
             stream._provisional_created_at += waited
 
     def _reclaim_provisionals_locked(
-        self, bidirectional: bool, peer_watermark: int
+            self, bidirectional: bool, peer_watermark: int
     ) -> None:
         """Fail the provisionals a peer GOAWAY watermark leaves no ID for.
 
@@ -3455,10 +3455,10 @@ class Conn(object):
             self._fail_provisional_locked(stream, error)
 
     def _commit_local_open(
-        self,
-        stream: "NativeStream",
-        timeout_deadline: Optional[float],
-        queue_opener: Callable[[], _T],
+            self,
+            stream: "NativeStream",
+            timeout_deadline: Optional[float],
+            queue_opener: Callable[[], _T],
     ) -> Optional[_T]:
         """Assign ``stream`` its ID and queue its opener in one critical section.
 
@@ -3510,9 +3510,9 @@ class Conn(object):
                     )
                     if head_created is not None:
                         expires_in = (
-                            head_created
-                            + provisional_open_max_age(self._last_ping_rtt)
-                            - time.monotonic()
+                                head_created
+                                + provisional_open_max_age(self._last_ping_rtt)
+                                - time.monotonic()
                         )
                         if expires_in <= 0:
                             wait_for = 0.0
@@ -3559,9 +3559,9 @@ class Conn(object):
                     1
                     for existing in self._streams.values()
                     if (
-                        existing.opened_locally
-                        and existing.bidirectional == bidirectional
-                        and not existing.closed
+                            existing.opened_locally
+                            and existing.bidirectional == bidirectional
+                            and not existing.closed
                     )
                 )
                 if active >= limit:
@@ -3646,7 +3646,7 @@ class Conn(object):
                 stream,
                 LateDataCause.ABORT,
                 late_data_cap=self._late_data_allowance_locked(stream, stopped_locally=True)
-                or None,
+                              or None,
             )
             refused.append(stream)
         return tuple(refused)
@@ -3657,14 +3657,14 @@ class Conn(object):
         if policy.accept_backlog_limit and count > policy.accept_backlog_limit:
             return True
         if (
-            policy.accept_backlog_bytes_limit
-            and self._accept_backlog_bytes_locked() > policy.accept_backlog_bytes_limit
+                policy.accept_backlog_bytes_limit
+                and self._accept_backlog_bytes_locked() > policy.accept_backlog_bytes_limit
         ):
             return True
         if (
-            policy.retained_open_info_bytes_budget
-            and self._accept_backlog_open_info_bytes_locked()
-            > policy.retained_open_info_bytes_budget
+                policy.retained_open_info_bytes_budget
+                and self._accept_backlog_open_info_bytes_locked()
+                > policy.retained_open_info_bytes_budget
         ):
             return True
         cap = self._config.session_memory_cap
@@ -3709,9 +3709,9 @@ class Conn(object):
         active = 0
         for stream in self._streams.values():
             if (
-                not stream.opened_locally
-                and stream.bidirectional == bidirectional
-                and not stream.closed
+                    not stream.opened_locally
+                    and stream.bidirectional == bidirectional
+                    and not stream.closed
             ):
                 active += 1
         return active < limit
@@ -3732,7 +3732,7 @@ class Conn(object):
         return self._pop_accepted_tail_locked(self._accept_uni)
 
     def _pop_accepted_tail_locked(
-        self, queue: Deque["NativeStream"]
+            self, queue: Deque["NativeStream"]
     ) -> Optional["NativeStream"]:
         if not queue:
             return None
@@ -3767,12 +3767,12 @@ class Conn(object):
         )
 
     def _retire_stream_locked(
-        self,
-        stream: "NativeStream",
-        cause: LateDataCause,
-        *,
-        action: LateDataAction = LateDataAction.IGNORE,
-        late_data_cap: Optional[int] = None,
+            self,
+            stream: "NativeStream",
+            cause: LateDataCause,
+            *,
+            action: LateDataAction = LateDataAction.IGNORE,
+            late_data_cap: Optional[int] = None,
     ) -> None:
         """Compact a stream leaving ``_streams`` into its tombstone.
 
@@ -3794,14 +3794,14 @@ class Conn(object):
         self._streams.pop(stream.stream_id, None)
 
     def _remember_terminal_stream_locked(
-        self,
-        stream_id: int,
-        cause: LateDataCause = LateDataCause.NONE,
-        *,
-        action: LateDataAction = LateDataAction.IGNORE,
-        hidden: bool = False,
-        late_data_cap: Optional[int] = None,
-        late_data_received: int = 0,
+            self,
+            stream_id: int,
+            cause: LateDataCause = LateDataCause.NONE,
+            *,
+            action: LateDataAction = LateDataAction.IGNORE,
+            hidden: bool = False,
+            late_data_cap: Optional[int] = None,
+            late_data_received: int = 0,
     ) -> None:
         self._terminal_state.record_tombstone(
             stream_id,
@@ -4058,16 +4058,16 @@ class NativeStream(object):
     )
 
     def __init__(
-        self,
-        session: Conn,
-        stream_id: int,
-        *,
-        opened_locally: bool,
-        bidirectional: bool,
-        local_send: bool,
-        local_receive: bool,
-        metadata: StreamMetadata,
-        opened_sent: bool = False,
+            self,
+            session: Conn,
+            stream_id: int,
+            *,
+            opened_locally: bool,
+            bidirectional: bool,
+            local_send: bool,
+            local_receive: bool,
+            metadata: StreamMetadata,
+            opened_sent: bool = False,
     ) -> None:
         self._session = session
         self._stream_id = stream_id
@@ -4137,10 +4137,10 @@ class NativeStream(object):
 
     # noinspection PyTypeHints
     def __exit__(
-        self,
-        exc_type: Optional[type[BaseException]],
-        exc: Optional[BaseException],
-        tb: Optional[TracebackType],
+            self,
+            exc_type: Optional[type[BaseException]],
+            exc: Optional[BaseException],
+            tb: Optional[TracebackType],
     ) -> None:
         self.close()
 
@@ -4237,7 +4237,7 @@ class NativeStream(object):
         return bytes_read
 
     def read_vectored(
-        self, buffers: Iterable[WritableBuffer], *, timeout: Optional[float] = None
+            self, buffers: Iterable[WritableBuffer], *, timeout: Optional[float] = None
     ) -> int:
         views = _writable_views(buffers)
         if not views:
@@ -4290,7 +4290,7 @@ class NativeStream(object):
         self.write(data, timeout=timeout)
 
     def write_vectored(
-        self, parts: Iterable[ReadableBuffer], *, timeout: Optional[float] = None
+            self, parts: Iterable[ReadableBuffer], *, timeout: Optional[float] = None
     ) -> int:
         views, total = _readable_views(parts)
         if total == 0:
@@ -4299,14 +4299,14 @@ class NativeStream(object):
         return total
 
     def write_final(
-        self, data: ReadableBuffer = b"", *, timeout: Optional[float] = None
+            self, data: ReadableBuffer = b"", *, timeout: Optional[float] = None
     ) -> int:
         view = _readable_view(data)
         self._send_data(view, fin=True, timeout=timeout)
         return len(view)
 
     def write_vectored_final(
-        self, parts: Iterable[ReadableBuffer], *, timeout: Optional[float] = None
+            self, parts: Iterable[ReadableBuffer], *, timeout: Optional[float] = None
     ) -> int:
         views, total = _readable_views(parts)
         self._send_data_vectored(views, fin=True, timeout=timeout)
@@ -4378,9 +4378,9 @@ class NativeStream(object):
             # STOP_SENDING already concluded (with our RESET) stays a no-op.
             self._raise_if_session_terminated()
             if (
-                error is not None
-                and error_termination_kind(error) is TerminationKind.STOPPED
-                and getattr(error, "source", None) is ErrorSource.REMOTE
+                    error is not None
+                    and error_termination_kind(error) is TerminationKind.STOPPED
+                    and getattr(error, "source", None) is ErrorSource.REMOTE
             ):
                 return
             if error is not None:
@@ -4501,10 +4501,10 @@ class NativeStream(object):
         with self._cond:
             needs_read = self._local_receive and not self._read_terminal()
             if (
-                self._local_receive
-                and not needs_read
-                and not self._read_stopped
-                and self._read_error is None
+                    self._local_receive
+                    and not needs_read
+                    and not self._read_stopped
+                    and self._read_error is None
             ):
                 # The peer already finished this direction: nothing to stop,
                 # but further reads fail promptly and unread bytes are dropped
@@ -4565,23 +4565,23 @@ class NativeStream(object):
         self._queue_control_frame(Frame(FrameType.ABORT, self._stream_id, 0, payload))
 
     def _send_data(
-        self,
-        data: memoryview,
-        *,
-        fin: bool,
-        timeout: Optional[float],
-        wait: bool = True,
+            self,
+            data: memoryview,
+            *,
+            fin: bool,
+            timeout: Optional[float],
+            wait: bool = True,
     ) -> None:
         parts = () if len(data) == 0 else (data,)
         self._send_data_vectored(parts, fin=fin, timeout=timeout, wait=wait)
 
     def _send_data_vectored(
-        self,
-        parts: Tuple[memoryview, ...],
-        *,
-        fin: bool,
-        timeout: Optional[float],
-        wait: bool = True,
+            self,
+            parts: Tuple[memoryview, ...],
+            *,
+            fin: bool,
+            timeout: Optional[float],
+            wait: bool = True,
     ) -> None:
         parts = tuple(part for part in parts if len(part) > 0)
         timeout_deadline = deadline_after(timeout)
@@ -4704,13 +4704,13 @@ class NativeStream(object):
             raise
 
     def _queue_opener_locked(
-        self,
-        parts: Tuple[memoryview, ...],
-        part_index: int,
-        part_offset: int,
-        desired: int,
-        prefix: bytes,
-        fin: bool,
+            self,
+            parts: Tuple[memoryview, ...],
+            part_index: int,
+            part_offset: int,
+            desired: int,
+            prefix: bytes,
+            fin: bool,
     ) -> Tuple[object, int, int, bool, bool]:
         # Runs under the session lock right after the ID is assigned, so it
         # only takes credit that is free now and never waits.
@@ -4726,15 +4726,15 @@ class NativeStream(object):
         )
 
     def _queue_data_chunk(
-        self,
-        parts: Tuple[memoryview, ...],
-        part_index: int,
-        part_offset: int,
-        take: int,
-        prefix: bytes,
-        fin: bool,
-        *,
-        opener: bool = False,
+            self,
+            parts: Tuple[memoryview, ...],
+            part_index: int,
+            part_offset: int,
+            take: int,
+            prefix: bytes,
+            fin: bool,
+            *,
+            opener: bool = False,
     ) -> Tuple[object, int, int, bool, bool]:
         """Frame the next ``take`` reserved bytes and queue them.
 
@@ -4878,9 +4878,9 @@ class NativeStream(object):
             return True
         error = self._read_error
         return (
-            error is not None
-            and error_termination_kind(error) is TerminationKind.ABORT
-            and getattr(error, "source", None) is ErrorSource.LOCAL
+                error is not None
+                and error_termination_kind(error) is TerminationKind.ABORT
+                and getattr(error, "source", None) is ErrorSource.LOCAL
         )
 
     def _receive_data(self, data: memoryview) -> bool:
@@ -5051,10 +5051,10 @@ class NativeStream(object):
                     source=ErrorSource.LOCAL,
                 )
             if (
-                self._local_receive
-                and self._read_error is None
-                and not self._read_stopped
-                and not self._peer_fin_seen
+                    self._local_receive
+                    and self._read_error is None
+                    and not self._read_stopped
+                    and not self._peer_fin_seen
             ):
                 self._read_error = error or SessionClosed(
                     operation=ErrorOperation.READ,
@@ -5090,8 +5090,8 @@ class NativeStream(object):
             self._metadata.open_info,
         )
         changed = (
-            updated.priority != self._metadata.priority
-            or updated.group != self._metadata.group
+                updated.priority != self._metadata.priority
+                or updated.group != self._metadata.group
         )
         self._metadata = updated
         return changed
@@ -5160,10 +5160,10 @@ class NativeStream(object):
 
     def _read_terminal(self) -> bool:
         return (
-            not self._local_receive
-            or self._read_closed
-            or self._read_finished
-            or self._read_error is not None
+                not self._local_receive
+                or self._read_closed
+                or self._read_finished
+                or self._read_error is not None
         )
 
     def _write_terminal(self) -> bool:
@@ -5175,10 +5175,10 @@ class NativeStream(object):
         with self._cond:
             stored = self._read_error if read else self._write_error
         return (
-            error is stored
-            and getattr(error, "source", None) is ErrorSource.REMOTE
-            and error_termination_kind(error)
-            in (TerminationKind.RESET, TerminationKind.ABORT, TerminationKind.STOPPED)
+                error is stored
+                and getattr(error, "source", None) is ErrorSource.REMOTE
+                and error_termination_kind(error)
+                in (TerminationKind.RESET, TerminationKind.ABORT, TerminationKind.STOPPED)
         )
 
 
@@ -5320,10 +5320,10 @@ def _initial_stream_send_max(session: object, stream_id: int, local_send: bool) 
 
 
 def _initial_stream_receive_window(
-    session: object,
-    opened_locally: bool,
-    bidirectional: bool,
-    local_receive: bool,
+        session: object,
+        opened_locally: bool,
+        bidirectional: bool,
+        local_receive: bool,
 ) -> int:
     if not local_receive:
         return 0
@@ -5356,9 +5356,9 @@ def _application_code(code: int) -> int:
 
 
 def _open_metadata_prefix(
-    capabilities: int,
-    metadata: StreamMetadata,
-    max_frame_payload: int,
+        capabilities: int,
+        metadata: StreamMetadata,
+        max_frame_payload: int,
 ) -> bytes:
     """Build the opener's OPEN_METADATA prefix, raising the typed open errors."""
 
@@ -5381,7 +5381,7 @@ def _open_metadata_prefix(
 
 
 def _abort_open_send_failure(
-    stream: "NativeStream", exc: BaseException, reason: str
+        stream: "NativeStream", exc: BaseException, reason: str
 ) -> None:
     code = getattr(exc, "numeric_code", None)
     if code is None:
@@ -5547,11 +5547,11 @@ def _establishment_stalled(operation: str, message: str) -> BaseException:
 
 
 def _finish_establishment_failure(
-    io: "_FrameIO",
-    preface_writer: _BackgroundCall,
-    local: Preface,
-    peer: Optional[Preface],
-    error: BaseException,
+        io: "_FrameIO",
+        preface_writer: _BackgroundCall,
+        local: Preface,
+        peer: Optional[Preface],
+        error: BaseException,
 ) -> None:
     """Send a fatal establishment CLOSE only after a complete local preface.
 

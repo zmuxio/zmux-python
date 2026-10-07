@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from typing import Tuple
-
 from zmux.session import ActiveStreamStats
+
 from ._constants import MAX_REASON_STATS_CODES
 from ._state import _sat_add
 

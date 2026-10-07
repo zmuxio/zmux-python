@@ -18,7 +18,6 @@ from enum import IntEnum
 from threading import RLock
 from typing import Any, Callable, Dict, Generic, Optional, TypeVar
 
-from .._validation import require_varint62
 from .control import MIN_PENDING_CONTROL_BUDGET, MIN_PENDING_PRIORITY_BUDGET
 from .flow import repo_default_urgent_lane_cap
 from .keepalive import (
@@ -106,6 +105,7 @@ from .._state.session import (
     plan_peer_go_away,
     visible_session_error,
 )
+from .._validation import require_varint62
 from .._wire.payload import build_go_away_payload_capped
 from ..config import (
     DEFAULT_ACCEPT_BACKLOG_LIMIT,

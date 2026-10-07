@@ -11,7 +11,6 @@ import unittest
 
 import zmux
 
-
 GO_HELPER = r'''
 package main
 

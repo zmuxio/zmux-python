@@ -18,9 +18,9 @@ Publishing uses PyPI Trusted Publishing (GitHub OIDC), so no PyPI token is store
 trust owner `zmuxio`, repository `zmux-python` and workflow `release.yml`; they differ only in the GitHub environment,
 because PyPI requires each pending publisher configuration to be unique:
 
-| PyPI project | Environment |
-| --- | --- |
-| `zmuxio` | `pypi` |
+| PyPI project     | Environment    |
+|------------------|----------------|
+| `zmuxio`         | `pypi`         |
 | `zmuxio-aioquic` | `pypi-aioquic` |
 
 GitHub creates both environments the first time the workflow uses them. Required reviewers can be added under

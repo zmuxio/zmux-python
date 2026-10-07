@@ -24,8 +24,8 @@ if str(_AIOQUIC_SRC) not in sys.path:
 import zmux_aioquic
 
 HAVE_AIOQUIC = (
-    importlib.util.find_spec("aioquic") is not None
-    and importlib.util.find_spec("cryptography") is not None
+        importlib.util.find_spec("aioquic") is not None
+        and importlib.util.find_spec("cryptography") is not None
 )
 
 if HAVE_AIOQUIC:
@@ -37,6 +37,7 @@ if HAVE_AIOQUIC:
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec
     from cryptography.x509.oid import NameOID
+
 
     class ZmuxTestProtocol(QuicConnectionProtocol):
         """README integration pattern plus raw QUIC event recording."""
@@ -54,10 +55,10 @@ if HAVE_AIOQUIC:
             if isinstance(
                     event,
                     (
-                        events.StreamDataReceived,
-                        events.StreamReset,
-                        events.StopSendingReceived,
-                        events.ConnectionTerminated,
+                            events.StreamDataReceived,
+                            events.StreamReset,
+                            events.StopSendingReceived,
+                            events.ConnectionTerminated,
                     ),
             ):
                 self.quic_events.append(event)
@@ -65,7 +66,6 @@ if HAVE_AIOQUIC:
 
 else:  # pragma: no cover - exercised only without aioquic
     ZmuxTestProtocol = None
-
 
 ALPN = "zmux-aioquic-loopback-test"
 STEP = 2.0
@@ -303,7 +303,7 @@ class AioquicLoopbackTest(unittest.IsolatedAsyncioTestCase):
                 self.server_conn, events.StreamReset, aborted_stream.stream_id,
                 error_code=301,
             )
-            and _has_event(
+                    and _has_event(
                 self.server_conn, events.StopSendingReceived, aborted_stream.stream_id,
                 error_code=301,
             ),
@@ -334,8 +334,8 @@ class AioquicLoopbackTest(unittest.IsolatedAsyncioTestCase):
             lambda: _has_event(
                 self.client, events.StopSendingReceived, bidi_id, error_code=protocol_code
             )
-            and _has_event(self.client, events.StreamReset, bidi_id, error_code=protocol_code)
-            and _has_event(
+                    and _has_event(self.client, events.StreamReset, bidi_id, error_code=protocol_code)
+                    and _has_event(
                 self.client, events.StopSendingReceived, uni_id, error_code=protocol_code
             ),
             message="PROTOCOL rejection of malformed preludes",

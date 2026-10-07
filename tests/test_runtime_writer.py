@@ -10,6 +10,7 @@ from zmux._runtime.queue import (
     WriteJob,
     make_tx_frame,
 )
+from zmux._runtime.stream import StreamRuntimeState
 from zmux._runtime.writer import (
     BatchConfig,
     BatchScheduler,
@@ -41,7 +42,6 @@ from zmux._runtime.writer import (
     write_job_batch,
     write_vectored_all,
 )
-from zmux._runtime.stream import StreamRuntimeState
 from zmux.errors import (
     ErrorDirection,
     ErrorOperation,

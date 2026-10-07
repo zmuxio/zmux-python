@@ -6,7 +6,6 @@ import sys
 import time
 from collections.abc import Iterable
 from typing import Optional, Tuple
-
 from zmux.config import OpenOptions
 from zmux.errors import AdapterUnsupported
 from zmux.protocol import ErrorCode, MAX_VARINT62

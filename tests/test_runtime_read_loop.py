@@ -44,8 +44,9 @@ from zmux._runtime.read_loop import (
     validate_peer_go_away_payload,
     window_remaining,
 )
+from zmux._wire.frame import read_session_frame
+from zmux._wire.varint import encode_varint
 from zmux.config import (
-    DEFAULT_ABUSE_WINDOW,
     DEFAULT_GROUP_REBUCKET_CHURN_BUDGET,
     DEFAULT_HIDDEN_ABORT_CHURN_BUDGET,
     DEFAULT_HIDDEN_ABORT_CHURN_WINDOW,
@@ -62,8 +63,6 @@ from zmux.config import (
     Config,
     Settings,
 )
-from zmux._wire.frame import read_session_frame
-from zmux._wire.varint import encode_varint
 from zmux.errors import FrameSizeError, ProtocolError
 from zmux.frame import Frame, read_frame
 from zmux.payload import (

@@ -217,10 +217,10 @@ class _DelayedGoAwayQueue(object):
 
         def queue_frame(conn, frame, *args, **kwargs):
             if (
-                conn is hook.session
-                and frame.frame_type == zmux.FrameType.GOAWAY
-                and threading.current_thread().name == hook.thread_name
-                and not hook.entered.is_set()
+                    conn is hook.session
+                    and frame.frame_type == zmux.FrameType.GOAWAY
+                    and threading.current_thread().name == hook.thread_name
+                    and not hook.entered.is_set()
             ):
                 hook.entered.set()
                 time.sleep(hook.delay)
@@ -307,7 +307,7 @@ class GoAwayWireOrderTest(unittest.TestCase):
             self.assertTrue(
                 _wait_until(
                     lambda: client._peer_go_away_bidi == 4
-                    or client.state is zmux.SessionState.FAILED
+                            or client.state is zmux.SessionState.FAILED
                 ),
                 iteration,
             )
@@ -767,9 +767,9 @@ class PartialWriteProgressTest(unittest.TestCase):
         session, peer = self._client()
         try:
             for name, call in (
-                ("write", lambda s: s.write(b"abcdefgh", timeout=0.3)),
-                ("write_vectored", lambda s: s.write_vectored([b"ABC", b"DEFGH"], timeout=0.3)),
-                ("write_final", lambda s: s.write_final(b"01234567", timeout=0.3)),
+                    ("write", lambda s: s.write(b"abcdefgh", timeout=0.3)),
+                    ("write_vectored", lambda s: s.write_vectored([b"ABC", b"DEFGH"], timeout=0.3)),
+                    ("write_final", lambda s: s.write_final(b"01234567", timeout=0.3)),
             ):
                 with self.subTest(call=name):
                     stream = session.open_stream()
@@ -814,8 +814,8 @@ class PartialWriteProgressTest(unittest.TestCase):
             self.assertIsNotNone(
                 peer.wait_for(
                     lambda f: f.frame_type == zmux.FrameType.DATA
-                    and f.stream_id == stream.stream_id
-                    and f.payload
+                              and f.stream_id == stream.stream_id
+                              and f.payload
                 )
             )
             peer.send_frame(

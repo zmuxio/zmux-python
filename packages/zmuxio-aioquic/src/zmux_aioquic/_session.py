@@ -7,7 +7,6 @@ import threading
 import time
 import weakref
 from typing import Optional, Set, Tuple
-
 from zmux.config import OpenOptions
 from zmux.conformance import SUITE_STREAM_ADAPTER_PROFILE
 from zmux.errors import (
@@ -33,6 +32,7 @@ from zmux.session import (
     as_async_session,
 )
 from zmux.streams import ReadableBuffer
+
 from ._constants import ACCEPTED_PRELUDE_RESULT_QUEUE_CAP
 from ._errors import (
     _accepted_prelude_rejectable,

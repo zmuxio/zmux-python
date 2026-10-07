@@ -177,9 +177,9 @@ def _priority_update(stream_id, priority):
 
 def _is_frame(frame_type, stream_id, code=None):
     return lambda frame: (
-        frame.frame_type == frame_type
-        and frame.stream_id == stream_id
-        and (code is None or _error_code(frame) == int(code))
+            frame.frame_type == frame_type
+            and frame.stream_id == stream_id
+            and (code is None or _error_code(frame) == int(code))
     )
 
 
@@ -654,8 +654,8 @@ class UsedStreamMarkerTest(_SessionAssertions):
             self.assertIsNotNone(
                 peer.wait_for(
                     lambda f: f.frame_type == zmux.FrameType.DATA
-                    and f.stream_id == 4
-                    and f.payload == b"done"
+                              and f.stream_id == 4
+                              and f.payload == b"done"
                 )
             )
             self.assert_open(session, peer)

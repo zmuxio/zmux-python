@@ -219,13 +219,13 @@ def _frames_of(peer, frame_type, stream_id=None):
         frame
         for frame in peer.snapshot()
         if frame.frame_type == frame_type
-        and (stream_id is None or frame.stream_id == stream_id)
+           and (stream_id is None or frame.stream_id == stream_id)
     ]
 
 
 def _is_close(code):
     return lambda frame: (
-        frame.frame_type == zmux.FrameType.CLOSE and _error_code(frame) == int(code)
+            frame.frame_type == zmux.FrameType.CLOSE and _error_code(frame) == int(code)
     )
 
 
@@ -521,9 +521,9 @@ class ProvisionalWaitAgeTest(unittest.TestCase):
             writer = client.open_stream()
             with client._lock:
                 created = (
-                    time.monotonic()
-                    - native.provisional_open_max_age(client._last_ping_rtt)
-                    + 0.2
+                        time.monotonic()
+                        - native.provisional_open_max_age(client._last_ping_rtt)
+                        + 0.2
                 )
                 abandoned._provisional_created_at = created
                 writer._provisional_created_at = created
@@ -562,9 +562,9 @@ class ProvisionalStatsTest(unittest.TestCase):
             abandoned = client.open_stream()
             with client._lock:
                 abandoned._provisional_created_at = (
-                    time.monotonic()
-                    - native.provisional_open_max_age(client._last_ping_rtt)
-                    - 1.0
+                        time.monotonic()
+                        - native.provisional_open_max_age(client._last_ping_rtt)
+                        - 1.0
                 )
             # The next open reaps the expired head.
             fresh = client.open_stream()
@@ -717,7 +717,7 @@ class GracefulCloseOpenAdmissionTest(unittest.TestCase):
             self.assertTrue(
                 _wait_until(
                     lambda: client._graceful_close_active
-                    and client.state is zmux.SessionState.DRAINING
+                            and client.state is zmux.SessionState.DRAINING
                 )
             )
             attempts = (

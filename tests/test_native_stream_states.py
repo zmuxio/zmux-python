@@ -181,9 +181,9 @@ def _error_code(frame):
 
 def _is_abort(stream_id, code=None):
     return lambda frame: (
-        frame.frame_type == zmux.FrameType.ABORT
-        and frame.stream_id == stream_id
-        and (code is None or _error_code(frame) == int(code))
+            frame.frame_type == zmux.FrameType.ABORT
+            and frame.stream_id == stream_id
+            and (code is None or _error_code(frame) == int(code))
     )
 
 
@@ -231,9 +231,9 @@ class PeerStreamControlValidationTest(unittest.TestCase):
         session, peer = _server_with_raw_client()
         try:
             for frame_for in (
-                lambda sid: _data(sid, b"bad"),
-                lambda sid: _varint_frame(zmux.FrameType.BLOCKED, sid, 0),
-                lambda sid: _error_frame(zmux.FrameType.RESET, sid, 9),
+                    lambda sid: _data(sid, b"bad"),
+                    lambda sid: _varint_frame(zmux.FrameType.BLOCKED, sid, 0),
+                    lambda sid: _error_frame(zmux.FrameType.RESET, sid, 9),
             ):
                 stream = session.open_uni_stream(timeout=1.0)
                 stream.write(b"x", timeout=1.0)
@@ -297,9 +297,9 @@ class DataAfterFinTest(unittest.TestCase):
 
     def test_data_after_peer_fin_on_live_stream_aborts_stream_closed(self):
         for late in (
-            _data(4, b"LATE"),
-            _data(4, b""),
-            _data(4, b"", zmux.FRAME_FLAG_FIN),
+                _data(4, b"LATE"),
+                _data(4, b""),
+                _data(4, b"", zmux.FRAME_FLAG_FIN),
         ):
             with self.subTest(payload=late.payload, flags=late.flags):
                 session, peer = _server_with_raw_client()
@@ -337,8 +337,8 @@ class DataAfterFinTest(unittest.TestCase):
             self.assertIsNotNone(peer.wait_for(_is_abort(4, zmux.ErrorCode.STREAM_CLOSED)))
             grant = peer.wait_for(
                 lambda f: f.frame_type == zmux.FrameType.MAX_DATA
-                and f.stream_id == 0
-                and zmux.parse_varint(f.payload)[0] >= 64 + 32
+                          and f.stream_id == 0
+                          and zmux.parse_varint(f.payload)[0] >= 64 + 32
             )
             self.assertIsNotNone(grant)
         finally:
@@ -494,10 +494,10 @@ class TerminalReadErrorTest(unittest.TestCase):
             self.assertTrue(_wait_until(lambda: inbound._read_error is not None))
             self.assertEqual(inbound._read_buffered, 0)
             for read in (
-                lambda: inbound.read(100, timeout=1.0),
-                lambda: inbound.read(100, timeout=1.0),
-                lambda: inbound.read_vectored([bytearray(4)], timeout=1.0),
-                lambda: inbound.write(b"x", timeout=1.0),
+                    lambda: inbound.read(100, timeout=1.0),
+                    lambda: inbound.read(100, timeout=1.0),
+                    lambda: inbound.read_vectored([bytearray(4)], timeout=1.0),
+                    lambda: inbound.write(b"x", timeout=1.0),
             ):
                 self._assert_app_error(
                     read, 301, zmux.ErrorSource.REMOTE, zmux.TerminationKind.ABORT
@@ -525,8 +525,8 @@ class TerminalReadErrorTest(unittest.TestCase):
         try:
             inbound.close_with_error(302, "local")
             for read in (
-                lambda: inbound.read(100, timeout=1.0),
-                lambda: inbound.read(100, timeout=1.0),
+                    lambda: inbound.read(100, timeout=1.0),
+                    lambda: inbound.read(100, timeout=1.0),
             ):
                 self._assert_app_error(
                     read, 302, zmux.ErrorSource.LOCAL, zmux.TerminationKind.ABORT
@@ -556,9 +556,9 @@ class TerminalReadErrorTest(unittest.TestCase):
 
                     def returned(frame):
                         return (
-                            frame.frame_type == zmux.FrameType.MAX_DATA
-                            and frame.stream_id == 0
-                            and zmux.parse_varint(frame.payload)[0] >= 64 + 32
+                                frame.frame_type == zmux.FrameType.MAX_DATA
+                                and frame.stream_id == 0
+                                and zmux.parse_varint(frame.payload)[0] >= 64 + 32
                         )
 
                     peer.barrier()
@@ -597,9 +597,9 @@ class TerminalReadErrorTest(unittest.TestCase):
             self.assertTrue(_wait_until(lambda: server.closed))
             self.assertEqual(inbound._read_buffered, 0)
             for call in (
-                lambda: inbound.read(100, timeout=1.0),
-                lambda: inbound.read(100, timeout=1.0),
-                lambda: inbound.write(b"x", timeout=1.0),
+                    lambda: inbound.read(100, timeout=1.0),
+                    lambda: inbound.read(100, timeout=1.0),
+                    lambda: inbound.write(b"x", timeout=1.0),
             ):
                 self._assert_app_error(
                     call,

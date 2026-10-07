@@ -309,9 +309,9 @@ class StalledTransportTest(unittest.TestCase):
             self.assertEqual(session.state, zmux.SessionState.FAILED)
 
             for thread, result in (
-                (writer, write_result),
-                (accept_thread, accept_result),
-                (read_thread, read_result),
+                    (writer, write_result),
+                    (accept_thread, accept_result),
+                    (read_thread, read_result),
             ):
                 thread.join(1.0)
                 self.assertFalse(thread.is_alive())
@@ -655,7 +655,7 @@ class FatalCloseTest(unittest.TestCase):
         internal = int(zmux.ErrorCode.INTERNAL)
         for name, frames in cases:
             with self.subTest(name), mock.patch.object(
-                native_module, "_uncoded_close_code", return_value=internal
+                    native_module, "_uncoded_close_code", return_value=internal
             ), mock.patch.object(
                 runtime_session_module, "_uncoded_close_code", return_value=internal
             ):

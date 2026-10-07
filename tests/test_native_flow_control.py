@@ -192,9 +192,9 @@ def _varint(frame):
 
 def _is_max_data(stream_id, minimum=0):
     return lambda frame: (
-        frame.frame_type == zmux.FrameType.MAX_DATA
-        and frame.stream_id == stream_id
-        and _varint(frame) >= minimum
+            frame.frame_type == zmux.FrameType.MAX_DATA
+            and frame.stream_id == stream_id
+            and _varint(frame) >= minimum
     )
 
 
@@ -370,7 +370,6 @@ class ReceiveCreditTest(unittest.TestCase):
             _close(session)
             peer.close()
 
-
     def test_close_after_peer_fin_drops_unread_bytes_and_returns_session_credit(self):
         session, peer = _server_with_raw_client(
             zmux.Settings(
@@ -426,10 +425,10 @@ class BlockedAndControlBudgetTest(unittest.TestCase):
         size = 16 << 20
         try:
             with mock.patch.object(
-                Conn,
-                "_handle_blocked",
-                autospec=True,
-                side_effect=Conn._handle_blocked,
+                    Conn,
+                    "_handle_blocked",
+                    autospec=True,
+                    side_effect=Conn._handle_blocked,
             ) as handled:
                 outbound = client.open_stream(timeout=1.0)
                 writer, written = _run(self._write_chunks, outbound, size)
@@ -588,7 +587,7 @@ class ZeroWindowTest(unittest.TestCase):
                     sid = stream.stream_id
                     blocked = peer.wait_for(
                         lambda f, sid=sid: (
-                            f.frame_type == zmux.FrameType.BLOCKED and f.stream_id == sid
+                                f.frame_type == zmux.FrameType.BLOCKED and f.stream_id == sid
                         )
                     )
                     self.assertIsNotNone(blocked)
@@ -740,8 +739,8 @@ class FlowControlViolationTest(unittest.TestCase):
             self.assertIsNotNone(
                 peer.wait_for(
                     lambda f: f.frame_type == zmux.FrameType.DATA
-                    and f.stream_id == 8
-                    and f.payload == b"ok"
+                              and f.stream_id == 8
+                              and f.payload == b"ok"
                 )
             )
             self.assertIsNone(

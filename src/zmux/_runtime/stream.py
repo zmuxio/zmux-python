@@ -18,14 +18,6 @@ from typing import Optional
 from ._frames import frame_tuple as _frame_tuple
 from .read_loop import saturating_add
 from .write_plan import advance_parts, checked_total_part_len
-from .._validation import (
-    coerce_int_enum as _coerce_enum,
-    optional_seconds,
-    require_bool as _shared_require_bool,
-    require_nonnegative_int as _nonnegative_int,
-    require_stream_id as _require_stream_id,
-    require_varint62 as _require_varint62,
-)
 from .._state.flow import (
     PeerStreamControlAction,
     ignore_late_non_opening_control,
@@ -94,6 +86,14 @@ from .._state.visibility import (
     should_flush_stream_blocked,
     should_flush_stream_max_data,
     should_reclaim_unseen_local_stream,
+)
+from .._validation import (
+    coerce_int_enum as _coerce_enum,
+    optional_seconds,
+    require_bool as _shared_require_bool,
+    require_nonnegative_int as _nonnegative_int,
+    require_stream_id as _require_stream_id,
+    require_varint62 as _require_varint62,
 )
 from ..errors import (
     ApplicationError,

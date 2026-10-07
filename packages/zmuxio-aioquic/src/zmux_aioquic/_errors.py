@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 from typing import Optional
-
 from zmux.errors import (
     ApplicationError,
     ErrorDirection,
@@ -23,6 +22,7 @@ from zmux.errors import (
     ZmuxError,
 )
 from zmux.protocol import ErrorCode
+
 from ._validation import _require_application_code
 
 

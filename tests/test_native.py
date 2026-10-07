@@ -676,9 +676,9 @@ class NativeSessionTest(unittest.TestCase):
         try:
             deadline = time.monotonic() + 1.0
             while (
-                client.stats.last_pong_at is None
-                and server.stats.last_pong_at is None
-                and time.monotonic() < deadline
+                    client.stats.last_pong_at is None
+                    and server.stats.last_pong_at is None
+                    and time.monotonic() < deadline
             ):
                 time.sleep(0.01)
             self.assertTrue(
@@ -820,8 +820,8 @@ class NativeSessionTest(unittest.TestCase):
 
             deadline = time.monotonic() + 1.0
             while (
-                (outbound.stream_id in client._streams or inbound.stream_id in server._streams)
-                and time.monotonic() < deadline
+                    (outbound.stream_id in client._streams or inbound.stream_id in server._streams)
+                    and time.monotonic() < deadline
             ):
                 time.sleep(0.01)
             self.assertNotIn(outbound.stream_id, client._streams)

@@ -299,7 +299,7 @@ class _RawPeer:
         self.send(_frame(zmux.FrameType.PING, 0, token))
         pong = self.wait_for(
             lambda frame: frame.frame_type == zmux.FrameType.PONG
-            and frame.payload.startswith(token)
+                          and frame.payload.startswith(token)
         )
         if pong is None:
             raise AssertionError("session did not answer the barrier PING")
@@ -1182,7 +1182,6 @@ _INVALID_CASE_RUNNERS = {
     "rapid_open_abort_churn_without_local_limit": _rapid_open_abort_churn,
 }
 
-
 # ---- portable_state runner ----
 #
 # Initial states are reached with ordinary frames and API calls, each event is
@@ -1328,8 +1327,8 @@ def _apply_state_event(t, label, session, peer, target, event, since):
         target.stream.close_write(timeout=_WAIT)
         fin = peer.wait_for(
             lambda frame: frame.frame_type == zmux.FrameType.DATA
-            and frame.stream_id == s
-            and frame.flags & zmux.FRAME_FLAG_FIN,
+                          and frame.stream_id == s
+                          and frame.flags & zmux.FRAME_FLAG_FIN,
             since=since,
         )
         t.assertIsNotNone(fin, label + ": DATA|FIN on S")
@@ -1366,10 +1365,10 @@ def _assert_state_result(t, label, session, peer, target, result, since):
     elif result == "sender_must_finish_with_reset_or_fin":
         finish = peer.wait_for(
             lambda frame: frame.stream_id == s
-            and (
-                    frame.frame_type == zmux.FrameType.RESET
-                    or (frame.frame_type == zmux.FrameType.DATA and frame.flags & zmux.FRAME_FLAG_FIN)
-            ),
+                          and (
+                                  frame.frame_type == zmux.FrameType.RESET
+                                  or (frame.frame_type == zmux.FrameType.DATA and frame.flags & zmux.FRAME_FLAG_FIN)
+                          ),
             since=since,
         )
         t.assertIsNotNone(finish, label + ": RESET or DATA|FIN on S")
