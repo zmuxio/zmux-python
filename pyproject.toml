@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zmuxio"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python package for the ZMux v1 stream multiplexing protocol"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,7 +30,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-aioquic = ["zmuxio-aioquic>=0.1.0"]
+aioquic = ["zmuxio-aioquic>=0.1.1"]
 # Lets tests/test_zmux_aioquic_loopback.py and the gated Go QUIC interop test
 # run instead of skipping (the adapter itself is imported from packages/).
 test = ["aioquic>=1.0", "cryptography"]

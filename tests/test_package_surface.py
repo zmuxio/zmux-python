@@ -100,7 +100,7 @@ class PackageSurfaceTest(unittest.TestCase):
         )
 
     def test_distribution_import_surface(self) -> None:
-        self.assertEqual(zmux.__version__, "0.1.0")
+        self.assertEqual(zmux.__version__, "0.1.1")
         self.assertEqual(len(zmux.__all__), len(set(zmux.__all__)))
         self.assertEqual(zmux.MAGIC, b"ZMUX")
         self.assertEqual(zmux.PROTO_VERSION, 1)
