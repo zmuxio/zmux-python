@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import datetime
 
 import pytest
@@ -36,7 +37,7 @@ async def echo(listener):
 
 
 async def round_trip(session, data=b"hello", **open_args):
-    send, recv = await session.open_bi(**(open_args or {"info": b"meta", "priority": (2, False)}))
+    send, recv = await session.open_bi(**(open_args or {"info": b"meta", "priority": zmux.Priority(2)}))
     await send.write(data)
     await send.finish()
     assert await recv.read_to_end() == data
@@ -52,18 +53,18 @@ async def test_carrier(carrier, tls):
             addr = await listener.serve_tcp("127.0.0.1:0")
             dial = zmux.dial_tcp(addr)
         elif carrier == "tls":
-            addr = await listener.serve_tls("127.0.0.1:0", server_tls)
-            dial = zmux.dial_tls(addr, "localhost", client_tls)
+            addr = await listener.serve_tls("127.0.0.1:0", tls=server_tls)
+            dial = zmux.dial_tls(addr, tls=client_tls, server_name="localhost")
         elif carrier == "quic":
-            addr = await listener.serve_quic("127.0.0.1:0", server_tls)
-            dial = zmux.dial_quic(addr, "localhost", client_tls)
+            addr = await listener.serve_quic("127.0.0.1:0", tls=server_tls)
+            dial = zmux.dial_quic(addr, tls=client_tls, server_name="localhost")
         elif carrier == "websocket":
             addr = await listener.serve_websocket("127.0.0.1:0")
             dial = zmux.dial_websocket(f"ws://{addr}/")
         elif carrier == "wss":
-            addr = await listener.serve_websocket("127.0.0.1:0", server_tls)
+            addr = await listener.serve_websocket("127.0.0.1:0", tls=server_tls)
             port = addr.rsplit(":", 1)[1]
-            dial = zmux.dial_websocket(f"wss://localhost:{port}/", client_tls)
+            dial = zmux.dial_websocket(f"wss://localhost:{port}/", tls=client_tls)
         elif carrier == "http2":
             addr = await listener.serve_http("127.0.0.1:0")
             dial = zmux.dial_http2(addr)
@@ -71,14 +72,14 @@ async def test_carrier(carrier, tls):
             addr = await listener.serve_http("127.0.0.1:0", tls=server_tls)
             dial = zmux.dial_http2(addr, tls=client_tls, server_name="localhost")
         elif carrier == "h3":
-            addr = await listener.serve_h3("127.0.0.1:0", server_tls)
+            addr = await listener.serve_h3("127.0.0.1:0", tls=server_tls)
             port = addr.rsplit(":", 1)[1]
-            dial = zmux.dial_h3(f"https://localhost:{port}/zmux", client_tls, addr)
+            dial = zmux.dial_h3(f"https://localhost:{port}/zmux", tls=client_tls, addr=addr)
         elif carrier == "webtransport":
             # The client resolves the URL's host: serve on its first address.
-            addr = await listener.serve_webtransport("localhost:0", server_tls)
+            addr = await listener.serve_webtransport("localhost:0", tls=server_tls)
             port = addr.rsplit(":", 1)[1]
-            dial = zmux.dial_webtransport(f"https://localhost:{port}/zmux", client_tls)
+            dial = zmux.dial_webtransport(f"https://localhost:{port}/zmux", tls=client_tls)
         else:
             addr = await listener.serve_http("127.0.0.1:0")
             dial = zmux.dial_http(addr)
@@ -96,15 +97,17 @@ async def test_preamble_and_errors():
             send, _ = await client.open_bi(info=b"route", tlvs=[(0x1000, b"x")])
             await send.write(b"a")
             _, recv = await server.accept_bi()
-            assert recv.preamble() == (b"route", [(0x1000, b"x")])
+            assert recv.preamble == zmux.Preamble(b"route", (zmux.Tlv(0x1000, b"x"),))
             await send.reset(7)
             with pytest.raises(zmux.StreamReset) as e:
                 await recv.read_to_end()
-            assert e.value.code == 7 and isinstance(e.value, zmux.ZmuxError)
+            assert e.value.code == 7 and e.value.kind == zmux.ErrorKind.RESET and isinstance(e.value, zmux.ZmuxError)
             server.close(code=3)
             with pytest.raises(zmux.SessionClosed) as e:
                 await client.accept_bi()
             assert e.value.code == 3 and not e.value.retryable
+            info = await client.wait_closed()
+            assert info.code == 3 and info.remote and isinstance(info.error, zmux.SessionClosed)
 
 
 async def test_cancellation():
@@ -132,11 +135,17 @@ async def test_multipath():
     async with zmux.Listener(config) as listener:
         addr = await listener.serve_tcp("127.0.0.1:0")
         server = asyncio.create_task(echo(listener))
-        async with await zmux.connect_tcp(addr, config) as session:
-            pipe = session.add_pipe(await zmux.dial_tcp(addr), priority=1, standby=True)
+        async with await zmux.connect_tcp(addr, config=config) as session:
+            pipe = session.add_pipe(await zmux.dial_tcp(addr), policy=zmux.PipePolicy(priority=1, standby=True))
             await pipe.joined()
-            assert len(session.pipe_stats()) == 2
+            stats = session.pipe_stats()
+            assert len(stats) == 2 and all(isinstance(s, zmux.PipeStats) for s in stats)
+            assert pipe.policy == zmux.PipePolicy(1, True, pipe.policy.weight)
             await round_trip(session, b"x" * 100_000)
+            assert session.stats().streams_opened_local == 1
+            pipe.close()
+            ev = await asyncio.wait_for(anext(session.events()), 5)
+            assert isinstance(ev, zmux.Event) and isinstance(ev.kind, zmux.EventKind)
         server.cancel()
 
 
@@ -145,7 +154,7 @@ async def test_early_data():
     async with zmux.Listener(config) as listener:
         addr = await listener.serve_tcp("127.0.0.1:0")
         server = asyncio.create_task(echo(listener))
-        async with await zmux.connect_tcp(addr, config) as session:
+        async with await zmux.connect_tcp(addr, config=config) as session:
             # Before the peer's parameters arrive: the preamble and the
             # requested priority travel within the floor.
             await round_trip(session, b"early", info=b"meta", peer_priority=(1, True))
@@ -158,14 +167,16 @@ async def test_quic_zero_rtt(tls):
     # which the client remembers for the next connection.
     config = zmux.Config(carrier_early_data=True)
     async with zmux.Listener(config) as listener:
-        addr = await listener.serve_quic("127.0.0.1:0", server_tls, zero_rtt=True)
+        addr = await listener.serve_quic("127.0.0.1:0", tls=server_tls, zero_rtt=True)
         server = asyncio.create_task(echo(listener))
         client = zmux.QuicClient(client_tls, zero_rtt=True)
-        session, zero = await client.connect(addr, "localhost", config)
+        session = await client.connect(addr, server_name="localhost", config=config)
+        zero = session.zero_rtt
         async with session:
             await round_trip(session)
         assert not zero.sent and client.remembers("localhost")
-        session, zero = await client.connect(addr, "localhost", config)
+        session = await client.connect(addr, server_name="localhost", config=config)
+        zero = session.zero_rtt
         async with session:
             await round_trip(session)
         assert zero.sent
@@ -177,7 +188,7 @@ async def test_resume_controls():
     async with zmux.Listener(config) as listener:
         addr = await listener.serve_tcp("127.0.0.1:0")
         server = asyncio.create_task(echo(listener))
-        async with await zmux.connect_tcp(addr, config) as session:
+        async with await zmux.connect_tcp(addr, config=config) as session:
             assert session.join_ready
             session.revalidate_pipes()
             await round_trip(session)
@@ -189,9 +200,9 @@ async def test_reserve_pipe():
     async with zmux.Listener(config) as listener:
         addr = await listener.serve_websocket("127.0.0.1:0")
         server = asyncio.create_task(echo(listener))
-        async with await zmux.connect_websocket(f"ws://{addr}/", config) as session:
-            r = session.reserve_pipe()
-            pipe = await zmux.dial_websocket(f"ws://{addr}/", headers=[("Zmux-Pipe-Join", r.header)])
+        async with await zmux.connect_websocket(f"ws://{addr}/", config=config) as session:
+            r = session.reserve_pipe(zmux.Direction.BIDI)
+            pipe = await zmux.dial_websocket(f"ws://{addr}/", headers={"Zmux-Pipe-Join": r.header})
             await r.attach(pipe).joined()
             assert len(session.pipe_stats()) == 2
             await round_trip(session)
@@ -241,3 +252,86 @@ def test_threads():
     for t in threads:
         t.join(60)
     assert not errors
+
+
+async def test_typed_surface():
+    async with zmux.Listener() as listener:
+        addr = await listener.serve_tcp("127.0.0.1:0")
+        async with await zmux.connect_tcp(addr) as client:
+            server = await listener.accept()
+            assert client.role == zmux.Role.INITIATOR and client.state == zmux.SessionState.ACTIVE
+            send, recv = await client.open_bi()
+            async with send:
+                send.set_priority(zmux.Priority(1, True))
+                assert send.priority == zmux.Priority(1, True)
+                await send.write(b"ab")
+            s2, r2 = await server.accept_bi()
+            assert b"".join([c async for c in r2]) == b"ab"
+            with pytest.raises(ValueError):
+                async with s2:
+                    await s2.write(b"x")
+                    raise ValueError
+            with pytest.raises(zmux.StreamReset):
+                await recv.read_to_end()
+            _, r3 = await client.open_bi()
+            s3, w = await zmux.open_connection(server)
+            w.writelines([b"1", b"2"])
+            await w.drain()
+            assert w.can_write_eof() and not w.is_closing()
+            await w.wait_closed()
+            _, r4 = await client.accept_bi()
+            assert await r4.read_to_end() == b"12"
+            s5 = await client.open_uni()
+            await s5.write(b"y" * 10)
+            await s5.finish()
+            with pytest.raises(zmux.LimitExceeded):
+                await (await server.accept_uni()).read_to_end(limit=4)
+        listener.close()
+        with pytest.raises(zmux.ListenerClosed):
+            await listener.accept()
+
+
+def test_config():
+    import datetime
+
+    c = zmux.Config(idle_timeout=datetime.timedelta(seconds=5), protocols=["a"])
+    assert c.replace(early_data=True).early_data and c.protocols == ("a",)
+    assert "idle_timeout" in repr(c)
+
+
+async def test_no_leaks_on_cancel():
+    """Cancelled reads, writes and accepts release their streams; fds stay flat."""
+    import gc
+    import os
+
+    def fds():
+        return len(os.listdir("/dev/fd")) if os.path.isdir("/dev/fd") else 0
+
+    async def cancel_soon(coro):
+        task = asyncio.ensure_future(coro)
+        await asyncio.sleep(0)
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, zmux.ZmuxError):
+            await task
+
+    async with zmux.Listener() as listener:
+        addr = await listener.serve_tcp("127.0.0.1:0")
+        async with await zmux.connect_tcp(addr) as client:
+            server = await listener.accept()
+            base = fds()
+            for _ in range(200):
+                send, recv = await client.open_bi()
+                await cancel_soon(recv.read())
+                await cancel_soon(send.write(b"z" * 1_000_000))
+                await cancel_soon(server.accept_uni())
+                await send.reset()
+                await recv.stop()
+                del send, recv
+            gc.collect()
+            for _ in range(100):
+                if client.stats().streams_active == 0:
+                    break
+                await asyncio.sleep(0.02)
+            assert client.stats().streams_active == 0
+            assert fds() <= base + 2
+            assert await client.ping() >= 0

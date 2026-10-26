@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  # A manual run builds and checks every wheel without publishing.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -29,6 +31,9 @@ jobs:
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
+          if [[ "${GITHUB_REF_TYPE}" != tag ]]; then
+            version=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          fi
           python - "${version}" <<'PY'
           import re, sys, tomllib
           version = sys.argv[1]
@@ -85,14 +90,24 @@ jobs:
         # `test`: the runner runs the wheels natively, so the tests run.
         # Cross-built wheels only build. Every target gets the abi3 wheel
         # (3.12+) and the free-threaded 3.14t one.
+        # `qemu`: the Docker platform for an import test of a cross-built
+        # wheel.
         include:
           - { os: ubuntu-latest, platform: manylinux, target: x86_64, manylinux: auto, test: true }
           - { os: ubuntu-24.04-arm, platform: manylinux, target: aarch64, manylinux: auto, test: true }
-          - { os: ubuntu-latest, platform: musllinux, target: x86_64, manylinux: musllinux_1_2, test: false }
-          - { os: ubuntu-24.04-arm, platform: musllinux, target: aarch64, manylinux: musllinux_1_2, test: false }
+          - { os: ubuntu-latest, platform: manylinux, target: armv7, manylinux: auto, qemu: linux/arm/v7 }
+          - { os: ubuntu-latest, platform: manylinux, target: i686, manylinux: auto, qemu: linux/386 }
+          - { os: ubuntu-latest, platform: manylinux, target: ppc64le, manylinux: auto, qemu: linux/ppc64le }
+          - { os: ubuntu-latest, platform: manylinux, target: s390x, manylinux: auto, qemu: linux/s390x }
+          - { os: ubuntu-latest, platform: manylinux, target: riscv64gc-unknown-linux-gnu, manylinux: '2_31' }
+          - { os: ubuntu-latest, platform: musllinux, target: x86_64, manylinux: musllinux_1_2, qemu: linux/amd64 }
+          - { os: ubuntu-24.04-arm, platform: musllinux, target: aarch64, manylinux: musllinux_1_2, qemu: linux/arm64 }
+          - { os: ubuntu-latest, platform: musllinux, target: armv7, manylinux: musllinux_1_2, qemu: linux/arm/v7 }
+          - { os: ubuntu-latest, platform: musllinux, target: i686, manylinux: musllinux_1_2, qemu: linux/386 }
           - { os: macos-latest, platform: macos, target: aarch64, test: true }
           - { os: macos-15-intel, platform: macos, target: x86_64, test: true }
           - { os: windows-latest, platform: windows, target: x64, test: true }
+          - { os: windows-latest, platform: windows, target: x86, arch: x86 }
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v5
@@ -100,11 +115,13 @@ jobs:
         id: py312
         with:
           python-version: '3.12'
+          architecture: ${{ matrix.arch || '' }}
       - uses: actions/setup-python@v5
         if: matrix.platform == 'macos' || matrix.platform == 'windows'
         id: py314t
         with:
           python-version: '3.14t'
+          architecture: ${{ matrix.arch || '' }}
       - name: Build (Linux container)
         if: matrix.platform == 'manylinux' || matrix.platform == 'musllinux'
         uses: PyO3/maturin-action@v1
@@ -141,11 +158,15 @@ jobs:
             "${vpy}" -m pip install "pytest>=8" "pytest-asyncio>=0.24" "cryptography>=42"
             "${vpy}" -m pytest -q tests
           done
-      - name: Import test (musllinux, Alpine)
-        if: matrix.platform == 'musllinux'
+      - uses: docker/setup-qemu-action@v3
+        if: matrix.qemu
+      - name: Import test (QEMU)
+        if: matrix.qemu
         run: |
-          docker run --rm -v "$PWD/dist:/dist" python:3.12-alpine sh -c \
-            "pip install --no-index --find-links /dist zmuxio && python -c 'import zmux; print(zmux.__version__)'"
+          image=python:3.12-slim
+          if [[ "${{ matrix.platform }}" == musllinux ]]; then image=python:3.12-alpine; fi
+          docker run --rm --platform "${{ matrix.qemu }}" -v "$PWD/dist:/dist" "${image}" sh -c \
+            "pip install --no-index --find-links /dist --only-binary :all: zmuxio && python -c 'import zmux; print(zmux.__version__)'"
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.platform }}-${{ matrix.target }}
@@ -171,7 +192,7 @@ jobs:
   publish:
     name: Publish zmuxio
     needs: [ validate, wheels, sdist ]
-    if: needs.validate.outputs.published != 'true'
+    if: startsWith(github.ref, 'refs/tags/v') && needs.validate.outputs.published != 'true'
     runs-on: ubuntu-latest
     environment:
       name: pypi
