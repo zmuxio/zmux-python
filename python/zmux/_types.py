@@ -43,6 +43,21 @@ class SessionState(_Enum):
     CLOSED = "Closed"
 
 
+class EarlyDataState(_Enum):
+    """What became of a session's early data."""
+
+    NOT_SENT = "NotSent"
+    """No early stream data went out."""
+    PENDING = "Pending"
+    """Sent; the peer's parameters or the carrier's verdict are still due."""
+    ACCEPTED = "Accepted"
+    """The peer processed it."""
+    REJECTED = "Rejected"
+    """The peer processed none of it: after a carrier rejection the data
+    went again once the handshake completed; after a zmux rejection the
+    session ended with `EarlyDataRejected`."""
+
+
 class Direction(_Enum):
     """Which directions a reserved pipe carries."""
 

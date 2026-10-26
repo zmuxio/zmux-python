@@ -7,7 +7,7 @@ from collections.abc import Iterable, Mapping
 from typing import Any
 
 from ._types import (
-    CapacityBelow, CapacityRestored, CloseInfo, Config, Direction, ErrorKind, Event, EventKind,
+    CapacityBelow, CapacityRestored, CloseInfo, Config, Direction, EarlyDataState, ErrorKind, Event, EventKind,
     GoAway, JoinAuthFailed, JoinSecurityUnavailable, PipeHalf, PipePolicy, PipePriorityChanged,
     PipeQualityChanged, PipesRetired, PipeState, PipeStateChanged, PipeStats, Preamble, Priority,
     PrioritySource, Resumed, Role, SessionState, SessionStats, Suspended, TierSaturation, Tlv,
@@ -25,7 +25,7 @@ __version__ = "0.3.0"
 
 __all__ = [
     "CapacityBelow", "CapacityRestored", "CloseInfo", "Config", "ConnectError", "DatagramError",
-    "DatagramStream", "Direction", "EarlyDataRejected", "ErrorKind", "Event", "EventKind",
+    "DatagramStream", "Direction", "EarlyDataRejected", "EarlyDataState", "ErrorKind", "Event", "EventKind",
     "EventStream", "GoAway", "Http2Connection", "IncompleteRead", "JoinAuthFailed",
     "JoinSecurityUnavailable", "LimitExceeded", "Listener", "ListenerClosed", "OpenError", "Pipe",
     "PipeEnd", "PipeError", "PipeHalf", "PipeIo", "PipePolicy", "PipePriorityChanged",

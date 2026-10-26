@@ -143,7 +143,9 @@ async def test_multipath():
             assert pipe.policy == zmux.PipePolicy(1, True, pipe.policy.weight)
             await round_trip(session, b"x" * 100_000)
             assert session.stats().streams_opened_local == 1
+            assert pipe.session.pipe_stats()[1].pipe == pipe.id
             pipe.close()
+            await asyncio.wait_for(pipe.closed(), 10)
             ev = await asyncio.wait_for(anext(session.events()), 5)
             assert isinstance(ev, zmux.Event) and isinstance(ev.kind, zmux.EventKind)
         server.cancel()
@@ -158,6 +160,8 @@ async def test_early_data():
             # Before the peer's parameters arrive: the preamble and the
             # requested priority travel within the floor.
             await round_trip(session, b"early", info=b"meta", peer_priority=(1, True))
+            # On loopback the parameters may arrive before the stream opens.
+            assert session.early_data in (zmux.EarlyDataState.ACCEPTED, zmux.EarlyDataState.NOT_SENT)
         server.cancel()
 
 
@@ -174,6 +178,7 @@ async def test_quic_zero_rtt(tls):
         zero = session.zero_rtt
         async with session:
             await round_trip(session)
+            assert session.early_data is zmux.EarlyDataState.NOT_SENT
         assert not zero.sent and client.remembers("localhost")
         session = await client.connect(addr, server_name="localhost", config=config)
         zero = session.zero_rtt

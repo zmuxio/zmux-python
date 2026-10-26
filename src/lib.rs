@@ -1320,6 +1320,11 @@ impl Session {
     fn state<'p>(&self, py: Python<'p>) -> Bound<'p, PyAny> {
         typed(py, "SessionState", kind_of(&self.0.state()))
     }
+    /// What became of the session's early data.
+    #[getter]
+    fn early_data<'p>(&self, py: Python<'p>) -> Bound<'p, PyAny> {
+        typed(py, "EarlyDataState", kind_of(&self.0.early_data()))
+    }
 
     fn __aenter__<'p>(slf: Bound<'p, Self>, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let o = slf.unbind();
@@ -1619,6 +1624,16 @@ impl Pipe {
     fn joined<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let p = self.0.clone();
         future_into_py(py, async move { p.joined().await.map_err(pipe_err) })
+    }
+    /// Waits until the pipe ended.
+    fn closed<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+        let p = self.0.clone();
+        future_into_py(py, async move { p.closed().await.map_err(pipe_err) })
+    }
+    /// The session the pipe belongs to.
+    #[getter]
+    fn session(&self) -> Session {
+        Session::new(self.0.session())
     }
     /// Applies the non-`None` fields of a `PipePolicy`.
     fn set_policy(&self, policy: Bound<'_, PyAny>) -> PyResult<()> {

@@ -12,6 +12,7 @@ from . import _types as _t
 from ._types import (
     CloseInfo,
     Direction,
+    EarlyDataState,
     ErrorKind,
     Event,
     PipePolicy,
@@ -283,8 +284,15 @@ class Pipe:
     @property
     def state(self) -> PipeState | None:
         """The outbound direction's state (else the inbound one's); `None` once released."""
+    @property
+    def session(self) -> Session:
+        """The session the pipe belongs to (its `zero_rtt` report is `None`)."""
     async def joined(self) -> None:
         """Waits until the peer confirmed the join; `PipeError` if it failed."""
+    async def closed(self) -> None:
+        """Waits until the pipe ended: returns once every direction closed
+        (or the session released it); `PipeError` if it failed or the
+        session ended first."""
     def set_policy(self, policy: PipePolicy) -> None:
         """Applies the non-`None` fields of `policy`."""
     def close(self) -> None: ...
@@ -418,6 +426,9 @@ class Session:
         """The peer speaks plain QMux without zmux extensions."""
     @property
     def state(self) -> SessionState: ...
+    @property
+    def early_data(self) -> EarlyDataState:
+        """What became of the early data: not sent, pending, accepted or rejected."""
     async def __aenter__(self) -> Self: ...
     async def __aexit__(self, *exc: object) -> bool: ...
     def __aiter__(self) -> Self: ...
