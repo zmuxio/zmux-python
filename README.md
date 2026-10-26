@@ -13,6 +13,9 @@ by the extension; Python awaits the results on its asyncio loop.
 pip install zmuxio      # import zmux; Python 3.12+, also free-threaded 3.14t
 ```
 
+Prebuilt wheels cover Linux, macOS and Windows on x86_64, and Linux and macOS
+on arm64. Windows on arm64 installs from the sdist, which needs a Rust toolchain.
+
 ```python
 import asyncio, zmux
 
