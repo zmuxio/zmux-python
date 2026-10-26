@@ -1,0 +1,5 @@
+zmuxio>=0.1.1
+aioquic>=1.0
+
+[test]
+cryptography

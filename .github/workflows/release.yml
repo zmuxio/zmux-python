@@ -18,139 +18,161 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
-      core_published: ${{ steps.published.outputs.core }}
-      aioquic_published: ${{ steps.published.outputs.aioquic }}
+      published: ${{ steps.published.outputs.published }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-
-      - name: Validate release tag and package versions
+      - name: Check the tag against the package versions
         id: version
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
-          python tools/check_release_version.py "${version}"
+          python - "${version}" <<'PY'
+          import re, sys, tomllib
+          version = sys.argv[1]
+          with open("pyproject.toml", "rb") as f:
+              project = tomllib.load(f)["project"]["version"]
+          with open("Cargo.toml", "rb") as f:
+              crate = tomllib.load(f)["package"]["version"]
+          init = re.search(r'__version__ = "([^"]+)"', open("python/zmux/__init__.py").read()).group(1)
+          found = {"pyproject.toml": project, "Cargo.toml": crate, "__init__.py": init}
+          bad = {k: v for k, v in found.items() if v != version}
+          if bad:
+              sys.exit(f"tag v{version} does not match {bad}")
+          PY
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
-
-      - name: Check existing PyPI versions
+      - name: Check whether PyPI has the version
         id: published
         shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          version_exists() {
-            python3 - "$1" "${VERSION}" <<'PY'
-          import sys
-          import urllib.error
-          import urllib.request
-
-          project, version = sys.argv[1], sys.argv[2]
+          status=0
+          python3 - "${VERSION}" <<'PY' || status=$?
+          import sys, urllib.error, urllib.request
           request = urllib.request.Request(
-              f"https://pypi.org/pypi/{project}/{version}/json",
+              f"https://pypi.org/pypi/zmuxio/{sys.argv[1]}/json",
               headers={"User-Agent": "zmux-python-release-workflow"},
           )
           try:
               with urllib.request.urlopen(request, timeout=20) as response:
                   sys.exit(0 if response.status == 200 else 1)
           except urllib.error.HTTPError as exc:
-              if exc.code == 404:
-                  sys.exit(1)
-              print(f"PyPI returned HTTP {exc.code} for {project} {version}", file=sys.stderr)
-              sys.exit(2)
+              sys.exit(1 if exc.code == 404 else 2)
           except Exception as exc:
-              print(f"could not query PyPI for {project} {version}: {exc}", file=sys.stderr)
+              print(f"could not query PyPI: {exc}", file=sys.stderr)
               sys.exit(2)
           PY
-          }
+          if [[ "${status}" -eq 0 ]]; then
+            echo "published=true" >> "${GITHUB_OUTPUT}"
+            echo "zmuxio ${VERSION} is already published; publish will be skipped."
+          elif [[ "${status}" -eq 1 ]]; then
+            echo "published=false" >> "${GITHUB_OUTPUT}"
+          else
+            exit "${status}"
+          fi
 
-          record_version_status() {
-            local project="$1"
-            local output="$2"
-            local status=0
-            version_exists "${project}" || status=$?
-            if [[ "${status}" -eq 0 ]]; then
-              echo "${output}=true" >> "${GITHUB_OUTPUT}"
-              echo "${project} ${VERSION} is already published; publish will be skipped."
-            elif [[ "${status}" -eq 1 ]]; then
-              echo "${output}=false" >> "${GITHUB_OUTPUT}"
-            else
-              exit "${status}"
-            fi
-          }
-
-          record_version_status zmuxio core
-          record_version_status zmuxio-aioquic aioquic
-
-  test:
-    name: Test (Python ${{ matrix.python }})
+  wheels:
+    name: Wheels (${{ matrix.platform }} ${{ matrix.target }})
     needs: validate
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: true
       matrix:
-        python: [ '3.10', '3.11', '3.12', '3.13', '3.14' ]
+        # `test`: the runner runs the wheels natively, so the tests run.
+        # Cross-built wheels only build. Every target gets the abi3 wheel
+        # (3.12+) and the free-threaded 3.14t one.
+        include:
+          - { os: ubuntu-latest, platform: manylinux, target: x86_64, manylinux: auto, test: true }
+          - { os: ubuntu-24.04-arm, platform: manylinux, target: aarch64, manylinux: auto, test: true }
+          - { os: ubuntu-latest, platform: musllinux, target: x86_64, manylinux: musllinux_1_2, test: false }
+          - { os: ubuntu-24.04-arm, platform: musllinux, target: aarch64, manylinux: musllinux_1_2, test: false }
+          - { os: macos-latest, platform: macos, target: aarch64, test: true }
+          - { os: macos-15-intel, platform: macos, target: x86_64, test: true }
+          - { os: windows-latest, platform: windows, target: x64, test: true }
+          - { os: windows-11-arm, platform: windows, target: aarch64, test: true }
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        if: matrix.platform == 'macos' || matrix.platform == 'windows'
+        id: py312
         with:
-          python-version: ${{ matrix.python }}
-          allow-prereleases: true
-
-      - name: Install test dependencies
-        run: python -m pip install aioquic cryptography
-
-      - name: Run tests
-        env:
-          PYTHONPATH: src:packages/zmuxio-aioquic/src
-        run: python -m unittest discover -s tests
-
-  build:
-    name: Build distributions
-    needs: test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+          python-version: '3.12'
+      - uses: actions/setup-python@v5
+        if: matrix.platform == 'macos' || matrix.platform == 'windows'
+        id: py314t
         with:
-          python-version: '3.13'
-
+          python-version: '3.14t'
+      - name: Build (Linux container)
+        if: matrix.platform == 'manylinux' || matrix.platform == 'musllinux'
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist -i python3.12 -i python3.14t
       - name: Build
-        run: |
-          python -m pip install build twine
-          python -m build --outdir dist/zmuxio .
-          python -m build --outdir dist/zmuxio-aioquic packages/zmuxio-aioquic
-          python -m twine check --strict dist/zmuxio/* dist/zmuxio-aioquic/*
-
-      - name: Install and import built wheels
-        run: |
-          python -m venv /tmp/release-smoke
-          /tmp/release-smoke/bin/python -m pip install dist/zmuxio/*.whl dist/zmuxio-aioquic/*.whl
-          cd /tmp
-          /tmp/release-smoke/bin/python -c "import zmux, zmux_aioquic; print('zmuxio', zmux.__version__)"
-
-      - name: Upload distributions
-        uses: actions/upload-artifact@v4
+        if: matrix.platform == 'macos' || matrix.platform == 'windows'
+        uses: PyO3/maturin-action@v1
         with:
-          name: dist
+          target: ${{ matrix.target }}
+          args: --release --locked --out dist -i ${{ steps.py312.outputs.python-path }} -i ${{ steps.py314t.outputs.python-path }}
+      - uses: actions/setup-python@v5
+        if: matrix.test && matrix.platform == 'manylinux'
+        id: lpy312
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-python@v5
+        if: matrix.test && matrix.platform == 'manylinux'
+        id: lpy314t
+        with:
+          python-version: '3.14t'
+      - name: Test the wheels
+        if: matrix.test
+        shell: bash
+        run: |
+          for py in "${{ steps.py312.outputs.python-path }}${{ steps.lpy312.outputs.python-path }}" \
+                    "${{ steps.py314t.outputs.python-path }}${{ steps.lpy314t.outputs.python-path }}"; do
+            rm -rf .venv-test
+            "${py}" -m venv .venv-test
+            if [[ -x .venv-test/bin/python ]]; then vpy=.venv-test/bin/python; else vpy=.venv-test/Scripts/python; fi
+            "${vpy}" -m pip install --find-links dist --no-index --only-binary :all: zmuxio
+            "${vpy}" -m pip install "pytest>=8" "pytest-asyncio>=0.24" "cryptography>=42"
+            "${vpy}" -m pytest -q tests
+          done
+      - name: Import test (musllinux, Alpine)
+        if: matrix.platform == 'musllinux'
+        run: |
+          docker run --rm -v "$PWD/dist:/dist" python:3.12-alpine sh -c \
+            "pip install --no-index --find-links /dist zmuxio && python -c 'import zmux; print(zmux.__version__)'"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.platform }}-${{ matrix.target }}
           path: dist/
           if-no-files-found: error
 
-  publish-core:
+  sdist:
+    name: Source distribution
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
     name: Publish zmuxio
-    needs: [ validate, build ]
-    if: needs.validate.outputs.core_published != 'true'
+    needs: [ validate, wheels, sdist ]
+    if: needs.validate.outputs.published != 'true'
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -158,64 +180,16 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - name: Download distributions
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          name: dist
           path: dist/
-
-      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
-        with:
-          packages-dir: dist/zmuxio/
-          skip-existing: true
-
-  publish-aioquic:
-    name: Publish zmuxio-aioquic
-    needs: [ validate, build, publish-core ]
-    # Runs after the core was published here or had already been published by an earlier run of this tag.
-    if: >-
-      !cancelled()
-      && needs.build.result == 'success'
-      && (needs.publish-core.result == 'success' || needs.publish-core.result == 'skipped')
-      && needs.validate.outputs.aioquic_published != 'true'
-    runs-on: ubuntu-latest
-    environment:
-      name: pypi-aioquic
-      url: https://pypi.org/p/zmuxio-aioquic
-    permissions:
-      id-token: write
-    steps:
-      - name: Download distributions
-        uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist/
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-
-      - name: Wait for zmuxio indexing
-        shell: bash
-        env:
-          VERSION: ${{ needs.validate.outputs.version }}
+          merge-multiple: true
+      - name: Check the distributions
         run: |
-          for attempt in $(seq 1 60); do
-            if python -m pip download --quiet --no-deps --no-cache-dir --dest /tmp/zmuxio-index \
-                --index-url https://pypi.org/simple "zmuxio==${VERSION}"; then
-              echo "zmuxio ${VERSION} is installable from PyPI"
-              exit 0
-            fi
-            echo "waiting for zmuxio ${VERSION} on PyPI (attempt ${attempt})"
-            sleep 10
-          done
-          echo "zmuxio ${VERSION} did not appear on PyPI in time" >&2
-          exit 1
-
+          python3 -m pip install twine
+          python3 -m twine check --strict dist/*
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages-dir: dist/zmuxio-aioquic/
+          packages-dir: dist/
           skip-existing: true

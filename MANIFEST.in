@@ -1,5 +1,0 @@
-prune packages
-prune tests
-prune testdata
-prune tools
-global-exclude __pycache__ *.py[cod]

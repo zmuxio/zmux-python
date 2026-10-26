@@ -1,48 +1,37 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
 
 [project]
 name = "zmuxio"
-version = "0.1.1"
-description = "Python package for the ZMux v1 stream multiplexing protocol"
+version = "0.3.0"
+description = "QMux-compatible stream and datagram multiplexing over one or many byte pipes (Rust core)"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 license = "Apache-2.0"
-authors = [
-    { name = "zmuxio contributors" }
-]
-keywords = ["zmux", "multiplexing", "networking", "protocol", "stream"]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
-    "Intended Audience :: Developers",
-    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Free Threading :: 2 - Beta",
+    "Programming Language :: Rust",
+    "Framework :: AsyncIO",
     "Typing :: Typed",
     "Topic :: Internet",
-    "Topic :: Software Development :: Libraries",
 ]
 
 [project.optional-dependencies]
-aioquic = ["zmuxio-aioquic>=0.1.1"]
-# Lets tests/test_zmux_aioquic_loopback.py and the gated Go QUIC interop test
-# run instead of skipping (the adapter itself is imported from packages/).
-test = ["aioquic>=1.0", "cryptography"]
+test = ["pytest>=8", "pytest-asyncio>=0.24", "cryptography>=42"]
 
 [project.urls]
-Homepage = "https://github.com/zmuxio/zmux-python"
 Repository = "https://github.com/zmuxio/zmux-python"
-Issues = "https://github.com/zmuxio/zmux-python/issues"
 
-[tool.setuptools.packages.find]
-where = ["src"]
-include = ["zmux", "zmux.*"]
+[tool.maturin]
+python-source = "python"
+module-name = "zmux._zmux"
+features = ["pyo3/extension-module"]
 
-[tool.setuptools.package-data]
-zmux = ["py.typed"]
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
