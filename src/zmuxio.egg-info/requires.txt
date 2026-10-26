@@ -1,7 +1,0 @@
-
-[aioquic]
-zmuxio-aioquic>=0.1.1
-
-[test]
-aioquic>=1.0
-cryptography
