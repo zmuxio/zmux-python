@@ -21,7 +21,7 @@ from ._zmux import (
     dial_quic, dial_tcp, dial_tls, dial_webtransport, dial_websocket, pipe_pair,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     "CapacityBelow", "CapacityRestored", "CloseInfo", "Config", "ConnectError", "DatagramError",
