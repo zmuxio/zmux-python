@@ -1,5 +1,10 @@
 # zmuxio
 
+[![CI](https://github.com/zmuxio/zmux-python/actions/workflows/ci.yml/badge.svg)](https://github.com/zmuxio/zmux-python/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/zmuxio.svg)](https://pypi.org/project/zmuxio/)
+[![Python versions](https://img.shields.io/pypi/pyversions/zmuxio.svg)](https://pypi.org/project/zmuxio/)
+[![License](https://img.shields.io/pypi/l/zmuxio.svg)](LICENSE)
+
 Python bindings for zmux: multiplexed streams and datagrams over one or many
 reliable byte pipes, wire-compatible with QMux (draft-ietf-quic-qmux). With a
 plain QMux peer a session is a single-pipe QMux session; between two zmux
