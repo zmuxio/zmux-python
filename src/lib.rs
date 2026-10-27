@@ -1960,11 +1960,64 @@ impl Listener {
 #[pymethods]
 impl Listener {
     #[new]
-    #[pyo3(signature = (config=None))]
-    fn new(config: Option<Bound<'_, PyAny>>) -> PyResult<Self> {
+    #[pyo3(signature = (config=None, *, max_pending=None, max_pending_per_source=None,
+        max_pending_per_session=None, first_record_timeout=None, handshake_timeout=None,
+        max_record_size=None, accept_sessions=None, max_suspended=None, memory_budget=None,
+        instance_id=None, on_memory_pressure=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        config: Option<Bound<'_, PyAny>>,
+        max_pending: Option<usize>,
+        max_pending_per_source: Option<usize>,
+        max_pending_per_session: Option<usize>,
+        first_record_timeout: Option<f64>,
+        handshake_timeout: Option<f64>,
+        max_record_size: Option<u64>,
+        accept_sessions: Option<bool>,
+        max_suspended: Option<usize>,
+        memory_budget: Option<u64>,
+        instance_id: Option<Vec<u8>>,
+        on_memory_pressure: Option<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        let mut l = zmux::ListenerConfig::default();
+        macro_rules! set {
+            ($($f:ident),*) => { $(if let Some(v) = $f { l.$f = v; })* };
+        }
+        set!(
+            max_pending,
+            max_pending_per_source,
+            max_pending_per_session,
+            max_record_size,
+            accept_sessions,
+            max_suspended,
+            memory_budget,
+            instance_id
+        );
+        if let Some(v) = first_record_timeout {
+            l.first_record_timeout = secs(v);
+        }
+        if let Some(v) = handshake_timeout {
+            l.handshake_timeout = secs(v);
+        }
+        if l.instance_id.len() > zmux::MAX_INSTANCE_ID_LEN {
+            return Err(PyValueError::new_err(format!(
+                "instance_id is longer than {} bytes",
+                zmux::MAX_INSTANCE_ID_LEN
+            )));
+        }
+        if let Some(f) = on_memory_pressure {
+            l.on_memory_pressure = Some(zmux::OnMemoryPressure(Arc::new(move |m| {
+                Python::attach(|py| {
+                    if let Err(e) = f.call1(py, (m.used, m.budget, m.active)) {
+                        e.write_unraisable(py, Some(f.bind(py)));
+                    }
+                });
+            })));
+        }
+        let config = cfg(config)?;
         let _g = get_runtime().enter();
         Ok(Listener {
-            inner: zmux::Listener::new(cfg(config)?, zmux::ListenerConfig::default()),
+            inner: zmux::Listener::new(config, l),
             tasks: Arc::default(),
         })
     }

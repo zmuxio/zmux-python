@@ -132,7 +132,7 @@ async def test_cancellation():
 
 async def test_multipath():
     config = zmux.Config(psk=b"k" * 32)
-    async with zmux.Listener(config) as listener:
+    async with zmux.Listener(config, instance_id=b"instance", max_suspended=16) as listener:
         addr = await listener.serve_tcp("127.0.0.1:0")
         server = asyncio.create_task(echo(listener))
         async with await zmux.connect_tcp(addr, config=config) as session:

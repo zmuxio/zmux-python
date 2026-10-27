@@ -3,7 +3,7 @@ cancelling the awaiting task drops the pending operation and leaves the
 session, stream or pipe usable. Use `asyncio.timeout()` for per-call
 deadlines; durations are seconds."""
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from os import PathLike
 from types import TracebackType
 from typing import Any, Self, final
@@ -440,7 +440,30 @@ class Listener:
     Each `serve_*` binds `addr` (port 0 picks one) and returns the bound
     address. `async for session in listener` until `close()`."""
 
-    def __init__(self, config: _t.Config | None = None) -> None: ...
+    def __init__(
+        self,
+        config: _t.Config | None = None,
+        *,
+        max_pending: int | None = None,
+        max_pending_per_source: int | None = None,
+        max_pending_per_session: int | None = None,
+        first_record_timeout: float | None = None,
+        handshake_timeout: float | None = None,
+        max_record_size: int | None = None,
+        accept_sessions: bool | None = None,
+        max_suspended: int | None = None,
+        memory_budget: int | None = None,
+        instance_id: bytes | None = None,
+        on_memory_pressure: Callable[[int, int, bool], None] | None = None,
+    ) -> None:
+        """Arguments left out keep the defaults: `max_pending` 64 carriers being
+        classified, `max_pending_per_source` 8, `max_pending_per_session` 4
+        pending joins, `first_record_timeout` 2 s, `handshake_timeout` 10 s,
+        `max_record_size` 65535, `accept_sessions` True, `max_suspended` 1024,
+        `memory_budget` 1 GiB (0: unlimited). `instance_id` (at most 8 bytes)
+        starts every session locator, for load-balancer stickiness.
+        `on_memory_pressure(used, budget, active)` is called when memory
+        pressure starts and ends."""
     async def serve_tcp(self, addr: str) -> str: ...
     async def serve_tls(self, addr: str, *, tls: TlsConfig) -> str: ...
     async def serve_quic(self, addr: str, *, tls: TlsConfig, lanes: int = 4, zero_rtt: bool = False) -> str:

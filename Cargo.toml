@@ -14,13 +14,13 @@ pyo3 = { version = "0.30", features = ["abi3-py312"] }
 pyo3-async-runtimes = { version = "0.30", features = ["tokio-runtime"] }
 tokio = { version = "1.47", features = ["net", "rt-multi-thread", "sync", "io-util"] }
 bytes = "1"
-zmux = "1.2.2"
-zmux-rustls = "1.2.2"
-zmux-quinn = { version = "1.2.2", features = ["rustls-ring"] }
-zmux-websocket = "1.2.2"
-zmux-http = "1.2.2"
-zmux-h3 = "1.2.2"
-zmux-webtransport = "1.2.2"
+zmux = "1.2.3"
+zmux-rustls = "1.2.3"
+zmux-quinn = { version = "1.2.3", features = ["rustls-ring"] }
+zmux-websocket = "1.2.3"
+zmux-http = "1.2.3"
+zmux-h3 = "1.2.3"
+zmux-webtransport = "1.2.3"
 http = "1"
 tokio-tungstenite = { version = "0.30", default-features = false }
 quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
