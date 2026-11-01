@@ -22,8 +22,8 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       published: ${{ steps.published.outputs.published }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
       - name: Check the tag against the package versions
@@ -109,14 +109,14 @@ jobs:
           - { os: windows-latest, platform: windows, target: x64, test: true }
           - { os: windows-latest, platform: windows, target: x86, arch: x86 }
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         if: matrix.platform == 'macos' || matrix.platform == 'windows'
         id: py312
         with:
           python-version: '3.12'
           architecture: ${{ matrix.arch || '' }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         if: matrix.platform == 'macos' || matrix.platform == 'windows'
         id: py314t
         with:
@@ -124,23 +124,23 @@ jobs:
           architecture: ${{ matrix.arch || '' }}
       - name: Build (Linux container)
         if: matrix.platform == 'manylinux' || matrix.platform == 'musllinux'
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@v1.51.0
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           args: --release --locked --out dist -i python3.12 -i python3.14t
       - name: Build
         if: matrix.platform == 'macos' || matrix.platform == 'windows'
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@v1.51.0
         with:
           target: ${{ matrix.target }}
           args: --release --locked --out dist -i ${{ steps.py312.outputs.python-path }} -i ${{ steps.py314t.outputs.python-path }}
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         if: matrix.test && matrix.platform == 'manylinux'
         id: lpy312
         with:
           python-version: '3.12'
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         if: matrix.test && matrix.platform == 'manylinux'
         id: lpy314t
         with:
@@ -155,10 +155,10 @@ jobs:
             "${py}" -m venv .venv-test
             if [[ -x .venv-test/bin/python ]]; then vpy=.venv-test/bin/python; else vpy=.venv-test/Scripts/python; fi
             "${vpy}" -m pip install --find-links dist --no-index --only-binary :all: zmuxio
-            "${vpy}" -m pip install "pytest>=8" "pytest-asyncio>=0.24" "cryptography>=42"
+            "${vpy}" -m pip install "pytest>=9.2" "pytest-asyncio>=1.4.1" "cryptography>=50"
             "${vpy}" -m pytest -q tests
           done
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v4
         if: matrix.qemu
       - name: Import test (QEMU)
         if: matrix.qemu
@@ -167,7 +167,7 @@ jobs:
           if [[ "${{ matrix.platform }}" == musllinux ]]; then image=python:3.12-alpine; fi
           docker run --rm --platform "${{ matrix.qemu }}" -v "$PWD/dist:/dist" "${image}" sh -c \
             "pip install --no-index --find-links /dist --only-binary :all: zmuxio && python -c 'import zmux; print(zmux.__version__)'"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.platform }}-${{ matrix.target }}
           path: dist/
@@ -178,12 +178,12 @@ jobs:
     needs: validate
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: PyO3/maturin-action@v1
+      - uses: actions/checkout@v7
+      - uses: PyO3/maturin-action@v1.51.0
         with:
           command: sdist
           args: --out dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sdist
           path: dist/
@@ -200,7 +200,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist/
           merge-multiple: true
@@ -209,7 +209,7 @@ jobs:
           python3 -m pip install twine
           python3 -m twine check --strict dist/*
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@v1.14.3
         with:
           packages-dir: dist/
           skip-existing: true

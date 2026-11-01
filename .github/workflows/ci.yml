@@ -18,12 +18,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -39,11 +39,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - run: python -m pip install "mypy>=1.13"
+      - run: python -m pip install "mypy>=2.4"
       - run: python -m mypy --strict python/zmux
 
   test:
@@ -57,8 +57,8 @@ jobs:
         # 3.12 builds the abi3 wheel; 3.14t the free-threaded one.
         python: [ '3.12', '3.14t' ]
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         id: py
         with:
           python-version: ${{ matrix.python }}
@@ -67,7 +67,7 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -78,11 +78,11 @@ jobs:
       - name: Build the wheel
         shell: bash
         run: |
-          python -m pip install "maturin>=1.9,<2"
+          python -m pip install "maturin>=1.16,<2"
           maturin build --release --locked --out dist -i "${{ steps.py.outputs.python-path }}"
       - name: Install and test
         shell: bash
         run: |
           python -m pip install --find-links dist --no-index zmuxio
-          python -m pip install "pytest>=8" "pytest-asyncio>=0.24" "cryptography>=42"
+          python -m pip install "pytest>=9.2" "pytest-asyncio>=1.4.1" "cryptography>=50"
           python -m pytest -q tests

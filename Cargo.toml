@@ -12,7 +12,7 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = { version = "0.30", features = ["abi3-py312"] }
 pyo3-async-runtimes = { version = "0.30", features = ["tokio-runtime"] }
-tokio = { version = "1.47", features = ["net", "rt-multi-thread", "sync", "io-util"] }
+tokio = { version = "1.54", features = ["net", "rt-multi-thread", "sync", "io-util"] }
 bytes = "1"
 zmux = "1.2.5"
 zmux-shaping = { version = "1.2.5", features = ["tokio"] }

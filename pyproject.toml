@@ -22,7 +22,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=9", "pytest-asyncio>=1.4", "cryptography>=50"]
+test = ["pytest>=9.2", "pytest-asyncio>=1.4.1", "cryptography>=50"]
 
 [project.urls]
 Repository = "https://github.com/zmuxio/zmux-python"
@@ -35,3 +35,7 @@ features = ["pyo3/extension-module"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+# README examples keep their hand-aligned layout; ruff 0.17 formats Markdown code blocks.
+extend-exclude = ["*.md"]
