@@ -26,6 +26,7 @@ for example) install from the sdist, which needs a Rust toolchain.
 ```python
 import asyncio, zmux
 
+
 async def main():
     async with zmux.Listener() as listener:
         addr = await listener.serve_tcp("127.0.0.1:0")
@@ -43,6 +44,7 @@ async def main():
             await send.finish()
             print(await recv.read_to_end())
         server.cancel()
+
 
 asyncio.run(main())
 ```
@@ -62,12 +64,14 @@ Python); the transport's `get_write_buffer_size()` is its unsent count.
 reads without the interpreter lock.
 
 ```python
-session = await zmux.connect_quic("example.net:443", config=zmux.Config(max_idle_timeout=30))
+session = await zmux.connect_quic(
+    "example.net:443", config=zmux.Config(max_idle_timeout=30)
+)
 async with session:
     send, recv = await session.open_bi(info=b"route", priority=zmux.Priority(1))
-    async with send:                      # finish on exit, reset on error
+    async with send:  # finish on exit, reset on error
         await send.write(b"request")
-    async for chunk in recv:              # until the end of the stream
+    async for chunk in recv:  # until the end of the stream
         ...
 ```
 
@@ -76,9 +80,13 @@ HTTP (no upgrades, no streaming bodies): the client sends POST requests, the
 server answers on `serve_http`. Both ends share `psk` and `encoding`:
 
 ```python
-opts = zmux.ExchangeOptions(psk=b"shared secret", encoding="base64",
-                            path="/up/{instance}", down_path="/down/{instance}/{nonce}")
-await listener.serve_http("0.0.0.0:8080", exchange=opts)          # server
+opts = zmux.ExchangeOptions(
+    psk=b"shared secret",
+    encoding="base64",
+    path="/up/{instance}",
+    down_path="/down/{instance}/{nonce}",
+)
+await listener.serve_http("0.0.0.0:8080", exchange=opts)  # server
 session = await zmux.connect_exchange("example.net:8080", options=opts)  # client
 ```
 
@@ -104,13 +112,17 @@ preferred kind that joins. The choice and every try are session events
 
 ```python
 auth = zmux.PrefixAuth(b"shared secret", slot=30)
-mode = zmux.Mode.auto([
-    zmux.Candidate.websocket("wss://example.net/zmux", credential=auth),
-    zmux.Candidate.streaming("example.net:80", credential=auth),
-    zmux.Candidate.split("example.net:80", credential=auth),
-    zmux.Candidate.exchange("example.net:80", options=opts),
-])
-session = await zmux.dial_mode(mode, zmux.Config(), cache=cache, key="example.net|office")
+mode = zmux.Mode.auto(
+    [
+        zmux.Candidate.websocket("wss://example.net/zmux", credential=auth),
+        zmux.Candidate.streaming("example.net:80", credential=auth),
+        zmux.Candidate.split("example.net:80", credential=auth),
+        zmux.Candidate.exchange("example.net:80", options=opts),
+    ]
+)
+session = await zmux.dial_mode(
+    mode, zmux.Config(), cache=cache, key="example.net|office"
+)
 print(session.stats().carrier)
 ```
 
@@ -180,8 +192,10 @@ async def tls(reader, writer):
     await writer.start_tls(server_context)
     return reader, writer
 
+
 async def transform(pipe, hint):
     return (await pipe.wrap(tls, server_side=True)).with_write_overhead(22)
+
 
 listener = zmux.Listener(inbound_transform=transform)
 ```
@@ -208,7 +222,9 @@ Events and statistics:
 ```python
 async for event in session.events():
     match event:
-        case zmux.PipeStateChanged(pipe=p, state=zmux.OutboundState.FAILED, failure=why):
+        case zmux.PipeStateChanged(
+            pipe=p, state=zmux.OutboundState.FAILED, failure=why
+        ):
             log.warning("pipe %d failed: %s", p, why)
         case zmux.Suspended() | zmux.Resumed():
             log.info("%s", event.kind)
@@ -322,9 +338,11 @@ while suspended. `options=` are the `PipeOptions` of the pool's pipes. `pool_pol
 at each look of the maintainer:
 
 ```python
-policy = {"count": {"const": 2},
-          "dial_after": [{"const": 1}, {"range": [5, 10]}],
-          "retire": [{"metric": "age", "above": {"range": [600, 900], "scope": "pipe"}}]}
+policy = {
+    "count": {"const": 2},
+    "dial_after": [{"const": 1}, {"range": [5, 10]}],
+    "retire": [{"metric": "age", "above": {"range": [600, 900], "scope": "pipe"}}],
+}
 ```
 
 Values have the JSON form and validation of the shaping definition's values;
