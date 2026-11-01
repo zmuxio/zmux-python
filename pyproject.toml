@@ -1,10 +1,10 @@
 [build-system]
-requires = ["maturin>=1.9,<2"]
+requires = ["maturin>=1.16,<2"]
 build-backend = "maturin"
 
 [project]
 name = "zmuxio"
-version = "0.3.1"
+version = "0.3.2"
 description = "QMux-compatible stream and datagram multiplexing over one or many byte pipes (Rust core)"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -22,7 +22,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8", "pytest-asyncio>=0.24", "cryptography>=42"]
+test = ["pytest>=9", "pytest-asyncio>=1.4", "cryptography>=50"]
 
 [project.urls]
 Repository = "https://github.com/zmuxio/zmux-python"

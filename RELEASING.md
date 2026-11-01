@@ -43,6 +43,12 @@ Review the metadata before setting the release version: `requires-python`, the P
 match the versions CI tests) and the `Development Status` classifier. Keep Python compatibility unchanged unless that
 is an intentional release decision.
 
+Before setting the release version, update every dependency to its latest release: the Rust dependencies in
+`Cargo.toml` (`cargo upgrade --incompatible`, then `cargo update`; the zmux crates at the version being released on
+crates.io), and the build and test requirements in `pyproject.toml` (maturin, pytest and the other development
+dependencies). Review the changes, rebuild with `maturin develop` and run the tests, and commit the updates on their own
+before the release commit.
+
 Update the version fields above, then commit and push:
 
 ```bash
