@@ -86,7 +86,7 @@ checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
  "cpufeatures",
- "rand_core 0.10.1",
+ "rand_core",
 ]
 
 [[package]]
@@ -352,18 +352,6 @@ dependencies = [
 
 [[package]]
 name = "getrandom"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
-dependencies = [
- "cfg-if",
- "libc",
- "r-efi 5.3.0",
- "wasip2",
-]
-
-[[package]]
-name = "getrandom"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
@@ -371,8 +359,8 @@ dependencies = [
  "cfg-if",
  "js-sys",
  "libc",
- "r-efi 6.0.0",
- "rand_core 0.10.1",
+ "r-efi",
+ "rand_core",
  "wasm-bindgen",
 ]
 
@@ -737,9 +725,9 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 
 [[package]]
 name = "log"
-version = "0.4.34"
+version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "loom"
@@ -1000,12 +988,6 @@ dependencies = [
 
 [[package]]
 name = "r-efi"
-version = "5.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
-
-[[package]]
-name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
@@ -1018,26 +1000,17 @@ checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
 dependencies = [
  "chacha20",
  "getrandom 0.4.3",
- "rand_core 0.10.1",
+ "rand_core",
 ]
 
 [[package]]
 name = "rand_chacha"
-version = "0.9.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3022b5f1df60f26e1ffddd6c66e8aa15de382ae63b3a0c1bfc0e4d3e3f325cb"
+checksum = "3e6af7f3e25ded52c41df4e0b1af2d047e45896c2f3281792ed68a1c243daedb"
 dependencies = [
  "ppv-lite86",
- "rand_core 0.9.5",
-]
-
-[[package]]
-name = "rand_core"
-version = "0.9.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
-dependencies = [
- "getrandom 0.3.4",
+ "rand_core",
 ]
 
 [[package]]
@@ -1052,7 +1025,7 @@ version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
 dependencies = [
- "rand_core 0.10.1",
+ "rand_core",
 ]
 
 [[package]]
@@ -1708,15 +1681,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
-name = "wasip2"
-version = "1.0.4+wasi-0.2.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b67efb37e106e55ce722a510d6b5f9c17f083e5fc79afc2badeb12cc313d9487"
-dependencies = [
- "wit-bindgen",
-]
-
-[[package]]
 name = "wasm-bindgen"
 version = "0.2.130"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1939,12 +1903,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
-name = "wit-bindgen"
-version = "0.57.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
-
-[[package]]
 name = "writeable"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2062,6 +2020,8 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 [[package]]
 name = "zmux"
 version = "1.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d27c70a95347e7a0065d83ec7b601ac28a248247fcb73b22c8026ea1c2cb5c6a"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -2075,6 +2035,8 @@ dependencies = [
 [[package]]
 name = "zmux-h3"
 version = "1.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd30e3be48d602afde3dfddafe2f2048b0b610b7c79f0b9af5202c5a89710ea3"
 dependencies = [
  "bytes",
  "h3",
@@ -2089,6 +2051,8 @@ dependencies = [
 [[package]]
 name = "zmux-http"
 version = "1.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00ddfdf10010678f25f26e27fd88268e7ff24950932f28571a52ee6aa87748d3"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -2129,6 +2093,8 @@ dependencies = [
 [[package]]
 name = "zmux-quinn"
 version = "1.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9d427177f2fbf6522f7f19c07e4aa8d3f65bb4394223054bcfddc9d75919dd0"
 dependencies = [
  "bytes",
  "quinn",
@@ -2139,6 +2105,8 @@ dependencies = [
 [[package]]
 name = "zmux-rustls"
 version = "1.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d62be9d03fc73861871715644eaefd78eea3dfcc0eae8f819e012abfaddd47f"
 dependencies = [
  "tokio",
  "tokio-rustls",
@@ -2148,7 +2116,10 @@ dependencies = [
 [[package]]
 name = "zmux-shaping"
 version = "1.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1596dbffb8a1cdf1b35b4e9985b6ba04648033c806b508eb4af59395cb841d6d"
 dependencies = [
+ "getrandom 0.4.3",
  "rand_chacha",
  "serde",
  "serde_json",
@@ -2158,6 +2129,8 @@ dependencies = [
 [[package]]
 name = "zmux-websocket"
 version = "1.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a4217c79353a7f7eca18dba275f466c55204c011eec56bd96c544a67c5a1a6b"
 dependencies = [
  "futures-util",
  "httparse",
@@ -2173,6 +2146,8 @@ dependencies = [
 [[package]]
 name = "zmux-webtransport"
 version = "1.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35ab3bcadad68a186425de5ed7464747d67060d175f0294e12c3aae3fa8ccd31"
 dependencies = [
  "bytes",
  "tokio",
