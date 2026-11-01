@@ -265,11 +265,11 @@ fn policy(name: &str) -> PyResult<zmux::Policy> {
 
 /// The join credentials of a `zmux.PipeAuth`.
 fn pipe_auth(v: &Bound<'_, PyAny>) -> PyResult<zmux::PipeAuth> {
-    let tls: bool = v.getattr("_tls")?.extract()?;
+    let exporter: bool = v.getattr("_exporter")?.extract()?;
     let insecure: bool = v.getattr("_insecure")?.extract()?;
     let psk: Option<Vec<u8>> = v.getattr("_psk")?.extract()?;
-    let base = match (tls, insecure) {
-        (true, _) => zmux::PipeAuth::tls(),
+    let base = match (exporter, insecure) {
+        (true, _) => zmux::PipeAuth::exporter(),
         (false, true) => zmux::PipeAuth::insecure(),
         (false, false) => zmux::PipeAuth::none(),
     };

@@ -850,21 +850,26 @@ class ShapingSizeLimits:
 
 
 class PipeAuth:
-    """Join credentials for multipath, immutable: `PipeAuth.tls()` (the
-    exporter of TLS that terminates at the peer), `PipeAuth.psk(key)` (a
+    """Join credentials for multipath, immutable: `PipeAuth.exporter()`
+    (the exporter of the innermost end-to-end handshake, today TLS that
+    this process terminates), `PipeAuth.psk(key)` (a
     pre-shared key of at least 16 bytes), `PipeAuth.insecure()` (no
     secret; only where other means protect the joins), and
     `auth.with_psk(key)`, a new value that adds a key."""
 
-    __slots__ = ("_insecure", "_psk", "_tls")
-    _tls: bool
+    __slots__ = ("_exporter", "_insecure", "_psk")
+    _exporter: bool
     _psk: bytes | None
     _insecure: bool
 
     def __init__(
-        self, *, tls: bool = False, psk: bytes | None = None, insecure: bool = False
+        self,
+        *,
+        exporter: bool = False,
+        psk: bytes | None = None,
+        insecure: bool = False,
     ) -> None:
-        object.__setattr__(self, "_tls", tls)
+        object.__setattr__(self, "_exporter", exporter)
         object.__setattr__(self, "_psk", None if psk is None else bytes(psk))
         object.__setattr__(self, "_insecure", insecure)
 
@@ -872,9 +877,10 @@ class PipeAuth:
         raise AttributeError("PipeAuth is immutable")
 
     @staticmethod
-    def tls() -> PipeAuth:
-        """The TLS exporter of the bootstrap carriers."""
-        return PipeAuth(tls=True)
+    def exporter() -> PipeAuth:
+        """The exporter of the innermost end-to-end handshake of the
+        bootstrap carriers."""
+        return PipeAuth(exporter=True)
 
     @staticmethod
     def psk(key: bytes) -> PipeAuth:
@@ -888,25 +894,25 @@ class PipeAuth:
 
     def with_psk(self, key: bytes) -> PipeAuth:
         """These credentials with the pre-shared key `key` added."""
-        return PipeAuth(tls=self._tls, psk=key, insecure=self._insecure)
+        return PipeAuth(exporter=self._exporter, psk=key, insecure=self._insecure)
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, PipeAuth):
             return NotImplemented
-        return (self._tls, self._psk, self._insecure) == (
-            other._tls,
+        return (self._exporter, self._psk, self._insecure) == (
+            other._exporter,
             other._psk,
             other._insecure,
         )
 
     def __hash__(self) -> int:
-        return hash((self._tls, self._psk, self._insecure))
+        return hash((self._exporter, self._psk, self._insecure))
 
     def __repr__(self) -> str:
         parts = [
             n
             for n, on in (
-                ("tls", self._tls),
+                ("exporter", self._exporter),
                 ("psk", self._psk is not None),
                 ("insecure", self._insecure),
             )

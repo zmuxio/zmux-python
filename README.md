@@ -282,7 +282,7 @@ policy written in Python is not offered: it would run on the driver's
 decision path under the interpreter lock.
 
 Multipath: give both ends `Config(max_pipes=8, pipe_auth=zmux.PipeAuth.psk(key))`
-(or `PipeAuth.tls()` over TLS/QUIC, `PipeAuth.tls().with_psk(key)` for
+(or `PipeAuth.exporter()` over TLS/QUIC, `PipeAuth.exporter().with_psk(key)` for
 both), then
 `session.add_pipe(await zmux.dial_tcp(addr), options=zmux.PipeOptions(send_priority=1, receive_priority=1))`.
 `PipeOptions` holds every option of a pipe (`None`: unset); a live pipe

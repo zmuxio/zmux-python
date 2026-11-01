@@ -51,7 +51,7 @@ def test_config_fields() -> None:
         overflow_delay=0.5,
         standby_probe=None,
         redundancy="off",
-        pipe_auth=zmux.PipeAuth.tls().with_psk(b"k" * 32),
+        pipe_auth=zmux.PipeAuth.exporter().with_psk(b"k" * 32),
         early_data=False,
         carrier_early_data=False,
         latency_budget=0.001,
@@ -120,7 +120,7 @@ def test_pipe_auth_is_immutable() -> None:
     a = zmux.PipeAuth.psk(b"k" * 32)
     b = a.with_psk(b"j" * 32)
     assert a != b and b == zmux.PipeAuth.psk(b"j" * 32)
-    assert zmux.PipeAuth.tls().with_psk(b"k" * 32) != a
+    assert zmux.PipeAuth.exporter().with_psk(b"k" * 32) != a
     with pytest.raises(AttributeError):
         a._psk = None
     assert "kkkk" not in repr(a)
