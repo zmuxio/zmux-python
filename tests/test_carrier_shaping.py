@@ -3,7 +3,7 @@
 import pytest
 import zmux
 
-PAD = '{"version":1,"machines":[{"states":[{"record":{"pad_to":{"const":1000}}}]}]}'
+PAD = '{"machines":[{"start":0,"states":[{"record":{"pad_to":1000}}]}]}'
 
 
 async def exchange(client: zmux.Session, server: zmux.Session) -> None:
@@ -15,15 +15,14 @@ async def exchange(client: zmux.Session, server: zmux.Session) -> None:
 
 
 def test_pipe_carrier() -> None:
-    pipe, _ = zmux.pipe_pair(carrier=zmux.CarrierKind.WEBSOCKET)
-    assert pipe.carrier == "websocket"
-    relabelled = pipe.with_carrier("quic")
-    assert relabelled.carrier == "quic"
-    with pytest.raises(RuntimeError):
-        _ = pipe.carrier
-    assert zmux.pipe_pair()[0].carrier is None
+    pipe, _ = zmux.pipe_pair(carrier_kind=zmux.CarrierKind.WEBSOCKET)
+    assert pipe.carrier_kind is zmux.CarrierKind.WEBSOCKET
+    pipe.carrier_kind = zmux.CarrierKind.QUIC
+    kind: object = pipe.carrier_kind
+    assert kind is zmux.CarrierKind.QUIC
+    assert zmux.pipe_pair()[0].carrier_kind is None
     with pytest.raises(ValueError):
-        zmux.pipe_pair(carrier="carrier pigeon")
+        zmux.pipe_pair(carrier_kind="carrier pigeon")
     with pytest.raises(ValueError):
         zmux.Config(shaping={"carrier pigeon": PAD})
     with pytest.raises(ValueError):
@@ -42,13 +41,13 @@ async def test_config_shapes_by_kind_from_the_first_record() -> None:
             for s in (client, server):
                 assert s.pipe_stats()[0].carrier == zmux.CarrierKind.WEBSOCKET
                 st = s.shaping_stats()
-                assert st["padding_bytes"] > 0 and st["faults"] == 0, st
+                assert st["wire_spent"] > 0 and st["faults"] == 0, st
         async with await zmux.connect_tcp(tcp, config=config) as client:
             server = await listener.accept()
             await exchange(client, server)
             for s in (client, server):
                 assert s.pipe_stats()[0].carrier is None
-                assert s.shaping_stats()["padding_bytes"] == 0
+                assert s.shaping_stats()["wire_spent"] == 0
 
 
 async def test_set_shaper_by_kind() -> None:
@@ -57,19 +56,17 @@ async def test_set_shaper_by_kind() -> None:
         async with await zmux.connect_tcp(addr) as client:
             server = await listener.accept()
             with pytest.raises(ValueError):
-                client.set_shaper(json=PAD, by_kind={None: PAD})
+                client.set_shaper(definition=PAD, by_kind={None: PAD})
             client.set_shaper(by_kind={zmux.CarrierKind.QUIC: PAD})
             await exchange(client, server)
-            assert client.shaping_stats()["padding_bytes"] == 0
+            assert client.shaping_stats()["wire_spent"] == 0
             client.set_shaper(by_kind={None: PAD})
             await exchange(client, server)
-            assert client.shaping_stats()["padding_bytes"] > 0
+            assert client.shaping_stats()["wire_spent"] > 0
 
 
-DELAY_FIRST = '{"version":1,"machines":[{"states":[{"record":{"delay":{"const":0.02}},"next":[{"on":"record_out","to":1}]},{}]}]}'
-DELAY_ALL = (
-    '{"version":1,"machines":[{"states":[{"record":{"delay":{"const":0.02}}}]}]}'
-)
+DELAY_FIRST = '{"machines":[{"start":0,"states":[{"record":{"delay":20000},"next":[{"on":"record_out","to":1}]},{}]}]}'
+DELAY_ALL = '{"machines":[{"start":0,"states":[{"record":{"delay":20000}}]}]}'
 
 
 @pytest.mark.parametrize("definition", [DELAY_FIRST, DELAY_ALL], ids=["first", "all"])
@@ -88,4 +85,4 @@ async def test_a_delayed_first_record_keeps_the_parameters_first(
             await exchange(server, client)
             for s in (client, server):
                 st = s.shaping_stats()
-                assert st["pause_total"] > 0 and st["faults"] == 0, st
+                assert st["stall_spent"] > 0 and st["faults"] == 0, st

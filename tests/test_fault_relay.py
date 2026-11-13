@@ -14,7 +14,7 @@ PSK = b"fault-relay-psk-0123456789abcdef"
 def _config(**kw: Any) -> zmux.Config:
     return zmux.Config(
         max_pipes=6,
-        pipe_auth=zmux.PipeAuth.psk(PSK),
+        pipe_auth=zmux.PipeAuth.psk(PSK).with_end_to_end(),
         max_idle_timeout=None,
         resume_timeout=120,
         **kw,
@@ -102,7 +102,11 @@ async def test_a_black_hole_is_found_by_the_probe() -> None:
                     return await zmux.dial_tcp(raddr)
 
                 pool = zmux.PipePool(
-                    1, dial, options=zmux.PipeOptions(probe_interval=1)
+                    1,
+                    dial,
+                    options=zmux.PipeOptions(
+                        liveness=zmux.PipeLiveness(probe_interval=1)
+                    ),
                 )
                 handle = session.maintain_pipes(pool)
                 await _until(lambda: len(_pool_pipes(session, first)) == 1, 10)
@@ -180,20 +184,30 @@ async def test_the_last_pipe_cut_resumes_without_loss() -> None:
                 reader = asyncio.ensure_future(read())
                 await asyncio.sleep(0.3)
                 relay.cut()
-                # Suspended and Resumed share one slot (the latest unread
-                # wins), so a slow reader may see only Resumed; the counter
+                # SessionSuspended and SessionResumed share one slot (the latest unread
+                # wins), so a slow reader may see only SessionResumed; the counter
                 # shows the suspension happened.
                 await _until(
-                    lambda: any(isinstance(e, zmux.Resumed) for e in events), 25
+                    lambda: any(isinstance(e, zmux.SessionResumed) for e in events), 25
                 )
                 assert client.stats().suspensions >= 1
                 assert await asyncio.wait_for(reader, 30) == total
                 await asyncio.wait_for(writer, 5)
-                retired = [e for e in events if isinstance(e, zmux.PipesRetired)]
-                # The cut pipes are retired; their failures were read as
-                # they happened, so the summary does not count them again.
-                assert sum(e.retired for e in retired) >= 2, retired
-                assert first in {i for e in retired for i in e.last}, retired
+
+                # The cut pipes are retired once their PIPE_ABANDON exchange
+                # ends, which may come after the data. Every summary is kept,
+                # and since `last` holds at most four IDs, the pipe table (which
+                # drops a pipe as it is retired) says whether `first` was.
+                def retired() -> list[zmux.PipesRetired]:
+                    return [e for e in events if isinstance(e, zmux.PipesRetired)]
+
+                await _until(
+                    lambda: (
+                        sum(e.retired for e in retired()) >= 2
+                        and all(p.id != first for p in client.pipes())
+                    ),
+                    10,
+                )
                 handle.stop()
                 await _until(lambda: handle.finished, 5)
                 watcher.cancel()

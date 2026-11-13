@@ -37,7 +37,7 @@ def shape(session: zmux.Session) -> None:
     with open(path, encoding="utf-8") as f:
         definition = f.read()
     try:
-        session.set_shaper(json=definition)
+        session.set_shaper(definition=definition)
     except ValueError as e:
         die(f"def: {e}")
 
@@ -45,11 +45,11 @@ def shape(session: zmux.Session) -> None:
 def report(session: zmux.Session) -> None:
     st = session.shaping_stats()
     print(
-        f"STATS padding={st['padding_bytes']} injected={st['injected']} "
+        f"STATS padding={st['wire_spent']} injected={st['injected']} "
         f"dropped={st['inject_dropped']} clamped={st['clamped']} faults={st['faults']}",
         flush=True,
     )
-    if os.environ.get("SHAPE_DEF") and (st["padding_bytes"] == 0 or st["faults"] != 0):
+    if os.environ.get("SHAPE_DEF") and (st["wire_spent"] == 0 or st["faults"] != 0):
         die("not shaped")
 
 

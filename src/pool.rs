@@ -8,6 +8,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyString};
 use pyo3_async_runtimes::TaskLocals;
 use zmux::helpers::{PoolDecision, PoolView};
+
 use zmux_shaping::{MachinePoolPolicy, MemberDecision, PoolMember};
 
 use crate::rt::get_runtime;
@@ -32,7 +33,7 @@ fn json_bytes(json: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
 
 /// A pool policy read from JSON; its decisions run natively. Pools given
 /// the same object share its state.
-#[pyclass(frozen, module = "zmux._zmux")]
+#[pyclass(frozen, module = "zmux")]
 pub(crate) struct PoolPolicy(Arc<StdMutex<MachinePoolPolicy>>);
 
 impl PoolPolicy {
@@ -66,21 +67,26 @@ fn metric(d: &Bound<'_, PyDict>, k: &str) -> PyResult<f64> {
     Ok(x)
 }
 
+/// Seconds as microseconds.
+fn micros(x: f64) -> u64 {
+    (x * 1e6).round().clamp(0.0, u64::MAX as f64) as u64
+}
+
+fn secs(x: u64) -> f64 {
+    x as f64 / 1e6
+}
+
 fn count(x: f64) -> u64 {
     x.clamp(0.0, u64::MAX as f64) as u64
 }
 
 #[pymethods]
 impl PoolPolicy {
+    /// Reads a policy from its JSON `definition` (`str`, `bytes` or
+    /// `dict`).
     #[new]
-    fn new(json: &Bound<'_, PyAny>) -> PyResult<Self> {
-        Self::parse(json)
-    }
-
-    /// Reads a policy from a JSON object (`str`, `bytes` or `dict`).
-    #[staticmethod]
-    fn from_json(json: &Bound<'_, PyAny>) -> PyResult<Self> {
-        Self::parse(json)
+    fn new(definition: &Bound<'_, PyAny>) -> PyResult<Self> {
+        Self::parse(definition)
     }
 
     /// One decision for a pool whose dials failed `failures` times in a
@@ -101,8 +107,8 @@ impl PoolPolicy {
                 .ok_or_else(|| PyValueError::new_err("member without an id"))?
                 .extract()?;
             let mut m = PoolMember::new(id);
-            m.age = Duration::from_secs_f64(metric(d, "age")?);
-            m.idle = Duration::from_secs_f64(metric(d, "idle")?);
+            m.age = micros(metric(d, "age")?);
+            m.idle = micros(metric(d, "idle")?);
             m.pipes = count(metric(d, "pipes")?);
             m.bytes_sent = count(metric(d, "bytes_sent")?);
             m.bytes_received = count(metric(d, "bytes_received")?);
@@ -114,7 +120,7 @@ impl PoolPolicy {
                     "since_dial is a finite non-negative number",
                 ));
             }
-            s => s.map(Duration::from_secs_f64),
+            s => s.map(micros),
         };
         let mut out = MemberDecision::default();
         self.0
@@ -122,18 +128,18 @@ impl PoolPolicy {
             .unwrap()
             .decide_members(failures, since, &ms, &mut out);
         Ok(PoolPolicyDecision {
-            count: out.count,
-            dial_after: out.dial_after,
+            count: out.count.map(|c| usize::try_from(c).unwrap_or(usize::MAX)),
+            dial_after: out.dial_after.map(secs),
             retire: out.retire,
-            recheck: out.recheck.map(|d| d.as_secs_f64()),
-            probe_interval: out.probe_interval,
-            probe_jitter: out.probe_jitter,
+            recheck: out.recheck.map(secs),
+            probe_interval: out.probe_interval.map(secs),
+            probe_jitter: out.probe_jitter.map(|j| f64::from(j) / 1e6),
         })
     }
 }
 
 /// One answer of `PoolPolicy.decide`.
-#[pyclass(frozen, eq, get_all, module = "zmux._zmux")]
+#[pyclass(frozen, eq, get_all, module = "zmux")]
 #[derive(Clone, PartialEq)]
 pub(crate) struct PoolPolicyDecision {
     count: Option<usize>,
@@ -166,19 +172,17 @@ impl PoolPolicyDecision {
                 )));
             }
         }
-        let mut d = PoolDecision::default();
+        // As in a policy file, a probe interval of 0 turns the idle probes off.
+        let mut l = zmux::PipeLiveness::default();
         if let Some(i) = probe_interval {
             let bad = || PyValueError::new_err("probe_interval is 0 or at least 1 s");
-            // As in a policy file, 0 turns the idle probes off.
-            let i = if i == 0.0 {
-                zmux::Period::Off
-            } else {
-                zmux::Period::Every(Duration::try_from_secs_f64(i).map_err(|_| bad())?)
-            };
-            d.set_probe_interval(i).map_err(|_| bad())?;
+            let i = Duration::try_from_secs_f64(i).map_err(|_| bad())?;
+            l.probe_interval = zmux::Inherit::Set((!i.is_zero()).then_some(i));
+            l.validate().map_err(|_| bad())?;
         }
         if let Some(j) = probe_jitter {
-            d.set_probe_jitter(j)
+            l.probe_jitter = zmux::Inherit::Set(j);
+            l.validate()
                 .map_err(|_| PyValueError::new_err("probe_jitter is in [0, 1)"))?;
         }
         Ok(Self {
@@ -219,19 +223,19 @@ impl zmux::helpers::PoolPolicy for Shared {
 }
 
 fn dial_err(e: PyErr) -> std::io::Error {
-    std::io::Error::other(e.to_string())
+    std::io::Error::other(e)
 }
 
 /// Members to keep up over one path: pipes on the carriers an async
 /// callable `dial()` returns, or the groups of pipes an async callable
 /// `join(session, options)` joins itself.
-#[pyclass(frozen, module = "zmux._zmux")]
+#[pyclass(frozen, module = "zmux")]
 pub(crate) struct PipePool {
     count: usize,
     dial: Option<Arc<Py<PyAny>>>,
     join: Option<Arc<Py<PyAny>>>,
-    /// Members dialed over the carrier kinds of a mode, under its policy.
-    mode: Option<(zmux::Mode, zmux::ModePolicy)>,
+    /// Members dialed through a carrier choice, under its policy.
+    choice: Option<(zmux::CarrierChoice, zmux::CarrierChoicePolicy)>,
     options: zmux::PipeOptions,
     rotate: Option<zmux::helpers::RotatePolicy>,
     policy: Option<Arc<StdMutex<MachinePoolPolicy>>>,
@@ -240,14 +244,23 @@ pub(crate) struct PipePool {
 
 #[pymethods]
 impl PipePool {
+    /// Exactly one of `dial` (an async callable returning a `PipeIo`),
+    /// `join` (an async callable `join(session, options)` returning the
+    /// pipes it joined) and `choice` (a `CarrierChoice`, whose members are
+    /// dialed most robust kind first and upgraded make before break to a
+    /// preferred kind once one is usable, under `choice_policy`). Durations
+    /// in seconds. An invalid choice or policy raises `ValueError`.
     #[new]
-    #[pyo3(signature = (count, dial=None, *, join=None, rotate_max_bytes=None, rotate_max_age=None,
-        rotate_jitter=0.0, pool_policy=None, options=None, decision_rejected=None))]
+    #[pyo3(signature = (count=1, dial=None, *, join=None, choice=None, choice_policy=None,
+        rotate_max_bytes=None, rotate_max_age=None, rotate_jitter=0.0, pool_policy=None,
+        options=None, decision_rejected=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         count: usize,
         dial: Option<Py<PyAny>>,
         join: Option<Py<PyAny>>,
+        choice: Option<PyRef<'_, crate::choice::CarrierChoice>>,
+        choice_policy: Option<PyRef<'_, crate::choice::CarrierChoicePolicy>>,
         rotate_max_bytes: Option<u64>,
         rotate_max_age: Option<f64>,
         rotate_jitter: f64,
@@ -255,69 +268,32 @@ impl PipePool {
         options: Option<Bound<'_, PyAny>>,
         decision_rejected: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
-        if dial.is_some() == join.is_some() {
-            return Err(PyTypeError::new_err("PipePool takes one of dial and join"));
+        let given = usize::from(dial.is_some())
+            + usize::from(join.is_some())
+            + usize::from(choice.is_some());
+        if given != 1 {
+            return Err(PyTypeError::new_err(
+                "PipePool takes exactly one of dial, join and choice",
+            ));
         }
+        if choice.is_none() && choice_policy.is_some() {
+            return Err(PyTypeError::new_err("choice_policy goes with choice"));
+        }
+        let choice = match choice {
+            Some(c) => {
+                let policy = choice_policy.map(|p| p.0.clone()).unwrap_or_default();
+                // Rejected now rather than when maintained.
+                zmux::helpers::PipePool::choice(&c.0, &policy)
+                    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+                Some((c.0.clone(), policy))
+            }
+            None => None,
+        };
         Self::build(
             count,
             dial,
             join,
-            None,
-            rotate_max_bytes,
-            rotate_max_age,
-            rotate_jitter,
-            pool_policy,
-            options,
-            decision_rejected,
-        )
-    }
-
-    /// A pool whose members are dialed over the carrier kinds of `mode`,
-    /// most robust first, then upgraded make before break to a preferred
-    /// kind once one is usable (see the Rust crate's `PipePool::mode`):
-    /// `cache` and the timers as `dial_mode`'s (`no_join` does not apply).
-    /// Durations in seconds. An invalid mode or policy raises `ValueError`.
-    #[staticmethod]
-    #[pyo3(signature = (mode, *, count=1, cache=None, key="".to_owned(), timer_factor=3.0,
-        timer_min=1.0, timer_max=3.0, settle=1.0, drop_window=30.0, rotate_max_bytes=None,
-        rotate_max_age=None, rotate_jitter=0.0, pool_policy=None, options=None,
-        decision_rejected=None))]
-    #[allow(clippy::too_many_arguments)]
-    fn mode(
-        mode: PyRef<'_, crate::mode::Mode>,
-        count: usize,
-        cache: Option<PyRef<'_, crate::mode::CarrierCache>>,
-        key: String,
-        timer_factor: f64,
-        timer_min: f64,
-        timer_max: f64,
-        settle: f64,
-        drop_window: f64,
-        rotate_max_bytes: Option<u64>,
-        rotate_max_age: Option<f64>,
-        rotate_jitter: f64,
-        pool_policy: Option<Bound<'_, PyAny>>,
-        options: Option<Bound<'_, PyAny>>,
-        decision_rejected: Option<Py<PyAny>>,
-    ) -> PyResult<Self> {
-        let policy = crate::mode::policy(
-            cache,
-            key,
-            timer_factor,
-            timer_min,
-            timer_max,
-            settle,
-            drop_window,
-            false,
-        )?;
-        // Rejected now rather than when maintained.
-        zmux::helpers::PipePool::mode(&mode.0, &policy)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Self::build(
-            count,
-            None,
-            None,
-            Some((mode.0.clone(), policy)),
+            choice,
             rotate_max_bytes,
             rotate_max_age,
             rotate_jitter,
@@ -340,7 +316,7 @@ impl PipePool {
         count: usize,
         dial: Option<Py<PyAny>>,
         join: Option<Py<PyAny>>,
-        mode: Option<(zmux::Mode, zmux::ModePolicy)>,
+        choice: Option<(zmux::CarrierChoice, zmux::CarrierChoicePolicy)>,
         rotate_max_bytes: Option<u64>,
         rotate_max_age: Option<f64>,
         rotate_jitter: f64,
@@ -372,7 +348,7 @@ impl PipePool {
             count,
             dial: dial.map(Arc::new),
             join: join.map(Arc::new),
-            mode,
+            choice,
             options: pipe_options(options)?,
             rotate,
             policy: pool_policy
@@ -386,8 +362,8 @@ impl PipePool {
     fn native(&self, locals: TaskLocals) -> zmux::helpers::PipePool {
         let locals = Arc::new(locals);
         let report = locals.clone();
-        let mut p = if let Some((mode, policy)) = &self.mode {
-            let mut p = zmux::helpers::PipePool::mode(mode, policy)
+        let mut p = if let Some((choice, policy)) = &self.choice {
+            let mut p = zmux::helpers::PipePool::choice(choice, policy)
                 .expect("checked when the pool was made");
             p.count = self.count;
             p
@@ -451,7 +427,7 @@ impl PipePool {
 
 /// Stops a pool's maintainer on `stop()` or when collected; it also ends
 /// with the session.
-#[pyclass(frozen, module = "zmux._zmux")]
+#[pyclass(frozen, module = "zmux")]
 pub(crate) struct MaintainHandle(zmux::helpers::MaintainHandle);
 
 #[pymethods]
@@ -475,7 +451,9 @@ pub(crate) fn maintain(py: Python<'_>, s: &Session, pool: &PipePool) -> PyResult
         .map_err(|_| PyRuntimeError::new_err("maintain_pipes needs a running event loop"))?;
     let p = pool.native(locals);
     let _g = get_runtime().enter();
-    Ok(MaintainHandle(zmux::helpers::maintain_pipes(&s.0, p)))
+    Ok(MaintainHandle(
+        zmux::helpers::maintain_pipes(&s.0, p).map_err(crate::connect_err)?,
+    ))
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {

@@ -17,7 +17,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, Rea
 use tokio::sync::{Mutex, mpsc};
 
 use crate::rt::{self, future_into_py};
-use crate::{PipeIo, admission, io_err, pyb};
+use crate::{PipeIo, Returned, admission, io_err, pyb, unread_take};
 
 /// How many writes each way a layer's channel holds.
 const DEPTH: usize = 8;
@@ -31,10 +31,12 @@ pub(crate) fn py_io(e: PyErr) -> io::Error {
 /// carrier with message framing each write is one message and reads return
 /// the messages' bytes in order. Each `write` is exactly one write on the
 /// carrier. Bytes a listener already read from the carrier come first.
-#[pyclass(frozen, module = "zmux._zmux")]
+#[pyclass(frozen, module = "zmux")]
 pub(crate) struct CarrierStream {
     r: Arc<Mutex<Option<ReadHalf<zmux::PipeStream>>>>,
     w: Arc<Mutex<Option<WriteHalf<zmux::PipeStream>>>>,
+    /// Bytes of reads cancelled as they completed, shared by the handles.
+    unread: Arc<Returned<Bytes>>,
 }
 
 impl CarrierStream {
@@ -43,6 +45,7 @@ impl CarrierStream {
         Self {
             r: Arc::new(Mutex::new(Some(r))),
             w: Arc::new(Mutex::new(Some(w))),
+            unread: Arc::default(),
         }
     }
 
@@ -56,6 +59,7 @@ impl CarrierStream {
         Self {
             r: self.r.clone(),
             w: self.w.clone(),
+            unread: self.unread.clone(),
         }
     }
 }
@@ -70,14 +74,23 @@ impl CarrierStream {
     /// receiving half).
     #[pyo3(signature = (n=65536))]
     fn read<'p>(&self, py: Python<'p>, n: usize) -> PyResult<Bound<'p, PyAny>> {
-        let r = self.r.clone();
-        future_into_py(py, async move {
-            let mut buf = vec![0; n.max(1)];
-            let mut r = r.lock().await;
-            let r = r.as_mut().ok_or_else(released)?;
-            let k = r.read(&mut buf).await.map_err(io_err)?;
-            Ok(pyb(&buf[..k]))
-        })
+        let (r, unread) = (self.r.clone(), self.unread.queue());
+        let undo = self.unread.undo(py)?;
+        rt::undoable_future_into_py(
+            py,
+            async move {
+                // Held until the result is settled: bytes taken back come first.
+                let mut held = r.lock_owned().await;
+                if let Some(b) = unread_take(&unread, n.max(1)) {
+                    return Ok((pyb(&b), held));
+                }
+                let mut buf = vec![0; n.max(1)];
+                let r = held.as_mut().ok_or_else(released)?;
+                let k = r.read(&mut buf).await.map_err(io_err)?;
+                Ok((pyb(&buf[..k]), held))
+            },
+            undo,
+        )
     }
     /// Writes `data` as one write on the carrier (one message on a carrier
     /// with message framing); fails without a sending half.
@@ -175,11 +188,14 @@ impl AsyncWrite for ChanIo {
     }
 }
 
-/// The Python side of a layer's stream, which `zmux._layer` pumps.
-#[pyclass(frozen, module = "zmux._zmux")]
+/// The Python side of a layer's stream, which `zmux._layer` pumps; private
+/// to the binding.
+#[pyclass(frozen, name = "_LayerEnd", module = "zmux")]
 pub(crate) struct LayerEnd {
     /// The carrier's writes, one message each.
     rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
+    /// Writes of reads cancelled as they completed.
+    unread: Returned<Bytes>,
     /// What the layer read; dropped at its end.
     tx: std::sync::Mutex<Option<mpsc::Sender<Bytes>>>,
 }
@@ -196,6 +212,7 @@ fn chan_pair() -> (ChanIo, LayerEnd) {
         },
         LayerEnd {
             rx: Arc::new(Mutex::new(out_rx)),
+            unread: Returned::default(),
             tx: std::sync::Mutex::new(Some(in_tx)),
         },
     )
@@ -205,11 +222,21 @@ fn chan_pair() -> (ChanIo, LayerEnd) {
 impl LayerEnd {
     /// The next write of the carrier; `b""` once it ended.
     fn read<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
-        let rx = self.rx.clone();
-        future_into_py(py, async move {
-            let b = rx.lock().await.recv().await.unwrap_or_default();
-            Ok(pyb(&b))
-        })
+        let (rx, unread) = (self.rx.clone(), self.unread.queue());
+        let undo = self.unread.undo(py)?;
+        rt::undoable_future_into_py(
+            py,
+            async move {
+                // Held until the result is settled: a write taken back comes first, whole.
+                let mut rx = rx.lock_owned().await;
+                if let Some(b) = unread_take(&unread, usize::MAX) {
+                    return Ok((pyb(&b), rx));
+                }
+                let b = rx.recv().await.unwrap_or_default();
+                Ok((pyb(&b), rx))
+            },
+            undo,
+        )
     }
     /// Bytes the layer read, for the carrier's reads.
     fn write<'p>(&self, py: Python<'p>, data: Vec<u8>) -> PyResult<Bound<'p, PyAny>> {
@@ -261,7 +288,7 @@ pub(crate) async fn wrap(
 }
 
 /// What a listener knows of a carrier when its inbound transform runs.
-#[pyclass(frozen, module = "zmux._zmux")]
+#[pyclass(frozen, module = "zmux")]
 pub(crate) struct PipeHint {
     source: Option<(String, u16)>,
     peer: Option<(String, u16)>,
@@ -299,7 +326,7 @@ impl PipeHint {
     fn split(&self) -> bool {
         self.split
     }
-    /// The admission's value for the carrier (`Verdict.accept(value=...)`).
+    /// The admission's value for the carrier (`AdmissionVerdict.accept(value=...)`).
     #[getter]
     fn admitted(&self, py: Python<'_>) -> Option<Py<PyAny>> {
         admission::admitted_obj(py, self.admitted.as_ref())

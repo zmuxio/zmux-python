@@ -8,7 +8,8 @@ import collections
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol, cast
 
-from ._zmux import CarrierStream, LayerEnd, ZmuxError
+from ._errors import ZmuxError
+from ._zmux import CarrierStream, _LayerEnd
 
 
 class LayerWriter(Protocol):
@@ -155,6 +156,13 @@ class _CarrierTransport(asyncio.Transport):
     def abort(self) -> None:
         self._lose(None)
 
+    def _force_close(self, exc: Exception | None) -> None:
+        # Called by asyncio's TLS protocol on a fatal error, as on its own
+        # transports: the queue is dropped and the protocol told of `exc`.
+        self._queue.clear()
+        self._queued = 0
+        self._lose(exc)
+
     def is_closing(self) -> bool:
         return self._closing
 
@@ -225,7 +233,7 @@ async def open_carrier(
 
 
 async def run(
-    layer: Layer, stream: CarrierStream, end: LayerEnd, server_side: bool
+    layer: Layer, stream: CarrierStream, end: _LayerEnd, server_side: bool
 ) -> None:
     """Runs `layer` over `stream`; then pumps between the layer's streams
     and `end` until either ends."""

@@ -1,4 +1,5 @@
-"""The shared carrier cache snapshot vectors (zmux-rs testdata/carrier-cache):
+"""The carrier cache snapshot vectors shared with the other implementations
+(copied from the specification into tests/testdata):
 each case's steps restored in order into a new cache, then its snapshot
 compared with the expected entries; and the JSON round trip."""
 
@@ -10,17 +11,7 @@ import re
 import pytest
 import zmux
 
-VECTORS = (
-    pathlib.Path(__file__).resolve().parents[2]
-    / "zmux-rs"
-    / "testdata"
-    / "carrier-cache"
-    / "vectors.json"
-)
-
-pytestmark = pytest.mark.skipif(
-    not VECTORS.exists(), reason="zmux-rs checkout not beside this one"
-)
+VECTORS = pathlib.Path(__file__).parent / "testdata" / "carrier-cache" / "vectors.json"
 
 
 def rfc3339(t: datetime.datetime) -> str:

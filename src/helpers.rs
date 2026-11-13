@@ -187,6 +187,32 @@ fn dial_err(e: PyErr) -> std::io::Error {
     std::io::Error::other(e.to_string())
 }
 
+/// `Config(redial=...)`: an async callable given the `Direction` that
+/// returns the carrier replacing the lost pipe. The Config is made inside a running
+/// event loop, which runs the callable.
+pub(crate) fn redial_of(v: &Bound<'_, PyAny>) -> PyResult<zmux::Dial> {
+    let py = v.py();
+    let locals = Arc::new(get_current_locals(py).map_err(|_| {
+        pyo3::exceptions::PyRuntimeError::new_err(
+            "redial needs the Config made inside a running event loop",
+        )
+    })?);
+    let f = Arc::new(v.clone().unbind());
+    Ok(zmux::Dial::new(move |req: zmux::DialRequest| {
+        let (f, locals) = (f.clone(), locals.clone());
+        let need = req.direction;
+        async move {
+            let fut = crate::rt::attach(|py| {
+                let coro = f.bind(py).call1((crate::direction_obj(py, need),))?;
+                crate::rt::into_future(&locals, coro)
+            })
+            .map_err(dial_err)?;
+            let obj = fut.await.map_err(dial_err)?;
+            crate::rt::attach(|py| obj.bind(py).cast::<PipeIo>()?.get().take()).map_err(dial_err)
+        }
+    }))
+}
+
 /// Resolves two sessions between the same endpoints that raced (both
 /// dialed at once): keeps one, drains the other, and optionally starts a
 /// rejoin of the loser's route into the survivor. `ValueError` when the

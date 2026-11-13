@@ -1,32 +1,9 @@
 import asyncio
-import json
-import pathlib
 from collections.abc import Callable
 from typing import Any
 
 import pytest
 import zmux
-
-VECTORS = json.loads(
-    (pathlib.Path(__file__).parent / "testdata" / "pool_policy.json").read_text()
-)
-
-
-def test_vector_version() -> None:
-    assert VECTORS["version"] == 3
-
-
-@pytest.mark.parametrize("case", VECTORS["parse"], ids=lambda c: c["name"])
-def test_parse(case: dict[str, Any]) -> None:
-    text = case["raw"] if "raw" in case else json.dumps(case["policy"])
-    if case["ok"]:
-        zmux.PoolPolicy.from_json(text)
-        if "policy" in case:
-            zmux.PoolPolicy(case["policy"])
-    else:
-        with pytest.raises(ValueError) as e:
-            zmux.PoolPolicy.from_json(text.encode())
-        assert case.get("error", "").lower() in str(e.value).lower()
 
 
 async def _until(cond: Callable[[], object]) -> None:
@@ -39,59 +16,18 @@ async def _no_dial() -> zmux.PipeIo:
 
 
 def test_not_json() -> None:
-    with pytest.raises(ValueError, match="pool"):
+    with pytest.raises(ValueError, match="syntax"):
         zmux.PoolPolicy("{")
     with pytest.raises(ValueError):
         zmux.PipePool(
             1,
             _no_dial,
-            pool_policy={"retire": [{"metric": "nope", "above": {"const": 1}}]},
+            pool_policy={"retire": [{"metric": "nope", "above": 1}]},
         )
-
-
-@pytest.mark.parametrize("case", VECTORS["decide"], ids=lambda c: c["name"])
-def test_decide(case: dict[str, Any]) -> None:
-    p = zmux.PoolPolicy(case["policy"])
-    got: list[zmux.PoolPolicyDecision] = []
-    for step in case["steps"]:
-        d = p.decide(
-            step.get("failures", 0),
-            step.get("members", []),
-            since_dial=step.get("since_dial"),
-        )
-        got.append(d)
-        want = step.get("want", {})
-        if "same_as" in want:
-            assert d == got[want["same_as"]]
-        for key in ("count", "retire"):
-            if key in want:
-                assert getattr(d, key) == want[key]
-        if "dial_after_same_as" in want:
-            assert d.dial_after == got[want["dial_after_same_as"]].dial_after
-        if "dial_after_redrawn_from" in want:
-            assert d.dial_after != got[want["dial_after_redrawn_from"]].dial_after
-        for key in ("dial_after", "recheck", "probe_interval", "probe_jitter"):
-            if key in want:
-                if want[key] is None:
-                    assert getattr(d, key) is None
-                else:
-                    assert getattr(d, key) == pytest.approx(want[key], abs=1e-6)
-        if "count_in" in want:
-            lo, hi = want["count_in"]
-            assert lo <= d.count <= hi
-        if "dial_after_in" in want:
-            lo, hi = want["dial_after_in"]
-            assert lo <= d.dial_after <= hi
-        if "probe_interval_in" in want:
-            lo, hi = want["probe_interval_in"]
-            assert d.probe_interval is not None and lo <= d.probe_interval <= hi
-        if "recheck_in" in want:
-            lo, hi = want["recheck_in"]
-            assert d.recheck is not None and d.recheck > 0 and lo <= d.recheck <= hi
 
 
 def test_since_dial_is_checked() -> None:
-    p = zmux.PoolPolicy({"dial_after": [{"const": 1}]})
+    p = zmux.PoolPolicy({"dial_after": [1000000]})
     with pytest.raises(ValueError):
         p.decide(since_dial=-1)
     assert repr(p.decide(since_dial=0.5)) == (
@@ -100,7 +36,9 @@ def test_since_dial_is_checked() -> None:
 
 
 async def test_pool_count_and_age_retire() -> None:
-    config = zmux.Config(max_pipes=8, pipe_auth=zmux.PipeAuth.psk(b"k" * 32))
+    config = zmux.Config(
+        max_pipes=8, pipe_auth=zmux.PipeAuth.psk(b"k" * 32).with_end_to_end()
+    )
     async with zmux.Listener(
         config, instance_id=b"instance", max_suspended=16
     ) as listener:
@@ -112,8 +50,8 @@ async def test_pool_count_and_age_retire() -> None:
             return await zmux.dial_tcp(addr)
 
         policy = {
-            "count": {"const": 2},
-            "retire": [{"metric": "age", "above": {"const": 1}}],
+            "count": 2,
+            "retire": [{"metric": "age", "above": 1000000}],
         }
         async with await zmux.connect_tcp(addr, config=config) as session:
             first = session.pipes()[0].id
@@ -143,32 +81,36 @@ def test_pipe_options_are_checked() -> None:
     async def dial() -> zmux.PipeIo:
         raise AssertionError("not dialled")
 
+    PL = zmux.PipeLiveness
     for bad in (
-        zmux.PipeOptions(probe_interval=0.5),
-        zmux.PipeOptions(probe_jitter=1.0),
-        zmux.PipeOptions(probe_jitter=-0.1),
-        zmux.PipeOptions(probe_interval=-1),
-        zmux.PipeOptions(probe_interval=0),
+        zmux.PipeOptions(liveness=PL(probe_interval=0.5)),
+        zmux.PipeOptions(liveness=PL(probe_jitter=1.0)),
+        zmux.PipeOptions(liveness=PL(probe_jitter=-0.1)),
+        zmux.PipeOptions(liveness=PL(probe_interval=-1)),
+        zmux.PipeOptions(liveness=PL(probe_interval=0)),
     ):
         with pytest.raises(ValueError):
             zmux.PipePool(1, dial, options=bad)
-    zmux.PipePool(1, dial, options=zmux.PipeOptions(probe_interval=1, probe_jitter=0))
-    zmux.PipePool(1, dial, options=zmux.PipeOptions(idle_probes=False))
-    with pytest.raises(ValueError):
-        zmux.PipePool(
-            1, dial, options=zmux.PipeOptions(probe_interval=2, idle_probes=False)
-        )
+    zmux.PipePool(
+        1,
+        dial,
+        options=zmux.PipeOptions(liveness=PL(probe_interval=1, probe_jitter=0)),
+    )
+    # None turns the idle probes off.
+    zmux.PipePool(1, dial, options=zmux.PipeOptions(liveness=PL(probe_interval=None)))
 
 
 async def test_sub_second_probe_interval_rejects_the_decision() -> None:
-    config = zmux.Config(max_pipes=8, pipe_auth=zmux.PipeAuth.psk(b"k" * 32))
+    config = zmux.Config(
+        max_pipes=8, pipe_auth=zmux.PipeAuth.psk(b"k" * 32).with_end_to_end()
+    )
     async with zmux.Listener(config) as listener:
         addr = await listener.serve_tcp("127.0.0.1:0")
 
         async def dial() -> zmux.PipeIo:
             return await zmux.dial_tcp(addr)
 
-        policy = {"count": {"const": 2}, "probe_interval": {"const": 0.5}}
+        policy = {"count": 2, "probe_interval": 500000}
         assert zmux.PoolPolicy(policy).decide().probe_interval == 0.5
         reasons: list[str] = []
         async with await zmux.connect_tcp(addr, config=config) as session:
@@ -190,9 +132,8 @@ async def test_sub_second_probe_interval_rejects_the_decision() -> None:
 async def test_pool_policy_probe_settings_reach_new_pipes() -> None:
     config = zmux.Config(
         max_pipes=8,
-        pipe_auth=zmux.PipeAuth.psk(b"k" * 32),
-        probe_interval=2,
-        probe_jitter=0.3,
+        pipe_auth=zmux.PipeAuth.psk(b"k" * 32).with_end_to_end(),
+        liveness=zmux.Liveness(probe_interval=2, probe_jitter=0.3),
     )
     async with zmux.Listener(
         config, instance_id=b"instance", max_suspended=16
@@ -202,12 +143,12 @@ async def test_pool_policy_probe_settings_reach_new_pipes() -> None:
         async def dial() -> zmux.PipeIo:
             return await zmux.dial_tcp(addr)
 
-        policy = {"probe_interval": {"const": 1}, "probe_jitter": 0}
+        policy = {"probe_interval": 1000000, "probe_jitter": 0}
         d = zmux.PoolPolicy(policy).decide()
         assert (d.probe_interval, d.probe_jitter) == (1, 0)
         async with await zmux.connect_tcp(addr, config=config) as session:
             first = session.pipes()[0].id
-            options = zmux.PipeOptions(probe_interval=5)
+            options = zmux.PipeOptions(liveness=zmux.PipeLiveness(probe_interval=5))
             handle = session.maintain_pipes(
                 zmux.PipePool(1, dial, pool_policy=policy, options=options)
             )
@@ -253,7 +194,9 @@ def test_handwritten_decisions_are_checked() -> None:
 
 
 async def test_join_pool_keeps_groups_up_whole() -> None:
-    config = zmux.Config(max_pipes=8, pipe_auth=zmux.PipeAuth.psk(b"k" * 32))
+    config = zmux.Config(
+        max_pipes=8, pipe_auth=zmux.PipeAuth.psk(b"k" * 32).with_end_to_end()
+    )
     async with zmux.Listener(
         config, instance_id=b"instance", max_suspended=16
     ) as listener:
@@ -265,7 +208,7 @@ async def test_join_pool_keeps_groups_up_whole() -> None:
         ) -> list[zmux.Pipe]:
             assert isinstance(options, zmux.PipeOptions) and options.label == "group"
             pipes = [
-                session.add_pipe(await zmux.dial_tcp(addr), options=options)
+                await session.add_pipe(await zmux.dial_tcp(addr), options=options)
                 for _ in range(2)
             ]
             for p in pipes:
@@ -275,7 +218,7 @@ async def test_join_pool_keeps_groups_up_whole() -> None:
 
         async with await zmux.connect_tcp(addr, config=config) as session:
             pool = zmux.PipePool(
-                1, join=join, options=zmux.PipeOptions(label="group", probation=0)
+                1, join=join, options=zmux.PipeOptions(label="group", probation=None)
             )
             handle = session.maintain_pipes(pool)
             await asyncio.wait_for(_until(lambda: len(joins) == 1), 10)
@@ -291,7 +234,7 @@ async def test_join_pool_keeps_groups_up_whole() -> None:
 
 
 def test_negative_member_metrics_and_rotate_age_raise() -> None:
-    p = zmux.PoolPolicy({"count": {"const": 1}})
+    p = zmux.PoolPolicy({"count": 1})
     for m in (
         {"id": 1, "age": -1},
         {"id": 1, "idle": float("nan")},

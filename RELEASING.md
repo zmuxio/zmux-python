@@ -49,6 +49,11 @@ crates.io), and the build and test requirements in `pyproject.toml` (maturin, py
 dependencies). Review the changes, rebuild with `maturin develop` and run the tests, and commit the updates on their own
 before the release commit.
 
+The zmux crates are released first: every one this crate depends on (`zmux-seal` among them) must be on crates.io
+at the version in `Cargo.toml`. `Cargo.lock` must then resolve them from crates.io, not from local paths: with no
+local patch in effect, run `cargo update` for the zmux crates and check that their entries in `Cargo.lock` name the
+crates.io registry as their source.
+
 Update the version fields above, then commit and push:
 
 ```bash

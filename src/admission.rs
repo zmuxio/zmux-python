@@ -26,7 +26,7 @@ enum Ask {
 
 /// The metadata of a carrier, as Python sees it during one call of a
 /// decider or a credential.
-#[pyclass(frozen, module = "zmux._zmux")]
+#[pyclass(frozen, module = "zmux")]
 pub(crate) struct CarrierInfo {
     source: Option<(String, u16)>,
     peer: Option<(String, u16)>,
@@ -151,8 +151,8 @@ fn with_info<R: Send>(
 }
 
 /// An admission decision for `serve_*`.
-#[pyclass(frozen, module = "zmux._zmux")]
-pub(crate) struct Verdict(V);
+#[pyclass(frozen, module = "zmux")]
+pub(crate) struct AdmissionVerdict(V);
 
 /// A verdict as Python holds it: an accept's value is a Python object.
 enum V {
@@ -163,59 +163,84 @@ enum V {
     Fallback,
     Stall,
     Close,
+    More {
+        need: usize,
+    },
 }
 
 /// The Python object of an admission's value (`AdmittedValue`): the one a
-/// decider gave `Verdict.accept`, `None` without one.
+/// decider gave `AdmissionVerdict.accept`, `None` without one.
 pub(crate) fn admitted_obj(py: Python<'_>, v: Option<&zmux::AdmittedValue>) -> Option<Py<PyAny>> {
     v.and_then(|v| (**v).downcast_ref::<Py<PyAny>>())
         .map(|o| o.clone_ref(py))
 }
 
-impl Verdict {
-    fn native(&self) -> zmux::Verdict {
+impl AdmissionVerdict {
+    fn native(&self) -> zmux::AdmissionVerdict {
         match &self.0 {
             V::Accept { skip, value } => {
-                let v = zmux::Verdict::accept(*skip);
+                let v = zmux::AdmissionVerdict::accept(*skip);
                 match value {
                     Some(o) => v.with_value(o.clone() as zmux::AdmittedValue),
                     None => v,
                 }
             }
-            V::Fallback => zmux::Verdict::Fallback,
-            V::Stall => zmux::Verdict::Stall,
-            V::Close => zmux::Verdict::Close,
+            V::Fallback => zmux::AdmissionVerdict::Fallback,
+            V::Stall => zmux::AdmissionVerdict::Stall,
+            V::Close => zmux::AdmissionVerdict::Close,
+            V::More { need } => zmux::AdmissionVerdict::More { need: *need },
         }
     }
 }
 
 #[pymethods]
-impl Verdict {
+impl AdmissionVerdict {
     /// Takes the carrier with the first `skip` prefix bytes removed;
     /// `value`, any object, is the carrier's admitted value
     /// (`Session.admitted`, `Pipe.admitted`, `PipeHint.admitted`).
     #[staticmethod]
     #[pyo3(signature = (skip=0, value=None))]
     fn accept(skip: usize, value: Option<Py<PyAny>>) -> Self {
-        Verdict(V::Accept {
+        AdmissionVerdict(V::Accept {
             skip,
             value: value.map(Arc::new),
         })
     }
     #[classattr]
     #[allow(non_snake_case)]
-    fn FALLBACK() -> Verdict {
-        Verdict(V::Fallback)
+    fn FALLBACK() -> AdmissionVerdict {
+        AdmissionVerdict(V::Fallback)
     }
     #[classattr]
     #[allow(non_snake_case)]
-    fn STALL() -> Verdict {
-        Verdict(V::Stall)
+    fn STALL() -> AdmissionVerdict {
+        AdmissionVerdict(V::Stall)
     }
     #[classattr]
     #[allow(non_snake_case)]
-    fn CLOSE() -> Verdict {
-        Verdict(V::Close)
+    fn CLOSE() -> AdmissionVerdict {
+        AdmissionVerdict(V::Close)
+    }
+    /// Reads until the prefix holds `need` bytes in all, then decides again
+    /// with the longer prefix.
+    #[staticmethod]
+    fn more(need: usize) -> Self {
+        AdmissionVerdict(V::More { need })
+    }
+    /// A `Decision` of this verdict with the carrier's label `variant`.
+    fn labelled(slf: Py<Self>, variant: String) -> Decision {
+        Decision {
+            verdict: slf,
+            variant: Some(variant),
+        }
+    }
+    /// The total prefix a `more` asks for; `None` for another verdict.
+    #[getter]
+    fn need(&self) -> Option<usize> {
+        match self.0 {
+            V::More { need } => Some(need),
+            _ => None,
+        }
     }
     /// The prefix bytes an accept removes; `None` for another verdict.
     #[getter]
@@ -234,7 +259,7 @@ impl Verdict {
         }
     }
     fn __eq__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
-        let Ok(o) = other.cast::<Verdict>() else {
+        let Ok(o) = other.cast::<AdmissionVerdict>() else {
             return Ok(false);
         };
         Ok(match (&self.0, &o.get().0) {
@@ -247,25 +272,86 @@ impl Verdict {
                     }
             }
             (V::Fallback, V::Fallback) | (V::Stall, V::Stall) | (V::Close, V::Close) => true,
+            (V::More { need: a }, V::More { need: b }) => a == b,
             _ => false,
         })
     }
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(match &self.0 {
-            V::Accept { skip, value: None } => format!("Verdict.accept({skip})"),
+            V::Accept { skip, value: None } => format!("AdmissionVerdict.accept({skip})"),
             V::Accept {
                 skip,
                 value: Some(v),
-            } => format!("Verdict.accept({skip}, value={})", v.bind(py).repr()?),
-            V::Fallback => "Verdict.FALLBACK".into(),
-            V::Stall => "Verdict.STALL".into(),
-            V::Close => "Verdict.CLOSE".into(),
+            } => format!(
+                "AdmissionVerdict.accept({skip}, value={})",
+                v.bind(py).repr()?
+            ),
+            V::Fallback => "AdmissionVerdict.FALLBACK".into(),
+            V::Stall => "AdmissionVerdict.STALL".into(),
+            V::Close => "AdmissionVerdict.CLOSE".into(),
+            V::More { need } => format!("AdmissionVerdict.more({need})"),
         })
     }
 }
 
+/// A decision on a carrier: its verdict and the host's label of the kind of
+/// carrier.
+#[pyclass(frozen, module = "zmux")]
+pub(crate) struct Decision {
+    verdict: Py<AdmissionVerdict>,
+    variant: Option<String>,
+}
+
+#[pymethods]
+impl Decision {
+    /// `verdict`, labelled `variant`: the label counts the verdict in
+    /// `AdmissionStats.variants` and, on an accept, becomes the carrier's
+    /// variant. One of a few constants of the host, never derived from the
+    /// peer's bytes.
+    #[new]
+    #[pyo3(signature = (verdict, *, variant=None))]
+    fn new(verdict: Py<AdmissionVerdict>, variant: Option<String>) -> Self {
+        Self { verdict, variant }
+    }
+    #[getter]
+    fn verdict(&self, py: Python<'_>) -> Py<AdmissionVerdict> {
+        self.verdict.clone_ref(py)
+    }
+    #[getter]
+    fn variant(&self) -> Option<&str> {
+        self.variant.as_deref()
+    }
+    fn __eq__(&self, py: Python<'_>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
+        let Ok(o) = other.cast::<Decision>() else {
+            return Ok(false);
+        };
+        let o = o.get();
+        Ok(self.variant == o.variant && self.verdict.bind(py).eq(o.verdict.bind(py))?)
+    }
+    fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
+        Ok(format!(
+            "Decision({}, variant={:?})",
+            self.verdict.bind(py).repr()?,
+            self.variant
+        ))
+    }
+}
+
+/// The native decision of what a decider returned.
+fn decision(v: &Bound<'_, PyAny>) -> PyResult<zmux::Decision> {
+    if let Ok(d) = v.cast::<Decision>() {
+        let d = d.get();
+        let verdict = d.verdict.get().native();
+        return Ok(match &d.variant {
+            Some(l) => verdict.labelled(l.as_str()),
+            None => verdict.into(),
+        });
+    }
+    Ok(v.cast::<AdmissionVerdict>()?.get().native().into())
+}
+
 /// A server's admission of new carriers, given to a `Listener`.
-#[pyclass(frozen, module = "zmux._zmux")]
+#[pyclass(frozen, module = "zmux")]
 pub(crate) struct Admission {
     pub(crate) inner: zmux::Admission,
     /// The decider written in Python, whose coroutines run on an event loop.
@@ -276,14 +362,27 @@ impl Admission {
     fn with_times(
         mut a: zmux::Admission,
         decider: Option<PyDecide>,
-        peek_timeout: Option<f64>,
-        stall: Option<(f64, f64)>,
+        peek_timeout: Option<Bound<'_, PyAny>>,
+        stall: Option<Bound<'_, PyAny>>,
+        fallback_on_peek_timeout: bool,
     ) -> PyResult<Self> {
-        if let Some(t) = peek_timeout {
-            a = a.with_peek_timeout(seconds("peek_timeout", t)?);
+        a = a.with_fallback_on_peek_timeout(fallback_on_peek_timeout);
+        if let Some(t) = peek_timeout.filter(|t| !crate::is_setting(t, "AUTO").unwrap_or(false)) {
+            let t = seconds("peek_timeout", t.extract()?)?;
+            if t.is_zero() {
+                return Err(PyValueError::new_err("peek_timeout is positive"));
+            }
+            a = a.with_peek_timeout(t);
         }
-        if let Some((min, max)) = stall {
-            a = a.with_stall_interval(seconds("stall", min)?, seconds("stall", max)?);
+        if let Some(st) = stall.filter(|t| !crate::is_setting(t, "AUTO").unwrap_or(false)) {
+            let (min, max): (f64, f64) = st.extract()?;
+            let (min, max) = (seconds("stall", min)?, seconds("stall", max)?);
+            if max.is_zero() || min > max {
+                return Err(PyValueError::new_err(
+                    "stall is (min, max) with 0 <= min <= max and max positive",
+                ));
+            }
+            a = a.with_stall_interval(min, max);
         }
         Ok(Admission { inner: a, decider })
     }
@@ -304,7 +403,7 @@ impl Admission {
 type Started = Pin<Box<dyn Future<Output = PyResult<Py<PyAny>>> + Send>>;
 
 /// A decision written in Python: `decide(info, prefix)` returning a
-/// `Verdict`, or a coroutine resolving to one.
+/// `AdmissionVerdict` or `Decision`, or a coroutine resolving to one.
 #[derive(Clone)]
 struct PyDecide {
     decide: Arc<Py<PyAny>>,
@@ -343,14 +442,14 @@ impl PyDecide {
         })
     }
 
-    /// The verdict of a decider's result; an exception or another value is
+    /// The decision of a decider's result; an exception or another value is
     /// reported as unraisable and closes.
-    fn verdict(&self, r: PyResult<Py<PyAny>>) -> zmux::Verdict {
+    fn decision(&self, r: PyResult<Py<PyAny>>) -> zmux::Decision {
         crate::rt::attach(|py| {
-            let v = r.and_then(|v| Ok(v.bind(py).cast::<Verdict>()?.get().native()));
+            let v = r.and_then(|v| decision(v.bind(py)));
             v.unwrap_or_else(|e| {
                 e.write_unraisable(py, Some(self.decide.bind(py)));
-                zmux::Verdict::Close
+                zmux::AdmissionVerdict::Close.into()
             })
         })
     }
@@ -365,12 +464,12 @@ impl zmux::Decide for PyDecide {
         let started = self.start(info, prefix);
         Box::pin(async move {
             match started {
-                Ok(v) => self.verdict(Ok(v)),
+                Ok(v) => self.decision(Ok(v)),
                 // Dropped when the listener gives the decision up: the
                 // coroutine's task is cancelled with it.
                 Err(f) => {
                     let r = f.await;
-                    self.verdict(r)
+                    self.decision(r)
                 }
             }
         })
@@ -379,19 +478,22 @@ impl zmux::Decide for PyDecide {
 
 #[pymethods]
 impl Admission {
-    /// `decide(info, prefix)` returns a `Verdict`, or is `async` and
-    /// resolves to one within what remains of the peek timeout; cancelled
+    /// `decide(info, prefix)` returns an `AdmissionVerdict` or `Decision`, or is
+    /// `async` and resolves to one within what remains of the peek timeout; cancelled
     /// (`CancelledError`) when that ends or the listener closes. An `async`
     /// decide runs on the event loop of the `Listener`'s creation; `info`'s
     /// exporter answers only before its first `await`.
     #[new]
-    #[pyo3(signature = (decide, *, peek=0, peek_timeout=None, stall=None))]
+    #[pyo3(signature = (decide, *, peek=0, max_peek=0, peek_timeout=None, stall=None,
+        fallback_on_peek_timeout=false))]
     fn new(
         py: Python<'_>,
         decide: Py<PyAny>,
         peek: usize,
-        peek_timeout: Option<f64>,
-        stall: Option<(f64, f64)>,
+        max_peek: usize,
+        peek_timeout: Option<Bound<'_, PyAny>>,
+        stall: Option<Bound<'_, PyAny>>,
+        fallback_on_peek_timeout: bool,
     ) -> PyResult<Self> {
         let d = PyDecide {
             decide: Arc::new(decide),
@@ -400,27 +502,41 @@ impl Admission {
         if let Ok(l) = pyo3_async_runtimes::tokio::get_current_locals(py) {
             let _ = d.locals.set(l);
         }
-        let a = zmux::Admission::with_decider(peek, d.clone());
-        Self::with_times(a, Some(d), peek_timeout, stall)
+        let a = zmux::Admission::with_decider(peek, d.clone()).with_max_peek(max_peek);
+        Self::with_times(a, Some(d), peek_timeout, stall, fallback_on_peek_timeout)
     }
 
     #[staticmethod]
-    #[pyo3(signature = (auth, *, skew, max_nonces=65536, peek_timeout=None, stall=None))]
+    #[pyo3(signature = (auth, *, skew, max_nonces=65536, peek_timeout=None, stall=None,
+        fallback_on_peek_timeout=false))]
     fn prefix_auth(
         auth: PyRef<'_, PrefixAuth>,
         skew: u32,
         max_nonces: usize,
-        peek_timeout: Option<f64>,
-        stall: Option<(f64, f64)>,
+        peek_timeout: Option<Bound<'_, PyAny>>,
+        stall: Option<Bound<'_, PyAny>>,
+        fallback_on_peek_timeout: bool,
     ) -> PyResult<Self> {
         let verifier = zmux::PrefixAuthVerifier::new(auth.0.clone(), skew, max_nonces);
         let a = zmux::Admission::prefix_auth(Arc::new(verifier));
-        Self::with_times(a, None, peek_timeout, stall)
+        Self::with_times(a, None, peek_timeout, stall, fallback_on_peek_timeout)
     }
 
     #[getter]
     fn peek(&self) -> usize {
         self.inner.peek()
+    }
+    /// The largest prefix `AdmissionVerdict.more` may ask for, at least `peek`.
+    #[getter]
+    fn max_peek(&self) -> usize {
+        self.inner.max_peek()
+    }
+    /// Whether a carrier whose prefix does not arrive within the peek
+    /// timeout goes to the fallback (with the bytes read replayed) instead
+    /// of being closed.
+    #[getter]
+    fn fallback_on_peek_timeout(&self) -> bool {
+        self.inner.fallback_on_peek_timeout()
     }
     #[getter]
     fn peek_timeout(&self) -> f64 {
@@ -435,7 +551,7 @@ impl Admission {
 
 /// Prefix authentication parameters both ends share; a client's
 /// credential.
-#[pyclass(frozen, module = "zmux._zmux")]
+#[pyclass(frozen, module = "zmux")]
 pub(crate) struct PrefixAuth(zmux::PrefixAuth);
 
 #[pymethods]
@@ -477,15 +593,15 @@ impl PrefixAuth {
 
 /// A credential implemented in Python: its `prefix(info)` and
 /// `header(info)` methods, called with the GIL.
-struct PyCredential(Py<PyAny>);
+struct PyCarrierCredential(Py<PyAny>);
 
-impl std::fmt::Debug for PyCredential {
+impl std::fmt::Debug for PyCarrierCredential {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("PyCredential(..)")
+        f.write_str("PyCarrierCredential(..)")
     }
 }
 
-impl PyCredential {
+impl PyCarrierCredential {
     /// `method(info)`, its result taken by `extract`.
     fn call<T: Send>(
         &self,
@@ -498,12 +614,12 @@ impl PyCredential {
                 let v = self.0.call_method1(py, method, (Py::new(py, view)?,))?;
                 extract(v.bind(py))
             })
-            .map_err(|e| std::io::Error::other(e.to_string()))
+            .map_err(std::io::Error::other)
         })?
     }
 }
 
-impl zmux::Credential for PyCredential {
+impl zmux::CarrierCredential for PyCarrierCredential {
     fn prefix(&self, info: &zmux::CarrierInfo<'_>) -> std::io::Result<Vec<u8>> {
         self.call("prefix", info, |v| v.extract::<Vec<u8>>())
     }
@@ -512,11 +628,11 @@ impl zmux::Credential for PyCredential {
     }
 }
 
-/// The credential of a `credential=` argument: a `PrefixAuth`, or an
+/// The carrier credential of a `carrier_credential=` argument: a `PrefixAuth`, or an
 /// object with `prefix` and `header` methods.
-pub(crate) fn credential(
+pub(crate) fn carrier_credential(
     obj: Option<Bound<'_, PyAny>>,
-) -> PyResult<Option<Arc<dyn zmux::Credential>>> {
+) -> PyResult<Option<Arc<dyn zmux::CarrierCredential>>> {
     let Some(obj) = obj else {
         return Ok(None);
     };
@@ -524,16 +640,17 @@ pub(crate) fn credential(
         return Ok(Some(Arc::new(p.get().0.clone())));
     }
     if obj.hasattr("prefix")? && obj.hasattr("header")? {
-        return Ok(Some(Arc::new(PyCredential(obj.unbind()))));
+        return Ok(Some(Arc::new(PyCarrierCredential(obj.unbind()))));
     }
     Err(PyValueError::new_err(
-        "a credential is a PrefixAuth or has prefix(info) and header(info) methods",
+        "a carrier credential is a PrefixAuth or has prefix(info) and header(info) methods",
     ))
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CarrierInfo>()?;
-    m.add_class::<Verdict>()?;
+    m.add_class::<AdmissionVerdict>()?;
+    m.add_class::<Decision>()?;
     m.add_class::<Admission>()?;
     m.add_class::<PrefixAuth>()?;
     Ok(())

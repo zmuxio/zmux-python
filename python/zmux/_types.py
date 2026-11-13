@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import dataclasses
-import datetime
 import enum
-import math
-from collections.abc import Mapping
+import logging
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
     Any,
     ClassVar,
+    Final,
     Literal,
     NamedTuple,
+    NewType,
     Protocol,
     runtime_checkable,
 )
@@ -23,7 +24,8 @@ from . import _zmux
 if TYPE_CHECKING:
     from typing import Self
 
-    from ._zmux import CarrierInfo, ZmuxError
+    from ._errors import ZmuxError
+    from ._zmux import CarrierInfo
 
 
 class _Enum(enum.StrEnum):
@@ -35,11 +37,72 @@ class _Enum(enum.StrEnum):
             return value
 
 
-class Role(_Enum):
-    """The negotiated session role."""
+class _Setting(enum.Enum):
+    """A setting of a field that is not a value of its range."""
 
-    INITIATOR = "initiator"
-    RESPONDER = "responder"
+    AUTO = "auto"
+    STAGED = "staged"
+    INHERIT = "inherit"
+    CLEAR = "clear"
+
+    def __repr__(self) -> str:
+        return f"zmux.{self.name}"
+
+
+AUTO: Final = _Setting.AUTO
+"""The automatic setting: an automatic cap, a derived value, or a local
+setting that follows the peer's request; the default where a field has
+it."""
+STAGED: Final = _Setting.STAGED
+"""Staged unidirectional stream credit (`Config.max_incoming_uni_streams`,
+the default)."""
+INHERIT: Final = _Setting.INHERIT
+"""A pipe or pool setting that follows the session's (the default of
+those fields)."""
+CLEAR: Final = _Setting.CLEAR
+"""`Pipe.update`: clears a field to what it is when never set."""
+
+Auto = Literal[_Setting.AUTO]
+"""The type of `AUTO`."""
+Staged = Literal[_Setting.STAGED]
+"""The type of `STAGED`."""
+Inherit = Literal[_Setting.INHERIT]
+"""The type of `INHERIT`."""
+Clear = Literal[_Setting.CLEAR]
+"""The type of `CLEAR`."""
+
+PipeId = NewType("PipeId", int)
+"""The identifier of a pipe, unique for the life of its session (0 for the
+bootstrap pipe)."""
+
+_DEFAULTS: Final[dict[str, Any]] = _zmux._config_defaults()
+
+
+class RecordMode(_Enum):
+    """How a pipe's records are protected."""
+
+    SEALED = "sealed"
+    BOUND = "bound"
+    TRUSTED = "trusted"
+    UNMANAGED = "unmanaged"
+    """A first pipe outside the secure carrier; no join has this mode."""
+
+
+class RejectAction(_Enum):
+    """The answer of `Listener(on_reject=...)`. Neither sends anything."""
+
+    CLOSE = "close"
+    STALL = "stall"
+
+
+class Role(_Enum):
+    """The role of an endpoint: `CLIENT` is the initiator (the transport
+    client of the bootstrap carrier), `SERVER` the responder, and `AUTO`
+    negotiates the two with the peer."""
+
+    CLIENT = "client"
+    SERVER = "server"
+    AUTO = "auto"
 
 
 class SessionState(_Enum):
@@ -65,11 +128,12 @@ class EarlyDataState(_Enum):
     REJECTED = "Rejected"
     """The peer processed none of it: after a carrier rejection the data
     went again once the handshake completed; after a zmux rejection the
-    session ended with `EarlyDataRejected`."""
+    session ended with `EarlyDataRejectedError`."""
 
 
 class Direction(_Enum):
-    """Which directions a reserved pipe carries."""
+    """Which directions a pipe carries, seen from this endpoint: `IN` it
+    reads, `OUT` it writes, `BIDI` both."""
 
     IN = "in"
     OUT = "out"
@@ -77,7 +141,7 @@ class Direction(_Enum):
 
 
 class OutboundState(_Enum):
-    """State of a pipe's outbound direction (STATE_MACHINE.md Section 3.1)."""
+    """State of a pipe's outbound direction."""
 
     JOINING = "Joining"
     ACTIVE = "Active"
@@ -88,7 +152,7 @@ class OutboundState(_Enum):
 
 
 class InboundState(_Enum):
-    """State of a pipe's inbound direction (STATE_MACHINE.md Section 3.2)."""
+    """State of a pipe's inbound direction."""
 
     JOINING = "Joining"
     OPEN = "Open"
@@ -100,6 +164,29 @@ class PipeHalf(_Enum):
 
     INBOUND = "Inbound"
     OUTBOUND = "Outbound"
+
+
+class Multipath(_Enum):
+    """`Session.multipath`: what became of multipath."""
+
+    OFF = "off"
+    """This endpoint did not offer it, or the session is not established yet."""
+    IN_USE = "in_use"
+    """In use: pipes can be added and resumption works when configured."""
+    PEER_DECLINED = "peer_declined"
+    """The peer did not offer it."""
+    JOIN_SECURITY_UNAVAILABLE = "join_security_unavailable"
+    """Both endpoints offered it, but no secret source of `pipe_auth` matched:
+    the session runs on one pipe."""
+
+
+class Support(NamedTuple):
+    """Support of a protocol extension at each side, a negotiation result."""
+
+    local: bool
+    """Announced by this endpoint."""
+    peer: bool
+    """Announced by the peer."""
 
 
 class PrioritySource(_Enum):
@@ -119,7 +206,9 @@ class ErrorKind(_Enum):
     HANDSHAKE_TIMEOUT = "HandshakeTimeout"
     EARLY_DATA_REJECTED = "EarlyDataRejected"
     RESUME_TIMEOUT = "ResumeTimeout"
+    RESUME_FAILED = "ResumeFailed"
     PIPES_LOST = "PipesLost"
+    JOIN_REFUSED = "JoinRefused"
     RESET = "Reset"
     STOPPED = "Stopped"
     REJECTED = "Rejected"
@@ -142,10 +231,15 @@ class ErrorKind(_Enum):
     LISTENER_CLOSED = "ListenerClosed"
     IO = "Io"
     ON_DRIVER_THREAD = "OnDriverThread"
+    JOIN_PENDING = "JoinPending"
+    JOIN_SECRET_SET = "JoinSecretSet"
+    NO_EXPORTER = "NoExporter"
+    RESERVED_LABEL = "ReservedLabel"
+    UNAVAILABLE = "Unavailable"
 
 
 class TransportErrorCode(enum.IntEnum):
-    """The transport error codes of a `SessionClosed.code` (kind
+    """The transport error codes of a `SessionClosedError.code` (kind
     `TRANSPORT_CLOSED`): QUIC's and zmux's."""
 
     NO_ERROR = 0x00
@@ -165,9 +259,7 @@ class TransportErrorCode(enum.IntEnum):
     RESUME_TIMEOUT = 0x0EB87167
     """The resume grace period expired."""
     RESUME_FAILED = 0x0F05F74E
-    """A resume could not be completed: also the answer of a listener with
-    `answer_unknown_joins` to a join that names no session there, which
-    ends a suspended session at once."""
+    """A resume could not be completed."""
     PIPE_FAILED = 0x296A5BF5
     PIPE_RESOURCE_LIMIT = 0x0B4FA113
     PIPE_AUTH_FAILED = 0x09613938
@@ -200,40 +292,119 @@ class Preamble:
     pipe_carrier: bool = False
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
-class PipeOptions:
-    """Every option of a pipe; `None` is unset (the default). Durations in
-    seconds.
+class KeyGroup(enum.IntEnum):
+    """The key-exchange group of a join and of the session epochs."""
 
-    `send_priority`: the tier of the local outbound direction, lower
-    preferred (unset: the peer's request, else 0). `receive_priority`: the
-    tier requested for the peer's outbound direction (0). `send_standby`:
-    the local outbound direction takes data only on failover (unset: the
-    peer's request, else no). `receive_standby`: asks the peer to do so
-    (no). `weight`: share among pipes of a tier (1). `probation`: base of
-    the pipe's probation (0 turns it off). `label`: the application's name
-    for the pipe. `fate_group`: pipes that fail together (0: independent).
-    `suspect_floor` (at least 0.05), `dead_timeout` (at least 1),
-    `probe_interval` (at least 1; a one-way attachment uses at most 15) and
-    `probe_jitter` (0 <= j < 1): the detection settings, the session's when
-    unset. `idle_probes=False` turns the pipe's idle probes off (without
-    `probe_interval`). Invalid values raise `ValueError` where the options are used.
-    A live pipe changes the first six with `Pipe.update`.
-    """
+    X25519 = 1
+    X25519_MLKEM768 = 2
 
-    send_priority: int | None = None
-    receive_priority: int | None = None
-    send_standby: bool | None = None
-    receive_standby: bool | None = None
-    weight: int | None = None
-    probation: float | None = None
-    label: str | None = None
-    fate_group: int | None = None
-    suspect_floor: float | None = None
-    dead_timeout: float | None = None
-    probe_interval: float | None = None
-    idle_probes: bool | None = None
-    probe_jitter: float | None = None
+
+@dataclass(frozen=True, slots=True)
+class SessionCrypto:
+    """An endpoint's Join Suites and key groups, each ascending, holding
+    Suite 1 and `KeyGroup.X25519_MLKEM768`, with no zero and no duplicate
+    (`Config.session_crypto`; the default `SessionCrypto.LOCAL` is every
+    Suite and key group of this build)."""
+
+    suites: tuple[int, ...]
+    groups: tuple[KeyGroup | int, ...]
+    LOCAL: ClassVar[SessionCrypto]
+
+
+SessionCrypto.LOCAL = SessionCrypto(
+    tuple(_DEFAULTS["session_crypto"][0]),
+    tuple(KeyGroup(g) for g in _DEFAULTS["session_crypto"][1]),
+)
+
+
+@dataclass(frozen=True, slots=True)
+class RejectInfo:
+    """An unauthenticated carrier that was refused: `profile` is 2 for a join and `None`
+    when its first bytes named none; `reason` an error class or `unknown_locator`."""
+
+    profile: int | None
+    record_mode: RecordMode | None
+    reason: str
+    source: tuple[str, int] | None
+
+
+@dataclass(frozen=True, slots=True)
+class RecordPolicyInput:
+    """What `Config.record_policy` and `Config.allow_record_mode` know of a
+    carrier."""
+
+    has_exporter: bool
+    secure: bool
+    label: str | None
+    is_first_pipe: bool
+
+
+@dataclass(frozen=True, slots=True)
+class Principal:
+    """Who a verified peer is: `kind` is `static_key` (`value` the peer's static key) or
+    `other` (a host's own, with its `code`)."""
+
+    kind: str
+    value: bytes
+    code: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class AppData:
+    """Application handshake data of one message (1, 2 or 3). `forward_secret`: under
+    keys with forward secrecy (message 1 is under the pre-shared key alone, and can be
+    replayed). `authenticated`: the sender passed this end's verification; it is false
+    in every `VerifyInput`. Act on message 3 data only after the server's `commit`."""
+
+    message: int
+    data: bytes
+    forward_secret: bool
+    authenticated: bool
+
+
+@dataclass(frozen=True, slots=True)
+class VerifyInput:
+    """What a verifier is told about the peer: its role, the Profile, its static key,
+    the Handle (`psk_identity`) when the Profile has one, its credential `(type, bytes)`
+    when its message carried one, this end's `local_context`, and the application data
+    the peer sent so far."""
+
+    role: Role
+    profile: int
+    peer_static: bytes
+    psk_identity: bytes | None
+    credential: tuple[int, bytes] | None
+    local_context: bytes
+    peer_app_data: tuple[AppData, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class VerifyVerdict:
+    """A verifier's acceptance: who the peer is; `proof_key`, the KeyId of the key whose
+    transcript signature the message must then carry; and `value`, the verifier's own
+    result, which comes back on the `Peer`."""
+
+    principal: Principal
+    proof_key: bytes | None = None
+    value: Any = field(default=None, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class Peer:
+    """What an Establish learned of the other end: its static key and credential, the
+    verdict (`None` when it was not verified), the Profile and the record mode, the
+    application data it sent, and the two post-quantum facts: `pq_confidential` (the
+    handshake resists a passive quantum adversary) and `pq_authenticated` (the verdict
+    named a proof key, the proof verified, and its algorithm is post-quantum)."""
+
+    static_key: bytes
+    credential: tuple[int, bytes] | None
+    verdict: VerifyVerdict | None
+    profile: int
+    record_mode: RecordMode
+    app_data: tuple[AppData, ...]
+    pq_confidential: bool
+    pq_authenticated: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,16 +451,26 @@ class PipeStats:
     second, points in time on the `time.monotonic()` clock; estimates and
     the fields that need acknowledgements are `None` until known."""
 
-    pipe: int
+    record_mode: RecordMode | None
+    pipe: PipeId
     local: bool
     """This endpoint joined the attachment."""
+    peer_attached: bool
+    """The peer attached the pipe: it confirmed the join."""
     fate_group: int
     label: str | None
     carrier: CarrierKind | str | None
     """The carrier's kind, if the adapter declares one."""
+    variant: str | None
+    """The carrier's variant (`PipeIo.variant`, `Decision.variant`)."""
     inbound: InboundState | str | None
     outbound: OutboundState | str | None
     attached_for: float
+    epoch: int | None
+    """The session epoch the attachment joined in (0 for pipe 0)."""
+    replace_by: float | None
+    """When a carrier of an older epoch is to be replaced by a new join, by
+    the epoch policy's period."""
     suspect_count: int
     failure_count: int
     failure: str | None
@@ -389,6 +570,26 @@ class StreamStats:
 
 
 @dataclass(frozen=True, slots=True)
+class AdmissionVariants:
+    """`Listener.variant_stats()`: the admission's verdicts per label, at
+    most 64 labels, the ones past that in `overflow`."""
+
+    variants: Mapping[str, VariantStats] = field(default_factory=dict, hash=False)
+    overflow: VariantStats = field(default_factory=lambda: VariantStats())
+
+
+@dataclass(frozen=True, slots=True)
+class VariantStats:
+    """The admission's verdicts on the carriers it labelled with one
+    variant; they count in the totals of `AdmissionStats` as well."""
+
+    accepted: int = 0
+    fallback: int = 0
+    stalled: int = 0
+    closed: int = 0
+
+
+@dataclass(frozen=True, slots=True)
 class AdmissionStats:
     """What a listener's admission decided: counts since it was made, each
     carrier that took a source slot counted once its outcome is known; all 0
@@ -414,7 +615,7 @@ class AdmissionStats:
 @dataclass(frozen=True, slots=True)
 class ListenerStats:
     """What happened to a listener's carriers: counts since it was made.
-    `rejected` counts the listener's own indistinguishable rejections only;
+    `rejected` counts the listener's own rejections only (nothing sent for any);
     the admission's decisions are in `admission`."""
 
     sessions: int
@@ -438,6 +639,85 @@ class CarrierKind(_Enum):
     WEBTRANSPORT = "webtransport"
 
 
+class CacheOutcome(_Enum):
+    """What a host learnt of a candidate after dialling it
+    (`CarrierCache.report`)."""
+
+    USABLE = "usable"
+    """Usable, as a chosen candidate."""
+    FAILED = "failed"
+    """An ordinary failure: the backoff doubles."""
+    REJECTED = "rejected"
+    """A definite verdict of the host: skipped for the longest backoff."""
+
+
+class ReplayVerdict(_Enum):
+    """The result of `ReplayFilter.check`."""
+
+    FRESH = "fresh"
+    """Accepted, and recorded."""
+    SEEN = "seen"
+    """The key was seen within the window."""
+    OUTSIDE = "outside"
+    """The stamp is outside the window, or before `not_before`."""
+    FULL = "full"
+    """The filter holds its maximum of keys: nothing new is accepted."""
+
+
+class Framing(_Enum):
+    """How a carrier delivers records (`classify_first_bytes`)."""
+
+    BYTE_STREAM = "byte_stream"
+    """Concatenated records, each with its Size field."""
+    RECORDS = "records"
+    """Each carrier message is one record's frames."""
+
+
+class FirstBytes(_Enum):
+    """What `classify_first_bytes` tells about a carrier's first bytes."""
+
+    NEED_MORE = "need_more"
+    """More bytes are needed to tell."""
+    RECORD = "record"
+    """They can begin a first record."""
+    OTHER = "other"
+    """They cannot."""
+
+
+class JoinPrefix(_Enum):
+    """What `Listener.join_prefix` tells about a carrier's prefix."""
+
+    KNOWN = "known"
+    """A Join Hello whose Locator names a current session."""
+    UNKNOWN = "unknown"
+    """A Join Hello whose Locator names no current session."""
+    NOT_JOIN = "not_join"
+    """Not a Join Hello, or a malformed one."""
+    NEED_MORE = "need_more"
+    """The prefix ends inside the Hello's head: more bytes are needed."""
+
+
+@dataclass(frozen=True, slots=True)
+class TlsState:
+    """What the TLS or QUIC handshake this process ran for a carrier
+    negotiated. No proof of an end-to-end handshake."""
+
+    alpn: bytes | None = None
+    server_name: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class SessionCarrier:
+    """What `Listener(session_config=...)` knows of a carrier that starts a
+    session: `source` and `peer` as `(host, port)`, the handshake this
+    process ran for it, and the admission's value."""
+
+    source: tuple[str, int] | None
+    peer: tuple[str, int] | None
+    tls: TlsState | None
+    admitted: Any
+
+
 class CandidateOutcome(_Enum):
     """How one try of a candidate fared."""
 
@@ -450,12 +730,14 @@ class CandidateOutcome(_Enum):
 @dataclass(frozen=True, slots=True)
 class CandidateResult:
     """One try of a carrier mode's candidate: `joined` when it was tried as
-    a further pipe of the established session; `error` unless usable."""
+    a further pipe of the established session; `error` unless usable;
+    `variant` the candidate's."""
 
     carrier: CarrierKind | str
     outcome: CandidateOutcome | str
     joined: bool
     error: str | None
+    variant: str | None = None
 
 
 def _candidate_result(fields: dict[str, Any]) -> CandidateResult:
@@ -464,6 +746,7 @@ def _candidate_result(fields: dict[str, Any]) -> CandidateResult:
         CandidateOutcome._of(fields["outcome"]),
         fields["joined"],
         fields["error"],
+        fields["variant"],
     )
 
 
@@ -512,12 +795,16 @@ class SessionStats:
     pipes_added: int
     pipe_failures: int
     join_auth_failures: int
+    join_pending: int
+    join_batch_dropped: int
+    join_failures: int
     join_replays: int
     join_refusals: int
     suspensions: int
     suspended_time: float
     scheduler_answers: int
     scheduler_fallbacks: int
+    first_flight_timeouts: int
     carrier: CarrierKind | str | None = None
     """The carrier kind a carrier mode chose (the latest after a switch)."""
     carrier_candidates: tuple[CandidateResult, ...] = ()
@@ -532,20 +819,27 @@ class SessionStats:
 class EventKind(_Enum):
     """`Event.kind` values."""
 
-    PIPE_STATE = "PipeState"
+    PIPE_ADDED = "PipeAdded"
+    PIPE_JOINED = "PipeJoined"
+    PIPE_SUSPECT = "PipeSuspect"
+    PIPE_RECOVERED = "PipeRecovered"
+    PIPE_FAILED = "PipeFailed"
+    PIPE_CLOSED = "PipeClosed"
     JOIN_AUTH_FAILED = "JoinAuthFailed"
-    JOIN_SECURITY_UNAVAILABLE = "JoinSecurityUnavailable"
     PIPE_PRIORITY_CHANGED = "PipePriorityChanged"
     PIPE_QUALITY_CHANGED = "PipeQualityChanged"
     TIER_SATURATION = "TierSaturation"
     CAPACITY_BELOW = "CapacityBelow"
     CAPACITY_RESTORED = "CapacityRestored"
-    GO_AWAY = "GoAway"
-    SUSPENDED = "Suspended"
-    RESUMED = "Resumed"
+    GO_AWAY_RECEIVED = "GoAwayReceived"
+    SESSION_SUSPENDED = "SessionSuspended"
+    SESSION_RESUMED = "SessionResumed"
+    RESUME_UNATTENDED = "ResumeUnattended"
     PIPES_RETIRED = "PipesRetired"
     CARRIER_CANDIDATE = "CarrierCandidate"
     CARRIER_CHOSEN = "CarrierChosen"
+    EPOCH_COMMITTED = "EpochCommitted"
+    EPOCH_DELETED = "EpochDeleted"
     UNKNOWN = "Unknown"
 
 
@@ -557,16 +851,60 @@ class Event:
 
 
 @dataclass(frozen=True, slots=True)
-class PipeStateChanged(Event):
-    """A pipe direction changed state: an `OutboundState` for the
-    `OUTBOUND` half, an `InboundState` for the `INBOUND` one; `failure` is
-    set with `OutboundState.FAILED`; `carrier` is the pipe's carrier kind."""
+class PipeAdded(Event):
+    """A local outbound pipe direction appeared (a join began, or pipe 0);
+    `carrier` is the pipe's carrier kind."""
 
-    kind: ClassVar[EventKind] = EventKind.PIPE_STATE
-    pipe: int
-    half: PipeHalf | str
-    state: OutboundState | InboundState | str
+    kind: ClassVar[EventKind] = EventKind.PIPE_ADDED
+    pipe: PipeId
+    carrier: CarrierKind | str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PipeJoined(Event):
+    """An outbound pipe direction became active."""
+
+    kind: ClassVar[EventKind] = EventKind.PIPE_JOINED
+    pipe: PipeId
+    carrier: CarrierKind | str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PipeSuspect(Event):
+    """An outbound pipe direction stopped making progress."""
+
+    kind: ClassVar[EventKind] = EventKind.PIPE_SUSPECT
+    pipe: PipeId
+    carrier: CarrierKind | str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PipeRecovered(Event):
+    """A suspect outbound pipe direction is active again."""
+
+    kind: ClassVar[EventKind] = EventKind.PIPE_RECOVERED
+    pipe: PipeId
+    carrier: CarrierKind | str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PipeFailed(Event):
+    """An outbound pipe direction failed, for the reason `failure`. Terminal."""
+
+    kind: ClassVar[EventKind] = EventKind.PIPE_FAILED
+    pipe: PipeId
     failure: str | None
+    carrier: CarrierKind | str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class PipeClosed(Event):
+    """A pipe direction ended: the `OUTBOUND` one closed, or the `INBOUND`
+    one ended. Terminal; retirement is reported by `PipesRetired`."""
+
+    kind: ClassVar[EventKind] = EventKind.PIPE_CLOSED
+    pipe: PipeId
+    half: PipeHalf | str
     carrier: CarrierKind | str | None = None
 
 
@@ -575,15 +913,8 @@ class JoinAuthFailed(Event):
     """`count` joins failed authentication since the last such event."""
 
     kind: ClassVar[EventKind] = EventKind.JOIN_AUTH_FAILED
-    carrier_bound: bool
+    reason: str
     count: int
-
-
-@dataclass(frozen=True, slots=True)
-class JoinSecurityUnavailable(Event):
-    """Both sides offered multipath without a matching pipe secret; the session stays on one pipe."""
-
-    kind: ClassVar[EventKind] = EventKind.JOIN_SECURITY_UNAVAILABLE
 
 
 @dataclass(frozen=True, slots=True)
@@ -591,7 +922,7 @@ class PipePriorityChanged(Event):
     """A pipe's effective outbound priority, standby flag or weight changed."""
 
     kind: ClassVar[EventKind] = EventKind.PIPE_PRIORITY_CHANGED
-    pipe: int
+    pipe: PipeId
     send_priority: int
     standby: bool
     weight: int
@@ -603,7 +934,7 @@ class PipeQualityChanged(Event):
     """A pipe's estimates left their band. Seconds; bytes per second."""
 
     kind: ClassVar[EventKind] = EventKind.PIPE_QUALITY_CHANGED
-    pipe: int
+    pipe: PipeId
     smoothed_rtt: float | None
     delivery_rate: int | None
 
@@ -634,27 +965,38 @@ class CapacityRestored(Event):
 
 
 @dataclass(frozen=True, slots=True)
-class GoAway(Event):
-    """The peer sent GOAWAY: streams below the watermarks may be processed."""
+class GoAwayReceived(Event):
+    """The peer sent GOAWAY: streams below the watermarks may be processed;
+    `code` is the peer's application error code."""
 
-    kind: ClassVar[EventKind] = EventKind.GO_AWAY
+    kind: ClassVar[EventKind] = EventKind.GO_AWAY_RECEIVED
     max_bidi: int
     max_uni: int
     code: int
 
 
 @dataclass(frozen=True, slots=True)
-class Suspended(Event):
+class SessionSuspended(Event):
     """Every pipe in a direction was lost; the session waits for a pipe to resume."""
 
-    kind: ClassVar[EventKind] = EventKind.SUSPENDED
+    kind: ClassVar[EventKind] = EventKind.SESSION_SUSPENDED
 
 
 @dataclass(frozen=True, slots=True)
-class Resumed(Event):
+class SessionResumed(Event):
     """The session left the suspended state."""
 
-    kind: ClassVar[EventKind] = EventKind.RESUMED
+    kind: ClassVar[EventKind] = EventKind.SESSION_RESUMED
+
+
+@dataclass(frozen=True, slots=True)
+class ResumeUnattended(Event):
+    """The session, which can rejoin, suspended with neither a `redial` hook nor a
+    running pipe pool: nothing will dial, and it ends at the grace period unless the
+    application adds a pipe. It follows `SessionSuspended` and is also logged as a
+    warning."""
+
+    kind: ClassVar[EventKind] = EventKind.RESUME_UNATTENDED
 
 
 @dataclass(frozen=True, slots=True)
@@ -666,27 +1008,47 @@ class PipesRetired(Event):
     failed: int
     closed: int
     dropped: int
-    last: tuple[int, ...]
+    last: tuple[PipeId, ...]
 
 
 @dataclass(frozen=True, slots=True)
 class CarrierCandidate(Event):
     """A carrier mode tried a candidate, as the session or (`joined`) as a
-    further pipe."""
+    further pipe; `variant` is the candidate's."""
 
     kind: ClassVar[EventKind] = EventKind.CARRIER_CANDIDATE
     carrier: CarrierKind | str
     outcome: CandidateOutcome | str
     joined: bool
+    variant: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class CarrierChosen(Event):
     """A carrier mode chose the session's carrier kind: when the session was
-    established, and again on every switch."""
+    established, and again on every switch; `variant` is the candidate's."""
 
     kind: ClassVar[EventKind] = EventKind.CARRIER_CHOSEN
     carrier: CarrierKind | str
+    variant: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EpochCommitted(Event):
+    """The session committed an epoch: its secret is known, and joins of it are
+    accepted. The latest when several were not read."""
+
+    kind: ClassVar[EventKind] = EventKind.EPOCH_COMMITTED
+    epoch: int
+
+
+@dataclass(frozen=True, slots=True)
+class EpochDeleted(Event):
+    """An epoch, its keys and its Locators were deleted. The latest when several were
+    not read."""
+
+    kind: ClassVar[EventKind] = EventKind.EPOCH_DELETED
+    epoch: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -700,20 +1062,27 @@ class UnknownEvent(Event):
 _EVENTS: dict[str, type[Event]] = {
     c.kind: c
     for c in (
-        PipeStateChanged,
+        PipeAdded,
+        PipeJoined,
+        PipeSuspect,
+        PipeRecovered,
+        PipeFailed,
+        PipeClosed,
         JoinAuthFailed,
-        JoinSecurityUnavailable,
         PipePriorityChanged,
         PipeQualityChanged,
         TierSaturation,
         CapacityBelow,
         CapacityRestored,
-        GoAway,
-        Suspended,
-        Resumed,
+        GoAwayReceived,
+        SessionSuspended,
+        SessionResumed,
+        ResumeUnattended,
         PipesRetired,
         CarrierCandidate,
         CarrierChosen,
+        EpochCommitted,
+        EpochDeleted,
     )
 }
 
@@ -732,9 +1101,6 @@ def _event(kind: str, fields: dict[str, Any]) -> Event:
     for k, e in _ENUM_FIELDS.items():
         if fields.get(k) is not None:
             fields[k] = e._of(fields[k])
-    if cls is PipeStateChanged:
-        states = InboundState if fields["half"] == PipeHalf.INBOUND else OutboundState
-        fields["state"] = states._of(fields["state"])
     if "last" in fields:
         fields["last"] = tuple(fields["last"])
     return cls(**fields)
@@ -763,53 +1129,56 @@ def _preamble(
     return Preamble(info, tuple(Tlv(t, v) for t, v in tlvs), pipe_carrier)
 
 
-Seconds = float | datetime.timedelta
+@dataclass(frozen=True, slots=True)
+class EpochPolicy:
+    """When a multipath session starts an epoch exchange on its own
+    (`Config.epoch_policy`): after `period` seconds in the stable state
+    (one hour by default; `None`: never by time; a carrier lives at most
+    twice as long before a new join replaces it), after `joins` joins in the
+    epoch (2**16 by default; `None`: never by count), once after the first
+    Sealed or Bound pipe of a session whose secret is a TLS exporter's or a
+    pre-shared key's, and once after a suspension. `EpochPolicy.MANUAL`
+    starts none: only `Session.advance_epoch` and `Session.replace_pipes`
+    do. A `period` or `joins` of zero raises `ValueError`."""
+
+    period: float | None = _DEFAULTS["epoch_policy"][0]
+    joins: int | None = _DEFAULTS["epoch_policy"][1]
+    after_first_pipe: bool = True
+    after_resume: bool = True
+    MANUAL: ClassVar[EpochPolicy]
+
+    def __post_init__(self) -> None:
+        if self.period == 0:
+            raise ValueError("epoch_policy.period is positive, or None for never")
+        if self.joins == 0:
+            raise ValueError("epoch_policy.joins is positive, or None for never")
 
 
-def _secs(v: Seconds | None) -> float | None:
-    return v.total_seconds() if isinstance(v, datetime.timedelta) else v
+EpochPolicy.MANUAL = EpochPolicy(None, None, False, False)
 
 
 @dataclass(frozen=True, kw_only=True)
-class ShapingLimits:
-    """Bounds a session puts on its shaper (`Config(shaping_limits=...)`);
-    each field is `None` by default, no bound, and a set one bounds as it
-    is, 0 allowing none. Durations are seconds (`float`) or `timedelta`; a
-    decision beyond a bound is reduced to it and counted as `clamped`.
-    A set field is finite and non-negative and `max_padding_ratio` at most 1
-    (`ValueError` otherwise, at construction). Under a set ratio, at least
-    `STARTUP_ALLOWANCE` bytes of PADDING are allowed; without one only
-    `max_padding_bytes` bounds PADDING."""
+class ShapingAccount:
+    """An allowance for injections, in bytes on the carrier; all fields zero: not set.
+    Padding that goes with a record is never refused and does not draw on it. `initial` is
+    at most 2**53, the others 2**43 (`ValueError` otherwise, at construction)."""
 
-    max_padding_bytes: int | None = None
-    """PADDING bytes added."""
-    max_padding_ratio: float | None = None
-    """PADDING bytes added over the other bytes sent."""
-    max_injected: int | None = None
-    """Records of PADDING only."""
-    max_pause_total: Seconds | None = None
-    """Sum of pauses and delays."""
-    max_delay: Seconds | None = None
-    """One pause or delay."""
+    initial: int = 0
+    """Available from the start."""
+    per_mb: int = 0
+    """Added per 10**6 bytes this endpoint sends of its own."""
+    per_sec: int = 0
+    """Added per second."""
 
     def __post_init__(self) -> None:
-        for k in ("max_pause_total", "max_delay"):
-            object.__setattr__(self, k, _secs(getattr(self, k)))
-        for k in ("max_padding_bytes", "max_injected"):
-            _count(k, getattr(self, k))
-        for k in ("max_pause_total", "max_delay"):
-            v = getattr(self, k)
-            if v is not None and (
-                not isinstance(v, (int, float))
-                or isinstance(v, bool)
-                or not 0 <= v < math.inf
-            ):
-                raise ValueError(f"{k} is a finite non-negative number of seconds")
-        r = self.max_padding_ratio
-        if r is not None and (
-            not isinstance(r, (int, float)) or isinstance(r, bool) or not 0 <= r <= 1
+        for k, most in (
+            ("initial", 1 << 53),
+            ("per_mb", 1 << 43),
+            ("per_sec", 1 << 43),
         ):
-            raise ValueError("max_padding_ratio is a number in [0, 1]")
+            v = getattr(self, k)
+            if not isinstance(v, int) or isinstance(v, bool) or not 0 <= v <= most:
+                raise ValueError(f"{k} is an integer in [0, {most}]")
 
 
 def _count(k: str, v: object) -> None:
@@ -817,15 +1186,80 @@ def _count(k: str, v: object) -> None:
         raise ValueError(f"{k} is a non-negative integer")
 
 
+def _wait(v: float | None) -> None:
+    if v is not None and (
+        not isinstance(v, (int, float)) or isinstance(v, bool) or not v > 0
+    ):
+        raise ValueError("max_delay is a positive number of seconds")
+
+
+@dataclass(frozen=True, kw_only=True)
+class ShapingLimits:
+    """Local bounds on shaping (`Config(shaping_limits=...)`), set by the application and
+    never sent; a configuration cannot widen them. Durations are seconds."""
+
+    wire: ShapingAccount = ShapingAccount()
+    """What injections may spend."""
+    max_delay: float | None = _zmux.DEFAULT_MAX_DELAY
+    """The bound on one wait, and so on the lowest rate of a gate (positive;
+    `None`: no bound)."""
+    no_padding: bool = False
+    """No padding at all, on handshakes and injections too."""
+    no_pause: bool = False
+    """No pause or delay."""
+    no_injection: bool = False
+    """No injection."""
+
+    def __post_init__(self) -> None:
+        _wait(self.max_delay)
+
+
+@dataclass(frozen=True, kw_only=True)
+class ShapingBudget:
+    """What a shaping configuration allows for a session (`Config(shaping_budget=...)`, a
+    callable returning this, called once per session). It cannot widen `ShapingLimits`."""
+
+    wire: ShapingAccount = ShapingAccount()
+    """What injections may spend."""
+    max_delay: float | None = None
+    """The configuration's bound on one wait in seconds; `None`: none."""
+    no_injection: bool = False
+    """The configuration allows no injection."""
+
+    def __post_init__(self) -> None:
+        _wait(self.max_delay)
+
+
+@dataclass(frozen=True, kw_only=True)
+class UnitPlan:
+    """The size and timing of one unit written to a carrier. Lengths are bytes on the
+    carrier, and `delay` is seconds."""
+
+    pad_to: int = 0
+    pad_multiple: int = 0
+    pad: int = 0
+    delay: float = 0.0
+
+
+@dataclass(frozen=True, kw_only=True)
+class HandshakeView:
+    """What a handshake shaper is told of a message: never a size."""
+
+    kind: CarrierKind | None
+    handshake: str
+    message: str
+
+
 @dataclass(frozen=True, kw_only=True)
 class ShapingSizeLimits:
     """Bounds of a shaping definition (`Session.set_shaper(limits=...)`);
-    each field is `None` by default, no bound, and a set one bounds as it
-    is, 0 allowing none. A definition beyond one raises `ValueError`; so
-    does a field that is not a non-negative integer, at construction."""
+    each field but `max_slots` is `None` by default, no bound, and a set one
+    bounds as it is, 0 allowing none. A definition beyond one raises
+    `ValueError`; so does a field that is not a non-negative integer, at
+    construction."""
 
     max_bytes: int | None = None
-    """Input bytes (JSON or sequence form)."""
+    """Input bytes."""
     max_machines: int | None = None
     """Machines."""
     max_states: int | None = None
@@ -834,8 +1268,11 @@ class ShapingSizeLimits:
     """Actions per state."""
     max_transitions: int | None = None
     """Transitions per state."""
-    max_points: int | None = None
-    """Points or components per distribution."""
+    max_segments: int | None = None
+    """Segments per value or table."""
+    max_slots: int | None = _zmux.DEFAULT_MAX_SLOTS
+    """Counters and timers of all machines of a candidate together (0
+    allows none); `None`: no bound."""
 
     def __post_init__(self) -> None:
         for k in (
@@ -844,34 +1281,46 @@ class ShapingSizeLimits:
             "max_states",
             "max_actions",
             "max_transitions",
-            "max_points",
+            "max_segments",
         ):
             _count(k, getattr(self, k))
+        _count("max_slots", self.max_slots)
 
 
 class PipeAuth:
     """Join credentials for multipath, immutable: `PipeAuth.exporter()`
     (the exporter of the innermost end-to-end handshake, today TLS that
     this process terminates), `PipeAuth.psk(key)` (a
-    pre-shared key of at least 16 bytes), `PipeAuth.insecure()` (no
-    secret; only where other means protect the joins), and
-    `auth.with_psk(key)`, a new value that adds a key."""
+    pre-shared key of at least 16 bytes), and `auth.with_psk(key)`, a new
+    value that adds a key. A session whose first pipe comes from `establish`
+    (the secure carrier) takes its source from that handshake and leaves
+    `pipe_auth` unset; a key or the exporter with it raises `ValueError`.
+    `auth.with_end_to_end()` states in advance what `Session.declare_end_to_end`
+    states; without it, a first pipe not on the secure carrier has no join
+    keys. It is no source of its own, and on a secure first pipe it has no
+    effect. `PipeAuth.deferred_psk()` offers a pre-shared key given later with
+    `Session.set_join_secret`; `auth.with_deferred_psk()` adds that to the
+    exporter. It excludes a static key (`ValueError` when the session
+    starts). Multipath or resume without a source raises `ValueError`."""
 
-    __slots__ = ("_exporter", "_insecure", "_psk")
+    __slots__ = ("_deferred", "_end_to_end", "_exporter", "_psk")
     _exporter: bool
     _psk: bytes | None
-    _insecure: bool
+    _end_to_end: bool
+    _deferred: bool
 
     def __init__(
         self,
         *,
         exporter: bool = False,
         psk: bytes | None = None,
-        insecure: bool = False,
+        end_to_end: bool = False,
+        deferred_psk: bool = False,
     ) -> None:
         object.__setattr__(self, "_exporter", exporter)
         object.__setattr__(self, "_psk", None if psk is None else bytes(psk))
-        object.__setattr__(self, "_insecure", insecure)
+        object.__setattr__(self, "_end_to_end", end_to_end)
+        object.__setattr__(self, "_deferred", deferred_psk)
 
     def __setattr__(self, name: str, value: object) -> None:
         raise AttributeError("PipeAuth is immutable")
@@ -888,25 +1337,64 @@ class PipeAuth:
         return PipeAuth(psk=key)
 
     @staticmethod
-    def insecure() -> PipeAuth:
-        """Insecure joins."""
-        return PipeAuth(insecure=True)
+    def deferred_psk() -> PipeAuth:
+        """A pre-shared key given later with `Session.set_join_secret`, for
+        example once the application authenticated the peer. Until then
+        local joins fail with `JoinPendingError` and the
+        peer's are held for at most the handshake timeout."""
+        return PipeAuth(deferred_psk=True)
 
     def with_psk(self, key: bytes) -> PipeAuth:
         """These credentials with the pre-shared key `key` added."""
-        return PipeAuth(exporter=self._exporter, psk=key, insecure=self._insecure)
+        return PipeAuth(
+            exporter=self._exporter,
+            psk=key,
+            end_to_end=self._end_to_end,
+            deferred_psk=self._deferred,
+        )
+
+    def with_end_to_end(self) -> PipeAuth:
+        """These credentials, with pipe 0 stated to be proven end to end."""
+        return PipeAuth(
+            exporter=self._exporter,
+            psk=self._psk,
+            end_to_end=True,
+            deferred_psk=self._deferred,
+        )
+
+    def with_deferred_psk(self) -> PipeAuth:
+        """These credentials with a deferred pre-shared key added."""
+        return PipeAuth(
+            exporter=self._exporter,
+            psk=self._psk,
+            end_to_end=self._end_to_end,
+            deferred_psk=True,
+        )
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, PipeAuth):
             return NotImplemented
-        return (self._exporter, self._psk, self._insecure) == (
+        return (
+            self._exporter,
+            self._psk,
+            self._end_to_end,
+            self._deferred,
+        ) == (
             other._exporter,
             other._psk,
-            other._insecure,
+            other._end_to_end,
+            other._deferred,
         )
 
     def __hash__(self) -> int:
-        return hash((self._exporter, self._psk, self._insecure))
+        return hash(
+            (
+                self._exporter,
+                self._psk,
+                self._end_to_end,
+                self._deferred,
+            )
+        )
 
     def __repr__(self) -> str:
         parts = [
@@ -914,30 +1402,113 @@ class PipeAuth:
             for n, on in (
                 ("exporter", self._exporter),
                 ("psk", self._psk is not None),
-                ("insecure", self._insecure),
+                ("end_to_end", self._end_to_end),
+                ("deferred_psk", self._deferred),
             )
             if on
         ]
         return f"PipeAuth({', '.join(parts) or 'none'})"
 
 
+_LIVENESS: Final[dict[str, Any]] = _DEFAULTS["liveness"]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Liveness:
+    """A session's liveness settings (`Config.liveness`), replaced as a whole
+    by assigning `Session.liveness` (`dataclasses.replace(session.liveness,
+    ...)` changes some). Durations are seconds; invalid values raise
+    `ValueError` where they are used.
+
+    `keep_alive_period` (15 s, at least 1; `None` off): QX_PING when idle,
+    capped at half the effective idle timeout. `suspect_floor` (0.25 s, at
+    least 0.05): the floor of the suspicion timer. `dead_timeout` (`AUTO`,
+    derived; else at least 1): how long a suspect pipe stays suspect before
+    it fails. `standby_probe` (1 s, at least 1; `None` off: standby pipes are
+    probed at `probe_interval`). `probe_interval` (15 s, at least 1; `None`
+    turns the idle probes off). `probe_jitter` (0.25, in [0, 1); 0 gives
+    the fixed schedule tests use)."""
+
+    keep_alive_period: float | None = _LIVENESS["keep_alive_period"]
+    suspect_floor: float = _LIVENESS["suspect_floor"]
+    dead_timeout: float | Auto = AUTO
+    standby_probe: float | None = _LIVENESS["standby_probe"]
+    probe_interval: float | None = _LIVENESS["probe_interval"]
+    probe_jitter: float = _LIVENESS["probe_jitter"]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PipeLiveness:
+    """A pipe's own liveness settings (`PipeOptions.liveness`, replaced with
+    `Pipe.update(liveness=...)`): the `Liveness` fields of the same names
+    that apply to one pipe, each `INHERIT` (the default, following the
+    session's) or a value; `probe_interval=None` turns the pipe's idle
+    probes off. Durations are seconds; invalid values raise `ValueError`
+    where they are used."""
+
+    suspect_floor: float | Inherit = INHERIT
+    dead_timeout: float | Inherit = INHERIT
+    probe_interval: float | Inherit | None = INHERIT
+    probe_jitter: float | Inherit = INHERIT
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PipeOptions:
+    """Every option of a pipe (`Session.add_pipe`, `PipePool`); durations in
+    seconds. Invalid values raise `ValueError` where the options are used.
+
+    Fixed when the pipe is added: `direction` (`Direction.BIDI`), the
+    directions the pipe carries; `record_mode` (`INHERIT`:
+    `Config.record_policy`, else sealed); `key_group` (`INHERIT`: the local
+    preference), the key group of the join; `label`, the application's name
+    for the pipe (`None`: none); `fate_group` (0: independent), pipes that
+    fail together; `return_on_reply` (`False`): `add_pipe` returns once the
+    Reply is verified instead of once the peer attached the pipe (then wait
+    with `Pipe.attached()` before closing the session's other pipes).
+
+    Changed on a live pipe with `Pipe.update`: `send_priority` (`AUTO`: the
+    peer's request, else 0), the tier of the local outbound direction, lower
+    preferred; `receive_priority` (0), the tier requested for the peer's
+    outbound direction; `send_standby` (`AUTO`: the peer's request, else
+    available), the local outbound direction takes data only on failover;
+    `receive_standby` (`False`), asks the peer to do so; `weight` (1, 0
+    excludes the pipe), its share among the pipes of a tier; `probation`
+    (`INHERIT`: the session's; `AUTO`: derived from the pipe's RTT; `None`
+    off; else the base in seconds); `liveness` (a `PipeLiveness`)."""
+
+    direction: Direction = Direction.BIDI
+    record_mode: RecordMode | str | Inherit = INHERIT
+    key_group: KeyGroup | int | Inherit = INHERIT
+    send_priority: int | Auto = AUTO
+    receive_priority: int = 0
+    send_standby: bool | Auto = AUTO
+    receive_standby: bool = False
+    weight: int = 1
+    probation: float | Auto | Inherit | None = INHERIT
+    label: str | None = None
+    fate_group: int = 0
+    liveness: PipeLiveness = PipeLiveness()
+    return_on_reply: bool = False
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class QualityBand:
     """When to report a pipe's quality (`PipeQualityChanged`): once its
-    smoothed RTT moved by more than `rtt` seconds (0: never), or its
-    delivery rate by more than the factor `rate_ratio` (0: never), from the
-    last reported values, at most once per `min_interval` seconds. A
-    negative or NaN `rate_ratio` raises `ValueError`."""
+    smoothed RTT moved by more than `rtt` seconds (0: every change; `None`:
+    never by RTT), or its delivery rate by more than the factor
+    `rate_ratio` (1 or less: every change; `None`: never by rate), from
+    the last reported values, at most once per `min_interval` seconds. A
+    negative or NaN `rtt` or `rate_ratio` raises `ValueError`."""
 
-    rtt: Seconds = 0.0
-    rate_ratio: float = 0.0
-    min_interval: Seconds = 1.0
+    rtt: float | None = None
+    rate_ratio: float | None = None
+    min_interval: float = 1.0
 
     def __post_init__(self) -> None:
-        for k in ("rtt", "min_interval"):
-            object.__setattr__(self, k, _secs(getattr(self, k)))
-        if not self.rate_ratio >= 0:
-            raise ValueError("rate_ratio is a non-negative number")
+        for k in ("rtt", "rate_ratio"):
+            v = getattr(self, k)
+            if v is not None and not v >= 0:
+                raise ValueError(f"{k} is a non-negative number, or None")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -957,17 +1528,18 @@ class CapacityFloor:
 
 class Limiter(Protocol):
     """A rate limiter of a splice direction (`zmux.splice(a_to_b=...)`):
-    `ready(min, max)` waits until it allows at least `min` bytes (or its
-    burst) and returns how many, at most `max`; `try_ready(max)` is the
-    allowance now; `charge(n)` accounts for `n` bytes forwarded. An
-    exception allows nothing."""
+    `ready(least, most)` waits until it allows at least `least` bytes (or
+    its burst) and returns how many, at most `most`; `try_ready(most)` is
+    the allowance now; `charge(n)` accounts for `n` bytes forwarded. The
+    parameters are positional-only, so an implementation names them freely.
+    An exception allows nothing."""
 
-    async def ready(self, min: int, max: int, /) -> int:
-        """Waits for an allowance of `min..=max` bytes."""
+    async def ready(self, least: int, most: int, /) -> int:
+        """Waits for an allowance of `least..=most` bytes."""
         ...
 
-    def try_ready(self, max: int, /) -> int:
-        """The allowance now, at most `max`; 0 when it would wait."""
+    def try_ready(self, most: int, /) -> int:
+        """The allowance now, at most `most`; 0 when it would wait."""
         ...
 
     def charge(self, n: int, /) -> None:
@@ -1030,96 +1602,196 @@ class Resolved:
         object.__setattr__(self, "rule", DuplicateRule._of(str(self.rule)))
 
 
-Scheduler = Literal[
-    "affinity",
-    "session-affinity",
-    "spread-eta",
-    "spread-round-robin",
-    "spread-rate-weighted",
-]
-"""A built-in scheduling policy by name. The binding takes no policy
-written in Python: one would run on the driver's decision path under the
-interpreter lock."""
+class Scheduler(_Enum):
+    """A built-in scheduling policy (`Config.scheduler`; its value, a
+    string, is accepted too). The binding takes no policy written in
+    Python: one would run on the driver's decision path under the
+    interpreter lock."""
+
+    AFFINITY = "affinity"
+    SESSION_AFFINITY = "session-affinity"
+    SPREAD_ETA = "spread-eta"
+    SPREAD_ROUND_ROBIN = "spread-round-robin"
+    SPREAD_RATE_WEIGHTED = "spread-rate-weighted"
+
+
+class Redundancy(_Enum):
+    """`Config.redundancy` (its value, a string, is accepted too): `URGENT`
+    sends the stream directions of urgency 0 to 2 and the first chunk after
+    an idle period redundantly on a second pipe; `OFF` sends nothing
+    redundantly."""
+
+    URGENT = "urgent"
+    OFF = "off"
+
+
+class KeyAlg(enum.IntEnum):
+    """A key algorithm of the secure carrier: what a KeyId and a signing key
+    are of."""
+
+    X25519 = _zmux._KEYALG_X25519
+    MLDSA44 = _zmux._KEYALG_MLDSA44
+
+
+class Tracer:
+    """`Config(tracer=...)`: observes a session's events without taking them
+    from `Session.events()`. Subclass it and override what you need; each
+    method runs in order, serially per session, on a native thread holding
+    the GIL (quick, not blocking), and an exception is reported as
+    unraisable."""
+
+    def established(self) -> None:
+        """The session was established."""
+
+    def event(self, event: Event) -> None:
+        """A session event."""
+
+    def dropped(self, count: int) -> None:
+        """`count` events were dropped since the previous call, before the
+        next delivered."""
+
+    def closed(self, reason: BaseException) -> None:
+        """The session ended, with the reason (the error `Session` calls
+        raise from then on); nothing follows."""
 
 
 @dataclass(frozen=True, kw_only=True)
 class Config:
-    """Session configuration: one field per knob and knob parameter.
-    Durations are seconds (`float`) or `timedelta`.
+    """Session configuration: one field per knob and knob parameter. A
+    keyword left out keeps the library's default (the field's default);
+    `None` is the off, no-timeout or unlimited setting of a field that has
+    one and raises `ValueError` for any other. Durations are seconds.
 
-    The timers and periods hold their defaults, and `None` is no timeout or
-    off: `handshake_timeout` (10 s), `max_idle_timeout` (30 s, at least
-    0.001; `None` announces none), `keep_alive_period` (15 s, at least 1),
-    `standby_probe` (1 s) and `probe_interval` (15 s). Every other field
-    keeps the default when `None`; `math.inf` makes `memory_budget` (1 GiB)
-    unlimited, and 0 is a budget of no byte. A negative value raises.
-    `keep_alive_period` is capped at half the
-    effective idle timeout. `max_stream_receive_window`,
-    `max_connection_receive_window` and `send_buffer_max` are auto when
-    `None`; `max_incoming_uni_streams`
-    `None` is staged credit. `standby_probe` (1 s; off leaves standby pipes
-    at the probe interval) and `probe_interval` (15 s) are at least 1. Multipath needs `max_pipes` above 1 and
-    `pipe_auth`. The datagram queues hold 64 datagrams waiting to be sent,
-    128 received session datagrams and 32 per stream, within 1 MiB of
-    received datagrams in all (`datagram_*`, each at least 1); the oldest
-    make room. `scheduler` is a built-in `Scheduler` name; `redundancy` is
-    `"urgent"` or `"off"`. `early_data` declares the peer a zmux endpoint
-    (stream data before its parameters), `carrier_early_data` allows the
-    carrier's own early data (replayable; see `RecvStream.is_replayable`).
-    `protocols`, `shaping_limits` and `shaping` are hooks: the
-    application protocols offered, the bounds of each session's shaper,
-    and the shaping definitions by carrier kind (`None` key: the default).
-    Use `config.replace(...)` to derive a variant.
+    Timers: `handshake_timeout` (10 s; `None`: none) bounds establishment;
+    `join_timeout` (10 s, positive, at most 60) bounds every join and
+    `Session.add_pipe`; `max_idle_timeout` (30 s, at least 0.001; `None`
+    announces none). `liveness` holds the keep-alive and probe settings.
+
+    Windows and memory: `initial_stream_receive_window` (256 KiB, at least
+    4 KiB), `max_stream_receive_window` (`AUTO`, or a fixed cap),
+    `latency_budget` (100 us), `initial_connection_receive_window` (1 MiB,
+    at least 16 KiB), `max_connection_receive_window` (`AUTO`, or a fixed
+    cap), `memory_budget` (1 GiB; `None`: unlimited), `send_buffer` (4
+    MiB), `send_buffer_max` (`AUTO`, or a fixed maximum).
+
+    Streams: `max_incoming_streams` (256; 0: the peer may open none, else at
+    least 4 and at most `MAX_STREAM_CREDIT`), `max_incoming_uni_streams`
+    (`STAGED`: 16 at first and 256 once the application accepts one; or a
+    count, 0 for none, at most `MAX_STREAM_CREDIT`).
+
+    Datagrams: `enable_datagrams` (`False`) and the queues
+    `datagram_send_queue` (64), `datagram_receive_queue` (128),
+    `datagram_stream_queue` (32 per stream), `datagram_receive_bytes`
+    (1 MiB, the session queue and the datagrams held for streams not
+    opened yet; stream queues do not count against it) and
+    `datagram_stream_bytes` (512 KiB per stream; `None`: only the count
+    bounds a stream queue), each at least 1; the oldest make room.
+
+    Multipath: `max_pipes` (1, multipath off; 8 recommended),
+    `pipe_headroom` (8), `replay_window` (`AUTO`, or at least `max_pipes +
+    pipe_headroom`), `max_lanes` (258, at least 1). Multipath needs
+    `pipe_auth` (a `PipeAuth`; `None`: no join credentials) unless the
+    first pipe is on the secure carrier; `join_early_hello` (8 KiB;
+    `None`: no first batch). `resume_timeout` (`None`: off; else at least
+    0.001) with `redial`, an async callable given the direction that
+    returns the `PipeIo` replacing a lost pipe, with backoff from
+    `redial_min_backoff` (1 s) doubling up to `redial_max_backoff` (60 s);
+    a `Config` with `redial` is made inside a running event loop.
+
+    Scheduling: `scheduler` (`Scheduler.AFFINITY`), `spread_chunk`,
+    `probation` (`AUTO`, derived from the pipe's RTT; `None` off; else the
+    base in seconds), `overflow_delay` (1 s), `redundancy`
+    (`Redundancy.URGENT`).
+
+    Early data: `early_data` (`False`) declares the peer a zmux endpoint
+    (stream data before its parameters), `carrier_early_data` (`False`)
+    allows the carrier's own early data (replayable; see
+    `RecvStream.is_replayable`), and `hold_first_flight` (`False`, a client
+    with early data) keeps the bootstrap pipe's first write until
+    `Session.release_first_flight()` or the handshake timeout.
+
+    Security: `session_crypto` (`SessionCrypto.LOCAL`), `epoch_policy`
+    (`EpochPolicy()`), `record_policy(input)` choosing a joined pipe's
+    record mode and `allow_record_mode(input, mode, admitted)` admitting
+    it, `authorize_join(pipe_id)` (on an acceptor, a further check of a
+    join after its authentication and record mode: falsy or an exception
+    refuses it). These run on a native thread holding the GIL.
+
+    Hooks: `protocols`, the application protocols offered; `logger` (a
+    `logging.Logger`) receives zmux's warnings; `tracer` (a `Tracer`)
+    receives every event in order beside the event stream;
+    `shaping_limits`, `shaping_budget`, `shaping` (definitions by carrier
+    kind, `None` key the default), `shaping_by_variant` (by carrier variant,
+    first), `handshake_shaper` and `shaping_bundle`. A hook left at `None`
+    is not used. Use `config.replace(...)` to derive a variant.
     """
 
-    handshake_timeout: Seconds | None = 10.0
-    max_idle_timeout: Seconds | None = 30.0
-    keep_alive_period: Seconds | None = 15.0
-    initial_stream_receive_window: int | None = None
-    max_stream_receive_window: int | None = None
-    latency_budget: Seconds | None = None
-    initial_connection_receive_window: int | None = None
-    max_connection_receive_window: int | None = None
-    memory_budget: int | float | None = None
-    max_incoming_streams: int | None = None
-    max_incoming_uni_streams: int | None = None
-    enable_datagrams: bool | None = None
-    datagram_send_queue: int | None = None
-    datagram_receive_queue: int | None = None
-    datagram_stream_queue: int | None = None
-    datagram_receive_bytes: int | None = None
-    send_buffer: int | None = None
-    send_buffer_max: int | None = None
-    max_pipes: int | None = None
-    pipe_headroom: int | None = None
-    replay_window: int | None = None
-    max_lanes: int | None = None
-    resume_timeout: Seconds | None = None
-    scheduler: Scheduler | None = None
-    spread_chunk: int | None = None
-    suspect_floor: Seconds | None = None
-    dead_timeout: Seconds | None = None
-    probation: Seconds | None = None
-    overflow_delay: Seconds | None = None
-    standby_probe: Seconds | None = 1.0
-    probe_interval: Seconds | None = 15.0
-    probe_jitter: float | None = None
-    redundancy: str | None = None
+    handshake_timeout: float | None = _DEFAULTS["handshake_timeout"]
+    join_timeout: float = _DEFAULTS["join_timeout"]
+    max_idle_timeout: float | None = _DEFAULTS["max_idle_timeout"]
+    liveness: Liveness = Liveness()
+    initial_stream_receive_window: int = _DEFAULTS["initial_stream_receive_window"]
+    max_stream_receive_window: int | Auto = AUTO
+    latency_budget: float = _DEFAULTS["latency_budget"]
+    initial_connection_receive_window: int = _DEFAULTS[
+        "initial_connection_receive_window"
+    ]
+    max_connection_receive_window: int | Auto = AUTO
+    memory_budget: int | None = _DEFAULTS["memory_budget"]
+    max_incoming_streams: int = _DEFAULTS["max_incoming_streams"]
+    max_incoming_uni_streams: int | Staged = STAGED
+    enable_datagrams: bool = False
+    datagram_send_queue: int = _DEFAULTS["datagram_send_queue"]
+    datagram_receive_queue: int = _DEFAULTS["datagram_receive_queue"]
+    datagram_stream_queue: int = _DEFAULTS["datagram_stream_queue"]
+    datagram_receive_bytes: int = _DEFAULTS["datagram_receive_bytes"]
+    datagram_stream_bytes: int | None = _DEFAULTS["datagram_stream_bytes"]
+    send_buffer: int = _DEFAULTS["send_buffer"]
+    send_buffer_max: int | Auto = AUTO
+    max_pipes: int = _DEFAULTS["max_pipes"]
+    pipe_headroom: int = _DEFAULTS["pipe_headroom"]
+    replay_window: int | Auto = AUTO
+    max_lanes: int = _DEFAULTS["max_lanes"]
+    resume_timeout: float | None = None
+    redial: Callable[[Direction], Awaitable[Any]] | None = field(
+        default=None, compare=False
+    )
+    redial_min_backoff: float = _DEFAULTS["redial_min_backoff"]
+    redial_max_backoff: float = _DEFAULTS["redial_max_backoff"]
+    scheduler: Scheduler | str = Scheduler.AFFINITY
+    spread_chunk: int = _DEFAULTS["spread_chunk"]
+    probation: float | Auto | None = AUTO
+    overflow_delay: float = _DEFAULTS["overflow_delay"]
+    redundancy: Redundancy | str = Redundancy.URGENT
     pipe_auth: PipeAuth | None = field(default=None, repr=False)
-    early_data: bool | None = None
-    carrier_early_data: bool | None = None
+    join_early_hello: int | None = _DEFAULTS["join_early_hello"]
+    session_crypto: SessionCrypto = SessionCrypto.LOCAL
+    epoch_policy: EpochPolicy = EpochPolicy()
+    record_policy: Callable[[RecordPolicyInput], RecordMode | str] | None = field(
+        default=None, compare=False
+    )
+    allow_record_mode: Callable[[RecordPolicyInput, RecordMode, Any], bool] | None = (
+        field(default=None, compare=False)
+    )
+    authorize_join: Callable[[PipeId], bool] | None = field(default=None, compare=False)
+    early_data: bool = False
+    carrier_early_data: bool = False
+    hold_first_flight: bool = False
     protocols: tuple[str, ...] | None = None
-    shaping_limits: ShapingLimits | None = None
+    logger: logging.Logger | None = field(default=None, repr=False, compare=False)
+    tracer: Tracer | None = field(default=None, repr=False, compare=False)
+    shaping_limits: ShapingLimits = ShapingLimits()
+    shaping_budget: Callable[[], ShapingBudget] | None = None
+    handshake_shaper: object | None = field(default=None, repr=False, compare=False)
+    shaping_bundle: object | None = field(default=None, repr=False, compare=False)
     shaping: Mapping[CarrierKind | str | None, str] | None = field(
         default=None, compare=False
     )
+    shaping_by_variant: Mapping[str, str] | None = field(default=None, compare=False)
     _native: Any = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         kw = {f.name: getattr(self, f.name) for f in dataclasses.fields(self) if f.init}
-        for k, v in kw.items():
-            if isinstance(v, datetime.timedelta):
-                kw[k] = _secs(v)
         if kw["protocols"] is not None:
             object.__setattr__(self, "protocols", tuple(kw["protocols"]))
             kw["protocols"] = list(kw["protocols"])
@@ -1129,6 +1801,9 @@ class Config:
                 k.value if isinstance(k, CarrierKind) else k: v
                 for k, v in kw["shaping"].items()
             }
+        if kw["shaping_by_variant"] is not None:
+            kw["shaping_by_variant"] = dict(kw["shaping_by_variant"])
+            object.__setattr__(self, "shaping_by_variant", kw["shaping_by_variant"])
         object.__setattr__(self, "_native", _zmux.Config(**kw))
 
     def replace(self, **changes: Any) -> Config:
@@ -1137,9 +1812,9 @@ class Config:
 
 
 @runtime_checkable
-class Credential(Protocol):
+class CarrierCredential(Protocol):
     """What a client presents to a server's admission on a new carrier, as
-    `credential=` of the `dial_*` functions (`PrefixAuth` is one). Called on
+    `carrier_credential=` of the `dial_*` functions (`PrefixAuth` is one). Called on
     a native thread holding the GIL, once per carrier, after its handshake:
     `info.export()` gives the exporter of that handshake for a bound
     credential. An exception fails the dial."""

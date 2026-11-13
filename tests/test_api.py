@@ -5,7 +5,7 @@ import contextlib
 import datetime
 import math
 from collections.abc import AsyncIterator, Callable
-from typing import Any
+from typing import Any, cast
 
 import pytest
 import zmux
@@ -23,8 +23,9 @@ async def pair(
         try:
             yield c, s, listener
         finally:
-            c.close()
-            s.close()
+            c.abort(0)
+            s.abort(0)
+            await asyncio.gather(c.wait_closed(), s.wait_closed())
 
 
 async def until(cond: Callable[[], object], limit: float = 5.0) -> None:
@@ -35,11 +36,11 @@ async def until(cond: Callable[[], object], limit: float = 5.0) -> None:
 
 def test_config_fields() -> None:
     c = zmux.Config(
-        max_idle_timeout=datetime.timedelta(seconds=20),
-        keep_alive_period=None,
+        max_idle_timeout=20,
+        liveness=zmux.Liveness(keep_alive_period=None, standby_probe=None),
         enable_datagrams=True,
         max_stream_receive_window=1 << 20,
-        memory_budget=math.inf,
+        memory_budget=None,
         max_incoming_uni_streams=0,
         send_buffer_max=1 << 22,
         max_pipes=4,
@@ -49,7 +50,6 @@ def test_config_fields() -> None:
         scheduler="spread-eta",
         spread_chunk=8192,
         overflow_delay=0.5,
-        standby_probe=None,
         redundancy="off",
         pipe_auth=zmux.PipeAuth.exporter().with_psk(b"k" * 32),
         early_data=False,
@@ -57,55 +57,51 @@ def test_config_fields() -> None:
         latency_budget=0.001,
     )
     assert c.replace(max_pipes=2).max_pipes == 2
+    assert c.memory_budget is None and c.liveness.keep_alive_period is None
     with pytest.raises(TypeError):
         zmux.Config(idle_timeout=5)  # type: ignore[call-arg]
     with pytest.raises(ValueError):
-        zmux.Config(scheduler="fastest")  # type: ignore[arg-type]  # an invalid value on purpose
+        zmux.Config(scheduler="fastest")
     with pytest.raises(ValueError):
         zmux.Config(redundancy="always")
 
 
 async def test_keep_alive_and_standby_probe_values() -> None:
-    # The timers and periods default to their values and take None for no
-    # timeout or off; math.inf makes the budget unlimited, 0 is no byte.
+    # The timers default to their values; None is no timeout, off or
+    # unlimited where the field has such a setting and ValueError elsewhere.
     c = zmux.Config()
-    assert (
-        c.handshake_timeout,
-        c.max_idle_timeout,
-        c.keep_alive_period,
-        c.standby_probe,
-        c.probe_interval,
-    ) == (
-        10,
-        30,
-        15,
-        1,
-        15,
-    )
+    assert (c.handshake_timeout, c.max_idle_timeout) == (10, 30)
+    lv = c.liveness
+    assert (lv.keep_alive_period, lv.standby_probe, lv.probe_interval) == (15, 1, 15)
+    assert lv.dead_timeout is zmux.AUTO
+    assert c.max_stream_receive_window is zmux.AUTO
+    assert c.max_incoming_uni_streams is zmux.STAGED
     off: dict[str, Any] = {
         "handshake_timeout": None,
         "max_idle_timeout": None,
-        "keep_alive_period": None,
-        "memory_budget": math.inf,
-        "standby_probe": None,
-        "probe_interval": None,
+        "memory_budget": None,
+        "liveness": zmux.Liveness(
+            keep_alive_period=None, standby_probe=None, probe_interval=None
+        ),
     }
     async with pair(client=zmux.Config(**off)):
         pass
-    async with pair(client=zmux.Config(keep_alive_period=1, memory_budget=0)):
+    async with pair(
+        client=zmux.Config(liveness=zmux.Liveness(keep_alive_period=1), memory_budget=0)
+    ):
         pass
     bad: dict[str, Any]
     for bad in (
-        {"standby_probe": 0.5},
-        {"standby_probe": 0},
-        {"probe_interval": 0},
+        {"liveness": zmux.Liveness(standby_probe=0.5)},
+        {"liveness": zmux.Liveness(standby_probe=0)},
+        {"liveness": zmux.Liveness(probe_interval=0)},
+        {"liveness": zmux.Liveness(keep_alive_period=0)},
+        {"liveness": zmux.Liveness(keep_alive_period=0.999)},
+        {"liveness": zmux.Liveness(keep_alive_period=-1)},
+        {"liveness": zmux.Liveness(standby_probe=-1)},
+        {"liveness": zmux.Liveness(keep_alive_period=math.inf)},
         {"max_idle_timeout": 0},
         {"max_idle_timeout": 0.0005},
-        {"keep_alive_period": 0},
-        {"keep_alive_period": 0.999},
-        {"keep_alive_period": -1},
-        {"standby_probe": -1},
-        {"keep_alive_period": math.inf},
         {"handshake_timeout": math.inf},
         {"handshake_timeout": -math.inf},
         {"memory_budget": -1},
@@ -116,10 +112,63 @@ async def test_keep_alive_and_standby_probe_values() -> None:
                 pass
 
 
+def test_none_only_where_a_field_has_an_off_setting() -> None:
+    for field in ("join_timeout", "max_pipes", "latency_budget", "scheduler"):
+        with pytest.raises(ValueError):
+            zmux.Config(**cast("dict[str, Any]", {field: None}))
+    zmux.Config(join_early_hello=None, resume_timeout=None, probation=None)
+    zmux.Config(probation=zmux.AUTO)
+    with pytest.raises((TypeError, ValueError)):
+        zmux.Config(max_idle_timeout=datetime.timedelta(seconds=20))  # type: ignore[arg-type]  # removed on purpose
+    # The removed fields moved into `liveness`.
+    for gone in (
+        "keep_alive_period",
+        "standby_probe",
+        "probe_interval",
+        "dead_timeout",
+    ):
+        with pytest.raises(TypeError):
+            zmux.Config(**cast("dict[str, Any]", {gone: 1}))
+
+
+async def test_hold_first_flight() -> None:
+    async with zmux.Listener() as listener:
+        addr = await listener.serve_tcp("127.0.0.1:0")
+        c = await zmux.Session.connect(
+            await zmux.dial_tcp(addr),
+            zmux.Config(early_data=True, hold_first_flight=True),
+        )
+        send, _recv = await c.open_bi()
+        await send.write(b"first flight")
+        await asyncio.wait_for(send.flush(), 1)
+        accepted = asyncio.ensure_future(listener.accept())
+        await asyncio.sleep(0.05)
+        assert not accepted.done()
+        assert c.stats().bytes_sent == 0
+        c.release_first_flight()
+        c.release_first_flight()
+        s = await asyncio.wait_for(accepted, 5)
+        _send, recv = await s.accept_bi()
+        assert await recv.read_exact(12) == b"first flight"
+        assert c.stats().first_flight_timeouts == 0
+        c.abort(0)
+        s.abort(0)
+        await asyncio.gather(c.wait_closed(), s.wait_closed())
+
+
+async def test_hold_first_flight_needs_client_early_data() -> None:
+    async with zmux.Listener() as listener:
+        addr = await listener.serve_tcp("127.0.0.1:0")
+        with pytest.raises(Exception, match="hold_first_flight"):
+            await zmux.Session.connect(
+                await zmux.dial_tcp(addr), zmux.Config(hold_first_flight=True)
+            )
+
+
 def test_pipe_auth_is_immutable() -> None:
-    a = zmux.PipeAuth.psk(b"k" * 32)
+    a = zmux.PipeAuth.psk(b"k" * 32).with_end_to_end()
     b = a.with_psk(b"j" * 32)
-    assert a != b and b == zmux.PipeAuth.psk(b"j" * 32)
+    assert a != b and b == zmux.PipeAuth.psk(b"j" * 32).with_end_to_end()
     assert zmux.PipeAuth.exporter().with_psk(b"k" * 32) != a
     with pytest.raises(AttributeError):
         a._psk = None
@@ -147,7 +196,7 @@ async def test_chunks_without_copying() -> None:
         _ss, recv = await s.accept_bi()
         got = b""
         while True:
-            chunk = await recv.read_chunk(3)
+            chunk = await recv.read_chunk(n=3)
             assert isinstance(chunk, memoryview) and chunk.readonly and len(chunk) <= 3
             if not chunk:
                 break
@@ -163,12 +212,12 @@ async def test_send_capacity_and_stream_settings() -> None:
         await c.ping()
         cap = send.send_capacity()
         assert 0 < cap <= 4096
-        assert await asyncio.wait_for(send.wait_send_capacity(1), 5) >= 1
+        assert await asyncio.wait_for(send.wait_send_capacity(minimum=1), 5) >= 1
         send.set_send_buffer(1 << 16)
         send.set_scheduler("spread-round-robin")
         send.set_scheduler(None)
         with pytest.raises(ValueError):
-            send.set_scheduler("fastest")  # type: ignore[arg-type]  # an invalid value on purpose
+            send.set_scheduler("fastest")
         send.set_redundant(True)
         send.set_redundant(False)
         # None follows the session's `redundancy` again.
@@ -177,7 +226,7 @@ async def test_send_capacity_and_stream_settings() -> None:
         recv.set_receive_window(1 << 16, 1 << 20)
         recv.set_peer_priority(zmux.Priority(1, False))
         with pytest.raises(ValueError):
-            await send.wait_send_capacity(0)
+            await send.wait_send_capacity(minimum=0)
         # The peer's window bounds the capacity: 4096 minus what is unsent.
         _ss, sr = await s.accept_bi()
         assert await sr.read(1) == b"x"
@@ -266,22 +315,48 @@ async def test_pipe_and_listener_stats() -> None:
         assert st.queued_bytes is None and st.queue_delay is None
 
 
-def test_direction_states_follow_the_half() -> None:
-    out = zmux._types._event(
-        "PipeState", {"pipe": 2, "half": "Outbound", "state": "Failed", "failure": "x"}
+def test_pipe_state_events_are_six_kinds() -> None:
+    failed = zmux._types._event(
+        "PipeFailed", {"pipe": 2, "failure": "x", "carrier": "websocket"}
     )
-    assert (
-        isinstance(out, zmux.PipeStateChanged)
-        and out.state is zmux.OutboundState.FAILED
+    assert failed == zmux.PipeFailed(zmux.PipeId(2), "x", zmux.CarrierKind.WEBSOCKET)
+    assert failed.kind is zmux.EventKind.PIPE_FAILED
+    closed = zmux._types._event("PipeClosed", {"pipe": 2, "half": "Inbound"})
+    assert closed == zmux.PipeClosed(zmux.PipeId(2), zmux.PipeHalf.INBOUND)
+    for kind, cls in (
+        ("PipeAdded", zmux.PipeAdded),
+        ("PipeJoined", zmux.PipeJoined),
+        ("PipeSuspect", zmux.PipeSuspect),
+        ("PipeRecovered", zmux.PipeRecovered),
+    ):
+        assert zmux._types._event(kind, {"pipe": 4}) == cls(zmux.PipeId(4))
+    goaway = zmux._types._event(
+        "GoAwayReceived", {"max_bidi": 1, "max_uni": 2, "code": 3}
     )
-    inb = zmux._types._event(
-        "PipeState", {"pipe": 2, "half": "Inbound", "state": "Open", "failure": None}
-    )
-    assert (
-        isinstance(inb, zmux.PipeStateChanged) and inb.state is zmux.InboundState.OPEN
-    )
+    assert goaway == zmux.GoAwayReceived(1, 2, 3)
     assert "RETIRED" not in zmux.OutboundState.__members__
     assert "ACTIVE" not in zmux.InboundState.__members__
+
+
+async def test_negotiation_results() -> None:
+    async with pair(client=zmux.Config(enable_datagrams=True)) as (c, s, _l):
+        assert c.is_established and s.is_established
+        assert c.qmux_version == "draft-02"
+        assert c.tls is None
+        assert c.datagram_support == zmux.Support(local=True, peer=False)
+        assert s.datagram_support == zmux.Support(local=False, peer=True)
+        assert isinstance(c.reset_stream_at_support, zmux.Support)
+        assert c.multipath is zmux.Multipath.OFF
+        assert not c.resume_in_use and isinstance(c.pipe_ack_in_use, bool)
+        assert c.goaway is None
+        send, _recv = await c.open_bi()
+        assert send.max_datagram_size() is None
+        closing = asyncio.ensure_future(c.shutdown())
+        await until(lambda: s.goaway is not None)
+        assert isinstance(s.goaway, zmux.GoAwayReceived)
+        closing.cancel()
+        with contextlib.suppress(asyncio.CancelledError, zmux.ZmuxError):
+            await closing
 
 
 async def test_datagram_queue_sizes() -> None:
@@ -301,7 +376,7 @@ async def test_datagram_queue_sizes() -> None:
         assert await asyncio.wait_for(s.read_datagram(), 5) == b"\x01"
         assert await asyncio.wait_for(s.read_datagram(), 5) == b"\x02"
         assert s.stats().datagrams_dropped_recv == 1
-    with pytest.raises(zmux.ZmuxError):
+    with pytest.raises(ValueError):
         async with pair(
             client=zmux.Config(enable_datagrams=True, datagram_send_queue=0)
         ):
@@ -310,11 +385,7 @@ async def test_datagram_queue_sizes() -> None:
 
 async def test_quality_band_and_capacity_floor() -> None:
     async with pair() as (c, _s, _l):
-        c.set_quality_band(
-            zmux.QualityBand(
-                rtt=0.05, rate_ratio=2.0, min_interval=datetime.timedelta(seconds=1)
-            )
-        )
+        c.set_quality_band(zmux.QualityBand(rtt=0.05, rate_ratio=2.0, min_interval=1.0))
         c.set_quality_band(None)
         c.set_capacity_floor(zmux.CapacityFloor(rate=1000))
         c.set_capacity_floor(None)
@@ -346,14 +417,14 @@ async def test_nested_session_over_a_carrier_stream() -> None:
 
         task = asyncio.create_task(inner_server())
         inner = await zmux.Session.connect(
-            await c.open_pipe_stream([(0x1000, b"route")])
+            await c.open_pipe_stream(tlvs=[(0x1000, b"route")])
         )
         send, recv = await inner.open_bi()
         await send.write(b"nested")
         await send.finish()
         assert await recv.read_to_end() == b"nested"
-        (await task).close()
-        inner.close()
+        (await task).abort(0)
+        inner.abort(0)
 
 
 class Counting:
@@ -363,12 +434,12 @@ class Counting:
         self.charged = 0
         self.waits = 0
 
-    async def ready(self, min: int, max: int, /) -> int:
+    async def ready(self, least: int, most: int, /) -> int:
         self.waits += 1
-        return max
+        return most
 
-    def try_ready(self, max: int, /) -> int:
-        return max
+    def try_ready(self, most: int, /) -> int:
+        return most
 
     def charge(self, n: int, /) -> None:
         self.charged += n
@@ -418,11 +489,12 @@ async def test_resolve_duplicate() -> None:
         assert isinstance(r, zmux.Resolved) and r.rule is zmux.DuplicateRule.IDENTITY
         assert not r.rejoin_started
         assert {r.survivor.role, r.loser.role} <= {
-            zmux.Role.INITIATOR,
-            zmux.Role.RESPONDER,
+            zmux.Role.CLIENT,
+            zmux.Role.SERVER,
         }
         for sess in (x1, x2, y1, y2):
-            sess.close()
+            sess.abort(0)
+        await asyncio.gather(*(x.wait_closed() for x in (x1, x2, y1, y2)))
 
 
 def test_negative_durations_raise() -> None:
@@ -437,3 +509,103 @@ def test_negative_durations_raise() -> None:
     ):
         with pytest.raises(ValueError):
             make()
+
+
+def test_pipe_options_defaults_and_sentinels() -> None:
+    o = zmux.PipeOptions()
+    assert (o.record_mode, o.key_group, o.probation) == (
+        zmux.INHERIT,
+        zmux.INHERIT,
+        zmux.INHERIT,
+    )
+    assert (o.send_priority, o.send_standby, o.receive_priority, o.weight) == (
+        zmux.AUTO,
+        zmux.AUTO,
+        0,
+        1,
+    )
+    assert o.liveness == zmux.PipeLiveness()
+    assert o.liveness.dead_timeout is zmux.INHERIT and o.fate_group == 0
+    assert zmux.ShapingSizeLimits().max_slots == zmux.DEFAULT_MAX_SLOTS
+    with pytest.raises(ValueError):
+        zmux.QualityBand(rtt=-1)
+    assert zmux.QualityBand(rtt=None, rate_ratio=None).min_interval == 1.0
+    assert zmux.QualityBand(rtt=0, rate_ratio=0).rtt == 0  # every change
+    with pytest.raises(ValueError):
+        zmux.ReplayFilter(1.0, 0)
+
+
+async def test_stream_credit_maximum_and_datagram_stream_bytes() -> None:
+    assert zmux.MAX_STREAM_CREDIT == 1 << 60
+    c = zmux.Config()
+    assert c.datagram_stream_bytes == 512 * 1024
+    assert zmux.Config(datagram_stream_bytes=None).datagram_stream_bytes is None
+    assert c.replace(datagram_stream_bytes=1 << 20).datagram_stream_bytes == 1 << 20
+    big = zmux.Config(
+        max_incoming_streams=zmux.MAX_STREAM_CREDIT,
+        max_incoming_uni_streams=zmux.MAX_STREAM_CREDIT,
+        enable_datagrams=True,
+        datagram_stream_bytes=None,
+    )
+    async with pair(client=big, server=big) as (client, server, _):
+        client.raise_incoming_streams(bidi=zmux.MAX_STREAM_CREDIT)
+        with pytest.raises(ValueError):
+            client.raise_incoming_streams(bidi=zmux.MAX_STREAM_CREDIT + 1)
+        send, _ = await client.open_bi()
+        await send.write(b"x")
+        assert await server.accept_bi()
+    invalid: list[dict[str, Any]] = [
+        {"datagram_stream_bytes": 0},
+        {"max_incoming_streams": zmux.MAX_STREAM_CREDIT + 1},
+        {"max_incoming_uni_streams": zmux.MAX_STREAM_CREDIT + 1},
+    ]
+    for bad in invalid:
+        with pytest.raises((ValueError, zmux.ZmuxError)):
+            async with pair(client=zmux.Config(**bad)):
+                pass
+    with pytest.raises((ValueError, OverflowError)):
+        zmux.Config(datagram_stream_bytes=-1)
+
+
+async def test_the_stream_datagram_queue_is_bounded_by_its_bytes() -> None:
+    cfg = zmux.Config(enable_datagrams=True, datagram_stream_bytes=4096)
+    async with pair(client=cfg, server=cfg) as (client, server, _):
+        send, _ = await client.open_bi()
+        await send.write(b"x")
+        _, recv = await server.accept_bi()
+        await recv.read_exact(1)
+        for i in range(8):
+            send.send_datagram(bytes([i]) * 1500)
+        await asyncio.sleep(0.2)
+        got = []
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(0.3):
+                while True:
+                    got.append(await recv.read_datagram())
+        # Two 1500-byte datagrams fit in 4096 bytes: the oldest made room.
+        assert len(got) <= 2 and got[-1][1] == bytes([7]) * 1500
+
+
+async def test_listener_source_prefixes() -> None:
+    good: list[dict[str, Any]] = [
+        {"source_prefix_v4": 24, "source_prefix_v6": 56},
+        {"source_prefix_v4": 1, "source_prefix_v6": 128},
+        {"source_prefix_v4": 32, "source_prefix_v6": 64},
+    ]
+    for kw in good:
+        async with zmux.Listener(**kw) as listener:
+            addr = await listener.serve_tcp("127.0.0.1:0")
+            session = await zmux.connect_tcp(addr)
+            await asyncio.wait_for(listener.accept(), 5)
+            session.abort(0)
+            await session.wait_closed()
+    refused: list[dict[str, Any]] = [
+        {"source_prefix_v4": 0},
+        {"source_prefix_v4": 33},
+        {"source_prefix_v4": -1},
+        {"source_prefix_v6": 0},
+        {"source_prefix_v6": 129},
+    ]
+    for bad in refused:
+        with pytest.raises(ValueError):
+            zmux.Listener(**bad)

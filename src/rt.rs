@@ -18,11 +18,15 @@
 
 use std::cell::Cell;
 use std::future::Future;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, mpsc};
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use pyo3::IntoPyObjectExt;
+use pyo3::buffer::PyBuffer;
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::exceptions::asyncio::CancelledError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -42,6 +46,8 @@ thread_local! {
     /// Whether this thread is one of the runtime's (or a helper thread of
     /// one), never a thread of Python.
     static RUNTIME_THREAD: Cell<bool> = const { Cell::new(false) };
+    /// How many [`attach`] calls this thread is inside.
+    static DEPTH: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Marks the calling thread as a runtime thread (for a helper thread a
@@ -51,21 +57,26 @@ pub(crate) fn mark_runtime_thread() {
 }
 
 /// `Python::attach`, except that a runtime thread parks for good instead
-/// once the interpreter is exiting.
+/// once the interpreter is exiting. A call nested in another runs on: its
+/// thread is attached already, and parking attached would stall
+/// finalization for good (the GIL never released, or a stop-the-world
+/// never reached).
 pub(crate) fn attach<F, R>(f: F) -> R
 where
     F: for<'py> FnOnce(Python<'py>) -> R,
 {
-    if !RUNTIME_THREAD.get() {
+    if !RUNTIME_THREAD.get() || DEPTH.get() > 0 {
         return Python::attach(f);
     }
     struct Leave;
     impl Drop for Leave {
         fn drop(&mut self) {
+            DEPTH.set(DEPTH.get() - 1);
             INFLIGHT.fetch_sub(1, Ordering::SeqCst);
         }
     }
     INFLIGHT.fetch_add(1, Ordering::SeqCst);
+    DEPTH.set(1);
     let leave = Leave;
     if EXITING.load(Ordering::SeqCst) {
         drop(leave);
@@ -91,6 +102,40 @@ fn _shutdown(py: Python<'_>) {
     });
 }
 
+/// Releases `buffer` on a thread of its own. Releasing a Python buffer enters the
+/// interpreter, and the last owner of a lent chunk may be anywhere, the session's lock held
+/// included: a thread of Python that holds the interpreter waits for that lock.
+pub(crate) fn release_buffer(buffer: PyBuffer<u8>) {
+    static RELEASE: OnceLock<Option<mpsc::Sender<PyBuffer<u8>>>> = OnceLock::new();
+    let sender = RELEASE.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<PyBuffer<u8>>();
+        std::thread::Builder::new()
+            .name("zmux-release".into())
+            .spawn(move || {
+                mark_runtime_thread();
+                while let Ok(first) = rx.recv() {
+                    attach(|_| {
+                        drop(first);
+                        while let Ok(next) = rx.try_recv() {
+                            drop(next);
+                        }
+                    });
+                }
+            })
+            .ok()
+            .map(|_| tx)
+    });
+    // Without the thread the buffer stays exported.
+    match sender {
+        Some(tx) => {
+            if let Err(mpsc::SendError(b)) = tx.send(buffer) {
+                std::mem::forget(b);
+            }
+        }
+        None => std::mem::forget(buffer),
+    }
+}
+
 /// Sets up the runtime (its threads marked) and the `atexit` hook; called
 /// once, from the module's initialization.
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -108,7 +153,10 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 /// Completes an asyncio future on its loop, unless it is done already
 /// (cancelled).
 #[pyclass(frozen)]
-struct Complete;
+struct Complete(
+    Option<Py<PyAny>>,
+    StdMutex<Option<Box<dyn std::any::Any + Send>>>,
+);
 
 #[pymethods]
 impl Complete {
@@ -120,7 +168,14 @@ impl Complete {
     ) -> PyResult<()> {
         if !fut.call_method0("done")?.is_truthy()? {
             fut.call_method1(method, (value,))?;
+        } else if method == "set_result"
+            && let Some(undo) = &self.0
+        {
+            // Cancelled as it completed: what it read goes back.
+            undo.call1(fut.py(), (value,))?;
         }
+        // What the operation held: nothing else goes on until its result is settled.
+        drop(self.1.lock().unwrap().take());
         Ok(())
     }
 }
@@ -141,12 +196,103 @@ impl OnCancel {
     }
 }
 
-/// The asyncio future of `fut`, run on the runtime, on the running event
-/// loop. Cancelling it (or dropping it unawaited) drops `fut`.
+/// `fut`, whose panic is an exception for the awaiter: the panicked task would otherwise
+/// leave the asyncio future pending for good.
+async fn caught<F, T>(fut: F) -> PyResult<T>
+where
+    F: Future<Output = PyResult<T>>,
+{
+    let mut fut = std::pin::pin!(fut);
+    std::future::poll_fn(|cx| {
+        catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))).unwrap_or_else(|p| {
+            let what = p
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| p.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("panic");
+            Poll::Ready(Err(PyRuntimeError::new_err(format!(
+                "internal error: {what}"
+            ))))
+        })
+    })
+    .await
+}
+
+/// What a coroutine of this binding starts when first awaited.
+type Starter = Box<dyn for<'py> FnOnce(Python<'py>) -> PyResult<Py<PyAny>> + Send>;
+
+/// Starts an operation on the running loop, once.
+#[pyclass(frozen)]
+struct Begin(StdMutex<Option<Starter>>);
+
+#[pymethods]
+impl Begin {
+    fn __call__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match self.0.lock().unwrap().take() {
+            Some(start) => start(py),
+            None => Err(PyRuntimeError::new_err("the operation already started")),
+        }
+    }
+}
+
+static DRIVE: pyo3::sync::PyOnceLock<Py<PyAny>> = pyo3::sync::PyOnceLock::new();
+
+/// The coroutine function that awaits an operation. A cancellation that reaches its task
+/// after the result was set gives the result to `undo`.
+fn drive(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
+    DRIVE
+        .get_or_try_init(py, || {
+            let code = c"
+import asyncio
+
+async def drive(start, undo):
+    fut = start()
+    try:
+        return await fut
+    except asyncio.CancelledError:
+        if undo is not None and fut.done() and not fut.cancelled() and fut.exception() is None:
+            undo(fut.result())
+        raise
+";
+            let m = PyModule::from_code(py, code, c"zmux_drive", c"zmux_drive")?;
+            Ok::<_, PyErr>(m.getattr("drive")?.unbind())
+        })
+        .map(|f| f.bind(py))
+}
+
+/// A coroutine that runs `fut` on the runtime once awaited. Cancelling it drops `fut`, and
+/// so does dropping it unawaited.
 pub(crate) fn future_into_py<F, T>(py: Python<'_>, fut: F) -> PyResult<Bound<'_, PyAny>>
 where
     F: Future<Output = PyResult<T>> + Send + 'static,
     T: for<'py> IntoPyObject<'py> + Send + 'static,
+{
+    undoable_future_into_py(py, async move { fut.await.map(|v| (v, ())) }, None)
+}
+
+/// [`future_into_py`], where `undo` takes back a result no awaiter will see. The future also
+/// gives what stays held until the result is set or undone.
+pub(crate) fn undoable_future_into_py<F, T, G>(
+    py: Python<'_>,
+    fut: F,
+    undo: Option<Py<PyAny>>,
+) -> PyResult<Bound<'_, PyAny>>
+where
+    F: Future<Output = PyResult<(T, G)>> + Send + 'static,
+    T: for<'py> IntoPyObject<'py> + Send + 'static,
+    G: Send + 'static,
+{
+    let completing = undo.as_ref().map(|u| u.clone_ref(py));
+    let start: Starter = Box::new(move |py| start_future(py, fut, completing));
+    drive(py)?.call1((Begin(StdMutex::new(Some(start))), undo))
+}
+
+/// The asyncio future of `fut`, run on the runtime, on the running event loop.
+fn start_future<F, T, G>(py: Python<'_>, fut: F, undo: Option<Py<PyAny>>) -> PyResult<Py<PyAny>>
+where
+    F: Future<Output = PyResult<(T, G)>> + Send + 'static,
+    T: for<'py> IntoPyObject<'py> + Send + 'static,
+    G: Send + 'static,
 {
     let lp = py.import("asyncio")?.call_method0("get_running_loop")?;
     let target = lp.call_method0("create_future")?;
@@ -162,11 +308,16 @@ where
             biased;
             // Cancelled, or the future (with its callback) collected.
             _ = cancel_rx => return,
-            r = fut => r,
+            r = caught(fut) => r,
         };
         tokio::task::spawn_blocking(move || {
             attach(|py| {
-                let (method, value) = match r.and_then(|v| v.into_py_any(py)) {
+                let mut held: Option<Box<dyn std::any::Any + Send>> = None;
+                let converted = r.and_then(|(v, g)| {
+                    held = Some(Box::new(g));
+                    v.into_py_any(py)
+                });
+                let (method, value) = match converted {
                     Ok(v) => ("set_result", v),
                     Err(e) => ("set_exception", e.into_value(py).into_any()),
                 };
@@ -174,12 +325,12 @@ where
                 let _ = lp.call_method1(
                     py,
                     "call_soon_threadsafe",
-                    (Complete, fut_py, method, value),
+                    (Complete(undo, StdMutex::new(held)), fut_py, method, value),
                 );
             })
         });
     });
-    Ok(target)
+    Ok(target.unbind())
 }
 
 /// The task of an awaitable given to [`into_future`], once the loop started
@@ -192,14 +343,14 @@ struct Slot {
 
 /// Starts an awaitable as a task on its loop.
 #[pyclass(frozen)]
-struct Start {
+struct StartAwaitable {
     awaitable: StdMutex<Option<Py<PyAny>>>,
     tx: StdMutex<Option<oneshot::Sender<PyResult<Py<PyAny>>>>>,
     slot: Arc<StdMutex<Slot>>,
 }
 
 #[pymethods]
-impl Start {
+impl StartAwaitable {
     fn __call__(&self, py: Python<'_>) -> PyResult<()> {
         let Some(aw) = self.awaitable.lock().unwrap().take() else {
             return Ok(());
@@ -270,7 +421,7 @@ pub(crate) fn into_future(
     let py = awaitable.py();
     let (tx, rx) = oneshot::channel();
     let slot = Arc::new(StdMutex::new(Slot::default()));
-    let start = Start {
+    let start = StartAwaitable {
         awaitable: StdMutex::new(Some(awaitable.unbind())),
         tx: StdMutex::new(Some(tx)),
         slot: slot.clone(),
