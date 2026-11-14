@@ -15,14 +15,14 @@ async def exchange(client: zmux.Session, server: zmux.Session) -> None:
 
 
 def test_pipe_carrier() -> None:
-    pipe, _ = zmux.pipe_pair(carrier_kind=zmux.CarrierKind.WEBSOCKET)
+    pipe, _ = zmux.adapter.pipe_pair(carrier_kind=zmux.CarrierKind.WEBSOCKET)
     assert pipe.carrier_kind is zmux.CarrierKind.WEBSOCKET
     pipe.carrier_kind = zmux.CarrierKind.QUIC
     kind: object = pipe.carrier_kind
     assert kind is zmux.CarrierKind.QUIC
-    assert zmux.pipe_pair()[0].carrier_kind is None
+    assert zmux.adapter.pipe_pair()[0].carrier_kind is None
     with pytest.raises(ValueError):
-        zmux.pipe_pair(carrier_kind="carrier pigeon")
+        zmux.adapter.pipe_pair(carrier_kind="carrier pigeon")
     with pytest.raises(ValueError):
         zmux.Config(shaping={"carrier pigeon": PAD})
     with pytest.raises(ValueError):
@@ -32,17 +32,19 @@ def test_pipe_carrier() -> None:
 async def test_config_shapes_by_kind_from_the_first_record() -> None:
     # Only WebSocket pipes are shaped: there is no default.
     config = zmux.Config(shaping={zmux.CarrierKind.WEBSOCKET: PAD})
-    async with zmux.Listener(config) as listener:
-        ws = await listener.serve_websocket("127.0.0.1:0")
-        tcp = await listener.serve_tcp("127.0.0.1:0")
-        async with await zmux.connect_websocket(f"ws://{ws}/", config=config) as client:
+    async with zmux.Listener(config=config) as listener:
+        ws = await listener.serve_websocket("127.0.0.1", 0)
+        tcp = await listener.serve_tcp("127.0.0.1", 0)
+        async with await zmux.connect_websocket(
+            f"ws://{ws[0]}:{ws[1]}/", config=config
+        ) as client:
             server = await listener.accept()
             await exchange(client, server)
             for s in (client, server):
                 assert s.pipe_stats()[0].carrier == zmux.CarrierKind.WEBSOCKET
                 st = s.shaping_stats()
                 assert st["wire_spent"] > 0 and st["faults"] == 0, st
-        async with await zmux.connect_tcp(tcp, config=config) as client:
+        async with await zmux.connect_tcp(*tcp, config=config) as client:
             server = await listener.accept()
             await exchange(client, server)
             for s in (client, server):
@@ -52,15 +54,15 @@ async def test_config_shapes_by_kind_from_the_first_record() -> None:
 
 async def test_set_shaper_by_kind() -> None:
     async with zmux.Listener() as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
-        async with await zmux.connect_tcp(addr) as client:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
+        async with await zmux.connect_tcp(*addr) as client:
             server = await listener.accept()
             with pytest.raises(ValueError):
-                client.set_shaper(definition=PAD, by_kind={None: PAD})
-            client.set_shaper(by_kind={zmux.CarrierKind.QUIC: PAD})
+                client.shaper = zmux.shaping.Shaper(definition=PAD, by_kind={None: PAD})
+            client.shaper = zmux.shaping.Shaper(by_kind={zmux.CarrierKind.QUIC: PAD})
             await exchange(client, server)
             assert client.shaping_stats()["wire_spent"] == 0
-            client.set_shaper(by_kind={None: PAD})
+            client.shaper = zmux.shaping.Shaper(by_kind={None: PAD})
             await exchange(client, server)
             assert client.shaping_stats()["wire_spent"] > 0
 
@@ -77,9 +79,9 @@ async def test_a_delayed_first_record_keeps_the_parameters_first(
     # creation on both ends, holds the transport parameters, which still
     # lead the pipe once it ends: both ends establish and carry a stream.
     config = zmux.Config(shaping={None: definition})
-    async with zmux.Listener(config) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
-        async with await zmux.connect_tcp(addr, config=config) as client:
+    async with zmux.Listener(config=config) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
+        async with await zmux.connect_tcp(*addr, config=config) as client:
             server = await listener.accept()
             await exchange(client, server)
             await exchange(server, client)

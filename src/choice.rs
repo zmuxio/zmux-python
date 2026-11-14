@@ -9,7 +9,7 @@ use pyo3::types::PyDict;
 
 use crate::rt::future_into_py;
 use crate::{
-    ExchangeOptions, H3Dial, QuicDial, Session, TlsConfig, WebTransportDial, admission,
+    ExchangeOptions, H3Dial, QuicDial, Session, TlsConfig, WebTransportDial, admission, hostport,
     http_client_options, seconds,
 };
 
@@ -55,30 +55,34 @@ pub(crate) struct Candidate(zmux::Candidate);
 #[pymethods]
 impl Candidate {
     /// A bidirectional streaming `POST` over HTTP/1.1 to `addr` (kind
-    /// `streaming`, as `dial_http`).
+    /// `streaming`, as `dial_streaming`).
     #[staticmethod]
-    #[pyo3(signature = (addr, *, path="/zmux".to_owned(), carrier_credential=None, pair_field=None))]
-    fn http(
-        addr: String,
+    #[pyo3(signature = (host, port, *, path="/zmux".to_owned(), carrier_credential=None, pair_field=None))]
+    fn streaming(
+        host: String,
+        port: u16,
         path: String,
         carrier_credential: Option<Bound<'_, PyAny>>,
         pair_field: Option<String>,
     ) -> PyResult<Self> {
+        let addr = hostport(&host, port);
         let opts = http_client_options(path, carrier_credential, pair_field)?;
         Ok(Self(zmux_http::candidate(connect(&addr), &addr, &opts)))
     }
 
     /// A split bootstrap (an uplink `POST` and a downlink `GET`) over
-    /// HTTP/1.1 to `addr` (kind `split`, as `dial_http_split`); as a
+    /// HTTP/1.1 to `addr` (kind `split`, as `dial_split`); as a
     /// further pipe it joins as a downlink and an uplink.
     #[staticmethod]
-    #[pyo3(signature = (addr, *, path="/zmux".to_owned(), carrier_credential=None, pair_field=None))]
-    fn http_split(
-        addr: String,
+    #[pyo3(signature = (host, port, *, path="/zmux".to_owned(), carrier_credential=None, pair_field=None))]
+    fn split(
+        host: String,
+        port: u16,
         path: String,
         carrier_credential: Option<Bound<'_, PyAny>>,
         pair_field: Option<String>,
     ) -> PyResult<Self> {
+        let addr = hostport(&host, port);
         let opts = http_client_options(path, carrier_credential, pair_field)?;
         Ok(Self(zmux_http::candidate_split(
             connect(&addr),
@@ -90,9 +94,10 @@ impl Candidate {
     /// The exchange carrier to `addr` (kind `exchange`, as
     /// `dial_exchange`); it authenticates with the options' PSK.
     #[staticmethod]
-    #[pyo3(signature = (addr, *, options=None))]
-    fn exchange(addr: String, options: Option<PyRef<'_, ExchangeOptions>>) -> Self {
+    #[pyo3(signature = (host, port, *, options=None))]
+    fn exchange(host: String, port: u16, options: Option<PyRef<'_, ExchangeOptions>>) -> Self {
         let o = options.map(|o| o.0.clone()).unwrap_or_default();
+        let addr = hostport(&host, port);
         Self(zmux_http::candidate_exchange(connect(&addr), &addr, &o))
     }
 
@@ -131,14 +136,16 @@ impl Candidate {
     /// A QUIC connection to `addr`, where the client reaches the server
     /// directly (kind `quic`, as `dial_quic`).
     #[staticmethod]
-    #[pyo3(signature = (addr, *, tls=None, server_name=None, lanes=4, carrier_credential=None))]
+    #[pyo3(signature = (host, port, *, tls=None, server_name=None, lanes=zmux_quinn::LaneWindows::default().lanes, carrier_credential=None))]
     fn quic(
-        addr: String,
+        host: String,
+        port: u16,
         tls: Option<PyRef<'_, TlsConfig>>,
         server_name: Option<String>,
         lanes: u32,
         carrier_credential: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
+        let addr = hostport(&host, port);
         let d = QuicDial::new(addr, tls, server_name, lanes, carrier_credential)?;
         Ok(Self(zmux::Candidate::new(
             zmux::CarrierKind::Quic,
@@ -152,11 +159,11 @@ impl Candidate {
     /// An HTTP/3 request to `url` (`https://`), sent to `addr` when given
     /// (kind `http3`, as `dial_http3`).
     #[staticmethod]
-    #[pyo3(signature = (url, *, tls=None, addr=None, lanes=4, carrier_credential=None))]
+    #[pyo3(signature = (url, *, tls=None, addr=None, lanes=zmux_quinn::LaneWindows::default().lanes, carrier_credential=None))]
     fn http3(
         url: String,
         tls: Option<PyRef<'_, TlsConfig>>,
-        addr: Option<String>,
+        addr: Option<(String, u16)>,
         lanes: u32,
         carrier_credential: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
@@ -173,7 +180,7 @@ impl Candidate {
     /// A WebTransport session to `url` (`https://`; kind `webtransport`,
     /// as `dial_webtransport`).
     #[staticmethod]
-    #[pyo3(signature = (url, *, tls=None, lanes=4, carrier_credential=None))]
+    #[pyo3(signature = (url, *, tls=None, lanes=zmux_quinn::LaneWindows::default().lanes, carrier_credential=None))]
     fn webtransport(
         url: String,
         tls: Option<PyRef<'_, TlsConfig>>,

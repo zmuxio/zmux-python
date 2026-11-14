@@ -10,16 +10,18 @@ import zmux
 
 
 @contextlib.asynccontextmanager
-async def serving_http(**kwargs: object) -> AsyncIterator[tuple[zmux.Listener, str]]:
+async def serving_http(
+    **kwargs: object,
+) -> AsyncIterator[tuple[zmux.Listener, tuple[str, int]]]:
     async with zmux.Listener() as listener:
-        yield listener, await listener.serve_http("127.0.0.1:0", **kwargs)  # type: ignore[arg-type]  # forwarded options
+        yield listener, await listener.serve_http("127.0.0.1", 0, **kwargs)  # type: ignore[arg-type]  # forwarded options
 
 
 async def test_requested_priority() -> None:
     async with zmux.Listener() as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         async with (
-            await zmux.Session.connect(await zmux.dial_tcp(addr)) as c,
+            await zmux.Session.connect(await zmux.dial_tcp(*addr)) as c,
             await listener.accept() as s,
         ):
             send, recv = await c.open_bi(peer_priority=zmux.Priority(2, True))
@@ -35,9 +37,12 @@ async def test_requested_priority() -> None:
 
 async def test_join_prefix_needs_a_hello() -> None:
     async with zmux.Listener() as listener:
-        assert listener.join_prefix(b"\x01abc")[0] == zmux.JoinPrefix.NOT_JOIN
-        kind, need = listener.join_prefix(b"\x02")
-        assert kind == zmux.JoinPrefix.NEED_MORE and need > 1
+        assert (
+            zmux.adapter.join_prefix(listener, b"\x01abc")[0]
+            == zmux.adapter.JoinPrefix.NOT_JOIN
+        )
+        kind, need = zmux.adapter.join_prefix(listener, b"\x02")
+        assert kind == zmux.adapter.JoinPrefix.NEED_MORE and need > 1
 
 
 async def test_fallback_on_peek_timeout() -> None:
@@ -51,9 +56,11 @@ async def test_fallback_on_peek_timeout() -> None:
     assert not zmux.Admission(
         lambda i, p: zmux.AdmissionVerdict.CLOSE
     ).fallback_on_peek_timeout
-    async with zmux.Listener(admission=admission) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
-        host, port = addr.rsplit(":", 1)
+    async with zmux.Listener(
+        listener_config=zmux.ListenerConfig(admission=admission)
+    ) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
+        host, port = addr
         _, writer = await asyncio.open_connection(host, int(port))
         writer.write(b"ab")
         await writer.drain()
@@ -67,7 +74,7 @@ async def test_fallback_on_peek_timeout() -> None:
 
 async def test_http_split_pair_field() -> None:
     async with serving_http(pair_field="X-Pair") as (listener, addr):
-        pipe = await zmux.dial_http_split(addr, pair_field="X-Pair")
+        pipe = await zmux.dial_split(*addr, pair_field="X-Pair")
         async with (
             asyncio.timeout(5),
             await zmux.Session.connect(pipe) as c,
@@ -75,7 +82,7 @@ async def test_http_split_pair_field() -> None:
         ):
             assert c.is_established and s.is_established
     with pytest.raises(ValueError):
-        await zmux.dial_http_split("127.0.0.1:1", pair_field="bad name")
+        await zmux.dial_split("127.0.0.1", 1, pair_field="bad name")
 
 
 async def test_websocket_without_subprotocol() -> None:
@@ -83,7 +90,9 @@ async def test_websocket_without_subprotocol() -> None:
         listener,
         addr,
     ):
-        pipe = await zmux.dial_websocket(f"ws://{addr}/zmux", no_subprotocol=True)
+        pipe = await zmux.dial_websocket(
+            f"ws://{addr[0]}:{addr[1]}/zmux", no_subprotocol=True
+        )
         async with (
             asyncio.timeout(5),
             await zmux.Session.connect(pipe) as c,
@@ -94,9 +103,9 @@ async def test_websocket_without_subprotocol() -> None:
 
 async def test_stream_pair_reader_and_writer() -> None:
     async with zmux.Listener() as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         async with (
-            await zmux.Session.connect(await zmux.dial_tcp(addr)) as c,
+            await zmux.Session.connect(await zmux.dial_tcp(*addr)) as c,
             await listener.accept() as s,
         ):
             reader, writer = await c.open_stream_pair(info=b"pair")
@@ -126,9 +135,9 @@ async def test_stream_pair_reader_and_writer() -> None:
 
 async def test_stream_pair_writer_raises_the_first_send_error() -> None:
     async with zmux.Listener() as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         async with (
-            await zmux.Session.connect(await zmux.dial_tcp(addr)) as c,
+            await zmux.Session.connect(await zmux.dial_tcp(*addr)) as c,
             await listener.accept() as s,
         ):
             _reader, writer = await c.open_stream_pair()
@@ -152,9 +161,9 @@ async def test_stream_pair_writer_raises_the_first_send_error() -> None:
 
 async def test_stream_pair_writer_abort() -> None:
     async with zmux.Listener() as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         async with (
-            await zmux.Session.connect(await zmux.dial_tcp(addr)) as c,
+            await zmux.Session.connect(await zmux.dial_tcp(*addr)) as c,
             await listener.accept(),
         ):
             # Aborted before any write: closing, and wait_closed returns.
@@ -172,13 +181,23 @@ async def test_stream_pair_writer_abort() -> None:
 
 
 def test_exception_hierarchy() -> None:
-    assert issubclass(zmux.IdleTimeoutError, TimeoutError)
+    # A session's end is never a timeout of the operation that saw it.
     assert issubclass(zmux.IdleTimeoutError, zmux.SessionClosedError)
-    assert issubclass(zmux.HandshakeTimeoutError, TimeoutError)
+    for ended in (
+        zmux.IdleTimeoutError,
+        zmux.HandshakeTimeoutError,
+        zmux.ResumeTimeoutError,
+    ):
+        assert not issubclass(ended, TimeoutError)
+    assert issubclass(zmux.DeadlineExceededError, (zmux.ZmuxError, TimeoutError))
+    assert issubclass(zmux.InvalidArgumentError, (zmux.ZmuxError, ValueError))
+    assert not issubclass(zmux.NotNegotiatedError, zmux.PipeError)
+    assert not issubclass(zmux.NotEstablishedError, zmux.PipeError)
     assert issubclass(zmux.StreamResetError, ConnectionError)
     assert issubclass(zmux.StreamStoppedError, ConnectionError)
-    assert issubclass(zmux.IncompleteReadError, EOFError)
-    assert issubclass(zmux.LimitExceededError, ValueError)
+    assert issubclass(zmux.IncompleteReadError, asyncio.IncompleteReadError)
+    assert not issubclass(zmux.LimitExceededError, ValueError)
+    assert issubclass(zmux.LimitExceededError, zmux.StreamError)
     assert issubclass(zmux.PreambleTooLargeError, zmux.ZmuxError)
     assert issubclass(zmux.PreambleTooLargeError, ValueError)
     for name in (
@@ -208,18 +227,18 @@ class _Refusing:
 
 async def test_carrier_credential_error_surfaces_as_itself() -> None:
     async with zmux.Listener() as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         with pytest.raises(LookupError, match="no credential"):
-            await zmux.dial_tcp(addr, carrier_credential=_Refusing())
+            await zmux.dial_tcp(*addr, carrier_credential=_Refusing())
 
 
 async def test_listener_closed_while_serving_stops_the_server() -> None:
     listener = zmux.Listener()
-    serving = asyncio.ensure_future(listener.serve_tcp("127.0.0.1:0"))
+    serving = asyncio.ensure_future(listener.serve_tcp("127.0.0.1", 0))
     await asyncio.sleep(0)
     listener.close()
     addr = await asyncio.wait_for(serving, 5)
-    host, port = addr.rsplit(":", 1)
+    host, port = addr
     async with asyncio.timeout(5):
         while True:
             try:

@@ -30,19 +30,18 @@ class Relay:
     """Forwards TCP connections to `target`; each can be black-holed (bytes
     taken, none forwarded, ends kept open) or cut (both ends closed)."""
 
-    def __init__(self, target: str) -> None:
+    def __init__(self, target: tuple[str, int]) -> None:
         self.target = target
         self.conns: list[_Conn] = []
         self.server: asyncio.Server | None = None
 
-    async def start(self) -> str:
+    async def start(self) -> tuple[str, int]:
         self.server = await asyncio.start_server(self._serve, "127.0.0.1", 0)
         host, port = self.server.sockets[0].getsockname()[:2]
-        return f"{host}:{port}"
+        return host, port
 
     async def _serve(self, r1: asyncio.StreamReader, w1: asyncio.StreamWriter) -> None:
-        host, port = self.target.rsplit(":", 1)
-        r2, w2 = await asyncio.open_connection(host, int(port))
+        r2, w2 = await asyncio.open_connection(*self.target)
         conn: _Conn = {"blackhole": False, "writers": (w1, w2)}
         self.conns.append(conn)
 
@@ -89,19 +88,20 @@ def _pool_pipes(session: zmux.Session, first: int) -> list[zmux.PipeStats]:
 async def test_a_black_hole_is_found_by_the_probe() -> None:
     config = _config()
     async with zmux.Listener(
-        config, instance_id=b"instance", max_suspended=16
+        config=config,
+        listener_config=zmux.ListenerConfig(instance_id=b"instance", max_suspended=16),
     ) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         relay = Relay(addr)
         raddr = await relay.start()
         try:
-            async with await zmux.connect_tcp(addr, config=config) as session:
+            async with await zmux.connect_tcp(*addr, config=config) as session:
                 first = session.pipes()[0].id
 
                 async def dial() -> zmux.PipeIo:
-                    return await zmux.dial_tcp(raddr)
+                    return await zmux.dial_tcp(*raddr)
 
-                pool = zmux.PipePool(
+                pool = zmux.helpers.PipePool(
                     1,
                     dial,
                     options=zmux.PipeOptions(
@@ -133,14 +133,15 @@ async def test_a_black_hole_is_found_by_the_probe() -> None:
 async def test_the_last_pipe_cut_resumes_without_loss() -> None:
     config = _config()
     async with zmux.Listener(
-        config, instance_id=b"instance", max_suspended=16
+        config=config,
+        listener_config=zmux.ListenerConfig(instance_id=b"instance", max_suspended=16),
     ) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         relay = Relay(addr)
         raddr = await relay.start()
         try:
             async with await zmux.Session.connect(
-                await zmux.dial_tcp(raddr), config
+                await zmux.dial_tcp(*raddr), config=config
             ) as client:
                 server = await listener.accept()
                 events: list[zmux.Event] = []
@@ -152,9 +153,9 @@ async def test_the_last_pipe_cut_resumes_without_loss() -> None:
                 watcher = asyncio.ensure_future(watch())
 
                 async def dial() -> zmux.PipeIo:
-                    return await zmux.dial_tcp(raddr)
+                    return await zmux.dial_tcp(*raddr)
 
-                pool = zmux.PipePool(1, dial)
+                pool = zmux.helpers.PipePool(1, dial)
                 handle = client.maintain_pipes(pool)
                 first = client.pipes()[0].id
                 await _until(lambda: len(_pool_pipes(client, first)) == 1, 10)

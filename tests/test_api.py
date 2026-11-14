@@ -16,9 +16,9 @@ async def pair(
     client: zmux.Config | None = None, server: zmux.Config | None = None
 ) -> AsyncIterator[tuple[zmux.Session, zmux.Session, zmux.Listener]]:
     """A connected session pair over TCP, and the server's listener."""
-    async with zmux.Listener(server) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
-        c = await zmux.Session.connect(await zmux.dial_tcp(addr), client)
+    async with zmux.Listener(config=server) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
+        c = await zmux.Session.connect(await zmux.dial_tcp(*addr), config=client)
         s = await listener.accept()
         try:
             yield c, s, listener
@@ -133,10 +133,10 @@ def test_none_only_where_a_field_has_an_off_setting() -> None:
 
 async def test_hold_first_flight() -> None:
     async with zmux.Listener() as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         c = await zmux.Session.connect(
-            await zmux.dial_tcp(addr),
-            zmux.Config(early_data=True, hold_first_flight=True),
+            await zmux.dial_tcp(*addr),
+            config=zmux.Config(early_data=True, hold_first_flight=True),
         )
         send, _recv = await c.open_bi()
         await send.write(b"first flight")
@@ -158,10 +158,10 @@ async def test_hold_first_flight() -> None:
 
 async def test_hold_first_flight_needs_client_early_data() -> None:
     async with zmux.Listener() as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         with pytest.raises(Exception, match="hold_first_flight"):
             await zmux.Session.connect(
-                await zmux.dial_tcp(addr), zmux.Config(hold_first_flight=True)
+                await zmux.dial_tcp(*addr), config=zmux.Config(hold_first_flight=True)
             )
 
 
@@ -178,8 +178,9 @@ def test_pipe_auth_is_immutable() -> None:
 async def test_try_open_bi_without_credit_raises() -> None:
     async with pair(server=zmux.Config(max_incoming_streams=0)) as (c, _s, _l):
         await c.ping()
-        with pytest.raises(zmux.OpenError):
+        with pytest.raises(zmux.StreamError) as blocked:
             c.try_open_bi()
+        assert blocked.value.kind == zmux.ErrorKind.BLOCKED and blocked.value.retryable
     async with pair() as (c, s, _l):
         send, _recv = c.try_open_bi(info=b"i", priority=(1, True))
         await send.write(b"x")
@@ -213,18 +214,18 @@ async def test_send_capacity_and_stream_settings() -> None:
         cap = send.send_capacity()
         assert 0 < cap <= 4096
         assert await asyncio.wait_for(send.wait_send_capacity(minimum=1), 5) >= 1
-        send.set_send_buffer(1 << 16)
-        send.set_scheduler("spread-round-robin")
-        send.set_scheduler(None)
+        send.send_buffer = 1 << 16
+        send.scheduler = "spread-round-robin"
+        send.scheduler = None
         with pytest.raises(ValueError):
-            send.set_scheduler("fastest")
-        send.set_redundant(True)
-        send.set_redundant(False)
+            send.scheduler = "fastest"
+        send.redundant = True
+        send.redundant = False
         # None follows the session's `redundancy` again.
-        send.set_redundant(None)
+        send.redundant = None
         send.set_reliable_boundary()
-        recv.set_receive_window(1 << 16, 1 << 20)
-        recv.set_peer_priority(zmux.Priority(1, False))
+        recv.receive_window = (1 << 16, 1 << 20)
+        recv.peer_priority = zmux.Priority(1, False)
         with pytest.raises(ValueError):
             await send.wait_send_capacity(minimum=0)
         # The peer's window bounds the capacity: 4096 minus what is unsent.
@@ -385,14 +386,14 @@ async def test_datagram_queue_sizes() -> None:
 
 async def test_quality_band_and_capacity_floor() -> None:
     async with pair() as (c, _s, _l):
-        c.set_quality_band(zmux.QualityBand(rtt=0.05, rate_ratio=2.0, min_interval=1.0))
-        c.set_quality_band(None)
-        c.set_capacity_floor(zmux.CapacityFloor(rate=1000))
-        c.set_capacity_floor(None)
-        with contextlib.suppress(zmux.PipeError):
-            c.pipes()[0].set_quality_band(zmux.QualityBand(rtt=0.01))
+        c.quality_band = zmux.QualityBand(rtt=0.05, rate_ratio=2.0, min_interval=1.0)
+        c.quality_band = None
+        c.capacity_floor = zmux.CapacityFloor(rate=1000)
+        c.capacity_floor = None
+        with contextlib.suppress(zmux.NotNegotiatedError):
+            c.pipes()[0].update(quality_band=zmux.QualityBand(rtt=0.01))
         with pytest.raises(ValueError):
-            c.set_quality_band(zmux.QualityBand(rtt=-1))
+            c.quality_band = zmux.QualityBand(rtt=-1)
     for bad in (float("nan"), -1.0):
         with pytest.raises(ValueError):
             zmux.QualityBand(rate_ratio=bad)
@@ -407,7 +408,7 @@ async def test_nested_session_over_a_carrier_stream() -> None:
             send, recv = await s.accept_bi()
             assert recv.preamble.pipe_carrier
             assert recv.preamble.tlvs == (zmux.Tlv(0x1000, b"route"),)
-            inner = await zmux.Session.accept(zmux.stream_pipe(send, recv))
+            inner = await zmux.Session.accept(zmux.adapter.stream_pipe(send, recv))
             with pytest.raises(zmux.StreamError):
                 send.stats()  # used up by stream_pipe
             a, b = await inner.accept_bi()
@@ -448,13 +449,13 @@ class Counting:
 async def test_splice_forwards_and_charges() -> None:
     async with pair() as (c, relay_in, _l1), pair() as (relay_out, server, _l2):
 
-        async def relay() -> tuple[zmux.Spliced, Counting]:
+        async def relay() -> tuple[zmux.helpers.Spliced, Counting]:
             a = await relay_in.accept_bi()
             b = await relay_out.open_bi()
             limiter = Counting()
             with pytest.raises(ValueError):
-                await zmux.splice(a, a)
-            done = await zmux.splice(a, b, chunk=4096, a_to_b=limiter)
+                await zmux.helpers.splice(a, a)
+            done = await zmux.helpers.splice(a, b, chunk=4096, a_to_b=limiter)
             return done, limiter
 
         async def echo() -> None:
@@ -468,25 +469,35 @@ async def test_splice_forwards_and_charges() -> None:
         await send.finish()
         assert await recv.read_to_end() == b"spliced" * 100
         (done, limiter), _ = await asyncio.wait_for(tasks, 10)
-        assert isinstance(done, zmux.Spliced)
-        assert done.a_to_b.end is zmux.SpliceEnd.FINISHED and done.a_to_b.code is None
+        assert isinstance(done, zmux.helpers.Spliced)
+        assert (
+            done.a_to_b.end is zmux.helpers.SpliceEnd.FINISHED
+            and done.a_to_b.code is None
+        )
         assert done.a_to_b.bytes == 700 == limiter.charged
         assert done.b_to_a.bytes == 700
 
 
 async def test_resolve_duplicate() -> None:
     async with zmux.Listener() as lx, zmux.Listener() as ly:
-        ax, ay = await lx.serve_tcp("127.0.0.1:0"), await ly.serve_tcp("127.0.0.1:0")
-        x1 = await zmux.Session.connect(await zmux.dial_tcp(ay))  # X dialed
+        ax, ay = await lx.serve_tcp("127.0.0.1", 0), await ly.serve_tcp("127.0.0.1", 0)
+        x1 = await zmux.Session.connect(await zmux.dial_tcp(*ay))  # X dialed
         y1 = await ly.accept()
-        y2 = await zmux.Session.connect(await zmux.dial_tcp(ax))  # Y dialed
+        y2 = await zmux.Session.connect(await zmux.dial_tcp(*ax))  # Y dialed
         x2 = await lx.accept()
         with pytest.raises(ValueError):
-            zmux.resolve_duplicate(x1, x2)  # nothing decides
+            zmux.helpers.resolve_duplicate(x1, x2)  # nothing decides
         with pytest.raises(ValueError):
-            zmux.resolve_duplicate(x1, x1, local_identity=b"x", peer_identity=b"y")
-        r = zmux.resolve_duplicate(x1, x2, local_identity=b"x", peer_identity=b"y")
-        assert isinstance(r, zmux.Resolved) and r.rule is zmux.DuplicateRule.IDENTITY
+            zmux.helpers.resolve_duplicate(
+                x1, x1, local_identity=b"x", peer_identity=b"y"
+            )
+        r = zmux.helpers.resolve_duplicate(
+            x1, x2, local_identity=b"x", peer_identity=b"y"
+        )
+        assert (
+            isinstance(r, zmux.helpers.Resolved)
+            and r.rule is zmux.helpers.DuplicateRule.IDENTITY
+        )
         assert not r.rejoin_started
         assert {r.survivor.role, r.loser.role} <= {
             zmux.Role.CLIENT,
@@ -499,8 +510,12 @@ async def test_resolve_duplicate() -> None:
 
 def test_negative_durations_raise() -> None:
     for make in (
-        lambda: zmux.Listener(handshake_timeout=-1),
-        lambda: zmux.Listener(first_record_timeout=float("nan")),
+        lambda: zmux.Listener(
+            listener_config=zmux.ListenerConfig(handshake_timeout=-1)
+        ),
+        lambda: zmux.Listener(
+            listener_config=zmux.ListenerConfig(first_record_timeout=float("nan"))
+        ),
         lambda: zmux.CarrierCache(success_ttl=-1),
         lambda: zmux.ExchangeOptions(idle_timeout=-1),
         lambda: zmux.Admission.prefix_auth(
@@ -516,23 +531,23 @@ def test_pipe_options_defaults_and_sentinels() -> None:
     assert (o.record_mode, o.key_group, o.probation) == (
         zmux.INHERIT,
         zmux.INHERIT,
-        zmux.INHERIT,
+        zmux.CLEAR,
     )
     assert (o.send_priority, o.send_standby, o.receive_priority, o.weight) == (
-        zmux.AUTO,
-        zmux.AUTO,
-        0,
-        1,
+        zmux.CLEAR,
+        zmux.CLEAR,
+        zmux.CLEAR,
+        zmux.CLEAR,
     )
-    assert o.liveness == zmux.PipeLiveness()
-    assert o.liveness.dead_timeout is zmux.INHERIT and o.fate_group == 0
-    assert zmux.ShapingSizeLimits().max_slots == zmux.DEFAULT_MAX_SLOTS
+    assert o.liveness is zmux.CLEAR and o.quality_band is zmux.CLEAR
+    assert zmux.PipeLiveness().dead_timeout is zmux.INHERIT and o.fate_group == 0
+    assert zmux.shaping.ShapingSizeLimits().max_slots == zmux.shaping.DEFAULT_MAX_SLOTS
     with pytest.raises(ValueError):
         zmux.QualityBand(rtt=-1)
     assert zmux.QualityBand(rtt=None, rate_ratio=None).min_interval == 1.0
     assert zmux.QualityBand(rtt=0, rate_ratio=0).rtt == 0  # every change
     with pytest.raises(ValueError):
-        zmux.ReplayFilter(1.0, 0)
+        zmux.adapter.ReplayFilter(1.0, 0)
 
 
 async def test_stream_credit_maximum_and_datagram_stream_bytes() -> None:
@@ -593,9 +608,9 @@ async def test_listener_source_prefixes() -> None:
         {"source_prefix_v4": 32, "source_prefix_v6": 64},
     ]
     for kw in good:
-        async with zmux.Listener(**kw) as listener:
-            addr = await listener.serve_tcp("127.0.0.1:0")
-            session = await zmux.connect_tcp(addr)
+        async with zmux.Listener(listener_config=zmux.ListenerConfig(**kw)) as listener:
+            addr = await listener.serve_tcp("127.0.0.1", 0)
+            session = await zmux.connect_tcp(*addr)
             await asyncio.wait_for(listener.accept(), 5)
             session.abort(0)
             await session.wait_closed()
@@ -608,4 +623,22 @@ async def test_listener_source_prefixes() -> None:
     ]
     for bad in refused:
         with pytest.raises(ValueError):
-            zmux.Listener(**bad)
+            zmux.Listener(listener_config=zmux.ListenerConfig(**bad))
+
+
+async def test_resolve_duplicate_returns_the_given_objects() -> None:
+    async with zmux.Listener() as lx, zmux.Listener() as ly:
+        ax, ay = await lx.serve_tcp("127.0.0.1", 0), await ly.serve_tcp("127.0.0.1", 0)
+        x1 = await zmux.Session.connect(await zmux.dial_tcp(*ay))
+        y1 = await ly.accept()
+        y2 = await zmux.Session.connect(await zmux.dial_tcp(*ax))
+        x2 = await lx.accept()
+        r = zmux.helpers.resolve_duplicate(
+            x1, x2, local_identity=b"x", peer_identity=b"y"
+        )
+        assert {id(r.survivor), id(r.loser)} == {id(x1), id(x2)}
+        assert r.survivor is x1 or r.survivor is x2
+        assert r.loser is (x2 if r.survivor is x1 else x1)
+        for sess in (x1, x2, y1, y2):
+            sess.abort(0)
+        await asyncio.gather(*(x.wait_closed() for x in (x1, x2, y1, y2)))

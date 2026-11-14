@@ -5,10 +5,10 @@ pipe input (`pipe_from_streams`)."""
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
-from ._errors import ZmuxError
+from ._errors import IncompleteReadError, StreamClosedError, ZmuxError
 from ._zmux import PipeIo, RecvStream, SendStream, UnsentCount, pipe_pair
 
 _DEFAULT_LIMIT = 1 << 16
@@ -17,9 +17,9 @@ _DEFAULT_LIMIT = 1 << 16
 class StreamPairReader:
     """The receiving part of a stream with the reads of
     `asyncio.StreamReader`: `read`, `readexactly`, `readline`, `readuntil`,
-    `at_eof` and line iteration. `readexactly` raises
-    `asyncio.IncompleteReadError` and `readuntil` `asyncio.LimitOverrunError`,
-    as `asyncio.StreamReader` does; a reset by the peer raises
+    `at_eof` and line iteration. `readexactly` and `readuntil`
+    raise `IncompleteReadError`, an `asyncio.IncompleteReadError`, and
+    `readuntil` `asyncio.LimitOverrunError`, as `asyncio.StreamReader` does; a reset by the peer raises
     `StreamResetError`, a `ConnectionError`. Every read is
     cancellation-safe: a cancelled read loses no byte."""
 
@@ -62,20 +62,20 @@ class StreamPairReader:
         return self._take(n)
 
     async def readexactly(self, n: int) -> bytes:
-        """Exactly `n` bytes; `asyncio.IncompleteReadError` (with the bytes
-        read as `partial`) when the stream ends first."""
+        """Exactly `n` bytes; `IncompleteReadError` (with the bytes read as
+        `partial`) when the stream ends first."""
         if n < 0:
             raise ValueError("readexactly size can not be less than zero")
         while len(self._buf) < n:
             if not await self._fill():
                 partial = self._take(len(self._buf))
-                raise asyncio.IncompleteReadError(partial, n)
+                raise IncompleteReadError(partial, n)
         return self._take(n)
 
     async def readuntil(self, separator: bytes = b"\n") -> bytes:
         """The bytes up to and including `separator`.
-        `asyncio.IncompleteReadError` when the stream ends first (the bytes
-        read as `partial`); `asyncio.LimitOverrunError` when the separator is
+        `IncompleteReadError` when the stream ends first (the bytes read as
+        `partial`); `asyncio.LimitOverrunError` when the separator is
         not within the reader's limit (the bytes stay)."""
         if not separator:
             raise ValueError("Separator should be at least one-byte string")
@@ -95,14 +95,14 @@ class StreamPairReader:
                 )
             if not await self._fill():
                 partial = self._take(len(self._buf))
-                raise asyncio.IncompleteReadError(partial, None)
+                raise IncompleteReadError(partial, None)
 
     async def readline(self) -> bytes:
         """One line ending with `b"\\n"`, or what remains at the end;
         `ValueError` for a line beyond the reader's limit."""
         try:
             return await self.readuntil(b"\n")
-        except asyncio.IncompleteReadError as e:
+        except IncompleteReadError as e:
             return e.partial
         except asyncio.LimitOverrunError as e:
             if self._buf.startswith(b"\n", e.consumed):
@@ -152,7 +152,7 @@ class StreamPairWriter:
         """Queues `data`; raises the error of an earlier failed send."""
         self._check()
         if self._closing is not None:
-            raise RuntimeError("write after close or write_eof")
+            raise StreamClosedError("write after close or write_eof")
         self._buf += data
         self._queued += len(data)
         if self._task is None or self._task.done():
@@ -226,8 +226,9 @@ class StreamPairWriter:
         """Finishes the stream once the queue is sent (`write_eof`)."""
         self.write_eof()
 
-    def abort(self, code: int = 0) -> None:
-        """Resets the stream with `code` at once; the queue is dropped."""
+    def abort(self, code: int) -> None:
+        """Resets the stream with the application error `code` at once; the
+        queue is dropped."""
         self._aborted = True
         self._buf.clear()
         if self._task is not None:
@@ -262,16 +263,22 @@ def _retrieve(task: asyncio.Future[None]) -> None:
 
 
 def _stream_pair(
-    send: SendStream, recv: RecvStream, high_water: int
+    send: SendStream, recv: RecvStream, high_water: int, limit: int
 ) -> tuple[StreamPairReader, StreamPairWriter]:
-    return StreamPairReader(recv), StreamPairWriter(send, high_water=high_water)
+    return StreamPairReader(recv, limit=limit), StreamPairWriter(
+        send, high_water=high_water
+    )
 
 
 _bridges: set[asyncio.Future[None]] = set()
 
 
 def pipe_from_streams(
-    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    *,
+    max_record: int | None = None,
+    exporter: Callable[[str, bytes, int], bytes | None] | None = None,
 ) -> PipeIo:
     """A pipe input over an asyncio stream pair. Bytes cross into Python and
     back, so this is slower than the built-in carriers; use it for
@@ -279,12 +286,14 @@ def pipe_from_streams(
     the pipe: it ends, and closes `writer`, once the session lets the pipe
     go; the end of `reader` ends only the inbound direction. The
     transport's `get_write_buffer_size()`, where it has one, is the
-    carrier's unsent count, taken at each write and drain."""
-    pipe, end = pipe_pair()
+    carrier's unsent count, taken at each write and drain. `max_record` is
+    the largest record plaintext the carrier takes (at least 1), applied
+    beside the peer's `max_record_size`; `exporter(label, context, length)`
+    is the exporter of the carrier's innermost end-to-end handshake (see
+    `pipe_pair`)."""
     size = getattr(writer.transport, "get_write_buffer_size", None)
     count = UnsentCount() if size is not None else None
-    if count is not None:
-        pipe.unsent = count
+    pipe, end = pipe_pair(unsent=count, max_record=max_record, exporter=exporter)
 
     def note() -> None:
         if count is not None and size is not None:

@@ -3,7 +3,6 @@ cancelling the awaiting task drops the pending operation and leaves the
 session, stream or pipe usable. Use `asyncio.timeout()` for per-call
 deadlines; durations are seconds."""
 
-import logging
 from collections.abc import Awaitable, Buffer, Callable, Iterable, Mapping
 from os import PathLike
 from typing import Any, ClassVar, Literal, Protocol, Self, final
@@ -11,9 +10,10 @@ from typing import Any, ClassVar, Literal, Protocol, Self, final
 from . import _types as _t
 from ._layer import Layer
 from ._streams import StreamPairReader, StreamPairWriter
+from ._errors import SessionClosedError
 from ._types import (
+    BiStream,
     CapacityFloor,
-    CloseInfo,
     EarlyDataState,
     Event,
     InboundState,
@@ -32,6 +32,7 @@ from ._types import (
     SessionState,
     SessionStats,
     Spliced,
+    StreamDatagram,
     StreamStats,
     Tlv,
 )
@@ -66,6 +67,12 @@ DEFAULT_MIN_BACKOFF: float
 """Shortest redial wait of the `redial` hook and of a pipe pool, seconds (1)."""
 DEFAULT_MAX_BACKOFF: float
 """Longest redial wait of the `redial` hook and of a pipe pool, seconds (60)."""
+DEFAULT_BACKOFF_JITTER: float
+"""Default jitter of a `Backoff`: each wait shortened by up to this fraction
+(0.2)."""
+DEFAULT_LANES: int
+"""Default number of QUIC streams a QUIC, HTTP/3 or WebTransport carrier uses
+as lanes (4)."""
 DEFAULT_JOIN_TIMEOUT: float
 """Default join deadline, seconds (10)."""
 MIN_MAX_LEN: int
@@ -81,6 +88,9 @@ _KEYALG_MLDSA44: int
 
 def _config_defaults() -> dict[str, Any]:
     """Internal: the library's defaults of the `zmux.Config` fields."""
+
+def _listener_defaults() -> dict[str, Any]:
+    """Internal: the library's defaults of the `zmux.ListenerConfig` fields."""
 
 def shaping_limits_from_json(text: str) -> _t.ShapingLimits:
     """Reads local limits from JSON; any error raises `ValueError`."""
@@ -113,7 +123,7 @@ class TlsConfig:
 @final
 class UnsentCount:
     """A carrier's unsent count that the application keeps up to date,
-    typically at each write to the carrier (`PipeIo.unsent`)."""
+    typically at each write to the carrier (`pipe_pair(unsent=...)`)."""
 
     def __init__(self, n: int | None = None) -> None: ...
     def set(self, n: int | None) -> None:
@@ -126,9 +136,11 @@ class UnsentCount:
 @final
 class PipeIo:
     """A pipe input: a carrier, or the pair of carriers of a split, not yet
-    given to a session; usable once. Its settings are writable properties,
-    changed in place until the input is given to a session (then reading or
-    writing one raises `RuntimeError`)."""
+    given to a session; usable once. Its settings are properties, changed in
+    place until the input is given to a session (then reading or writing one
+    raises `PipeUsedError`); what a carrier's author sets once is a
+    parameter of the function that builds the input (`pipe_pair`,
+    `pipe_from_streams`)."""
 
     @property
     def carrier_kind(self) -> _t.CarrierKind | str | None:
@@ -137,27 +149,12 @@ class PipeIo:
     @carrier_kind.setter
     def carrier_kind(self, kind: _t.CarrierKind | str) -> None: ...
     @property
-    def unsent(self) -> UnsentCount:
-        """Write-only: the carrier's unsent count, which the application
-        keeps up to date with the bytes the carrier took and has not yet
-        transmitted, or `None` when it cannot tell. It feeds
-        `PipeStats.queued_bytes` and the scheduler's queue estimate; the
-        session's driver reads it without the interpreter lock."""
-    @unsent.setter
-    def unsent(self, count: UnsentCount) -> None: ...
-    @property
     def variant(self) -> str | None:
         """The host's name of the transform the carrier runs, or `None`:
         reported in `PipeStats.variant`, and what
-        `set_shaper(by_variant=...)` picks by."""
+        `Shaper(by_variant=...)` picks by."""
     @variant.setter
     def variant(self, variant: str) -> None: ...
-    @property
-    def max_record(self) -> int:
-        """Write-only: the largest record plaintext the carrier takes (at
-        least 1), applied beside the peer's `max_record_size`."""
-    @max_record.setter
-    def max_record(self, size: int) -> None: ...
     @property
     def write_overhead(self) -> int:
         """The fixed bytes (0 to 65535, `ValueError` otherwise) the layers
@@ -166,26 +163,12 @@ class PipeIo:
     @write_overhead.setter
     def write_overhead(self, overhead: int) -> None: ...
     @property
-    def exporter(self) -> Callable[[str, bytes, int], bytes | None]:
-        """Write-only: the exporter of the carrier's innermost end-to-end
-        handshake, the one source of `PipeAuth.exporter()`, carrier-bound
-        joins and `Session.export_keying_material`: `export(label, context,
-        length)` returns `length` bytes, or `None` while the handshake is
-        incomplete; an exception or another length gives no value and is
-        reported as unraisable. It is called from any thread when a value is
-        needed, possibly with the session's lock held: it must be quick and
-        must not call this session. Where the session's thread waits, it
-        waits at most a second for the interpreter, then has no value. Never
-        give an early exporter. A stream carrier ignores it."""
-    @exporter.setter
-    def exporter(self, export: Callable[[str, bytes, int], bytes | None]) -> None: ...
-    @property
     def terminated_tls(self) -> _t.TlsState | None:
         """The TLS or QUIC handshake this process ran for the carrier,
         complete; `None` without TLS or where it ends at a proxy. Assigning
         a `TlsState` declares such a handshake; not to be set where TLS ends
         at a proxy. No proof of an end-to-end handshake: exporters come from
-        `exporter`."""
+        the `exporter` parameter of the function that builds the input."""
     @terminated_tls.setter
     def terminated_tls(self, state: _t.TlsState) -> None: ...
     def declare_secure(self) -> None:
@@ -268,11 +251,30 @@ class PipeEnd:
         """Delivers `data` to the session; `b""` ends the pipe."""
 
 def pipe_pair(
-    *, carrier_kind: _t.CarrierKind | str | None = None
+    *,
+    carrier_kind: _t.CarrierKind | str | None = None,
+    unsent: UnsentCount | None = None,
+    max_record: int | None = None,
+    exporter: Callable[[str, bytes, int], bytes | None] | None = None,
 ) -> tuple[PipeIo, PipeEnd]:
     """An in-memory pipe: give the `PipeIo` to a session, drive the
     `PipeEnd` yourself. `carrier_kind` labels it with a carrier kind
-    (`PipeIo.carrier_kind`)."""
+    (`PipeIo.carrier_kind`). `unsent` is the carrier's unsent count, which
+    the application keeps up to date with the bytes the carrier took and has
+    not yet transmitted (it feeds `PipeStats.queued_bytes` and the
+    scheduler's queue estimate; the session's driver reads it without the
+    interpreter lock). `max_record` (at least 1) is the largest record
+    plaintext the carrier takes, applied beside the peer's
+    `max_record_size`. `exporter(label, context, length)` is the exporter of
+    the carrier's innermost end-to-end handshake, the one source of
+    `PipeAuth.exporter()`, carrier-bound joins and
+    `Session.export_keying_material`: it returns `length` bytes, or `None`
+    while the handshake is incomplete; an exception or another length gives
+    no value and is reported as unraisable. It is called from any thread
+    when a value is needed, possibly with the session's lock held: it must
+    be quick and must not call this session. Where the session's thread
+    waits, it waits at most a second for the interpreter, then has no value.
+    Never give an early exporter. A stream carrier ignores it."""
 
 @final
 class CarrierInfo:
@@ -362,7 +364,7 @@ class Decision:
 
 @final
 class Admission:
-    """A listener's admission of new carriers (`Listener(admission=...)`),
+    """A listener's admission of new carriers (`ListenerConfig(admission=...)`),
     applied at every entry, joins and resumptions included:
     `decide(info, prefix)` is called once per carrier, after its outer
     handshake, with its metadata and up to `peek` first bytes (none on
@@ -454,28 +456,30 @@ class PrefixAuth:
 type _CarrierCredential = PrefixAuth | _t.CarrierCredential
 
 async def dial_tcp(
-    addr: str, *, carrier_credential: _CarrierCredential | None = None
+    host: str, port: int, *, carrier_credential: _CarrierCredential | None = None
 ) -> PipeIo:
-    """A pipe input on a new TCP connection to `host:port`; with
+    """A pipe input on a new TCP connection to `host` and `port`; with
     `carrier_credential`, its prefix is sent first (given no exporter)."""
 
 async def dial_tls(
-    addr: str,
+    host: str,
+    port: int,
     *,
     tls: TlsConfig | None = None,
     server_name: str | None = None,
     carrier_credential: _CarrierCredential | None = None,
 ) -> PipeIo:
-    """A pipe input on TLS over TCP; `server_name` defaults to the host of `addr`.
+    """A pipe input on TLS over TCP; `server_name` defaults to `host`.
     With `carrier_credential`, its prefix is sent after the handshake. Without ALPN
     identifiers in `tls`, zmux's are offered."""
 
 async def dial_quic(
-    addr: str,
+    host: str,
+    port: int,
     *,
     tls: TlsConfig | None = None,
     server_name: str | None = None,
-    lanes: int = 4,
+    lanes: int = DEFAULT_LANES,
     carrier_credential: _CarrierCredential | None = None,
 ) -> PipeIo:
     """A pipe input on a new QUIC connection using up to `lanes` QUIC
@@ -496,8 +500,9 @@ async def dial_websocket(
     no application protocol identifier; the server must allow it
     (`serve_http(websocket_no_subprotocol=True)`)."""
 
-async def dial_http(
-    addr: str,
+async def dial_streaming(
+    host: str,
+    port: int,
     *,
     path: str = "/zmux",
     carrier_credential: _CarrierCredential | None = None,
@@ -512,8 +517,9 @@ async def dial_http(
     prefix is the first bytes of a request body, and a GET carries its
     header form."""
 
-async def dial_http_split(
-    addr: str,
+async def dial_split(
+    host: str,
+    port: int,
     *,
     path: str = "/zmux",
     carrier_credential: _CarrierCredential | None = None,
@@ -525,9 +531,10 @@ async def dial_http_split(
     bearer secret until the session is established: use TLS to the server
     or to a trusted TLS-terminating intermediary."""
 
-async def join_http_split(
+async def join_split(
     session: Session,
-    addr: str,
+    host: str,
+    port: int,
     *,
     path: str = "/zmux",
     carrier_credential: _CarrierCredential | None = None,
@@ -538,7 +545,7 @@ async def join_http_split(
     join across a POST and a GET paired by a token, one further pipe of the
     two directions, `options` choosing its direction; returns `[pipe]` as
     `add_pipe` does. A split bootstrap's carrier
-    (`dial_http_split`) joins no session: `add_pipe` refuses it with
+    (`dial_split`) joins no session: `add_pipe` refuses it with
     `PipeError`. A `PipePool(join=...)` keeps such pairs up."""
 
 @final
@@ -607,7 +614,7 @@ class PipePool:
     """Members to keep up over one path, `count` usable ones, given exactly
     one way to make them (`TypeError` otherwise): with `dial()`, each a pipe
     on the carrier it opens; with `join(session, options)`, each the pipes
-    it joins itself (such as `join_http_split`), usable while all of them
+    it joins itself (such as `join_split`), usable while all of them
     are, counted once, and redialled, rotated and retired as a whole; with
     `choice` (a `CarrierChoice`, under `choice_policy`), each over the most
     robust kind available (one the policy's cache holds as usable, else the
@@ -621,7 +628,8 @@ class PipePool:
     is a `CarrierCandidate` event. An invalid choice or policy raises
     `ValueError`.
 
-    Redials back off from the start of the previous attempt. Rotation
+    Redials back off from the start of the previous attempt, by `backoff`
+    (a `Backoff`; `None`: the default one). Rotation
     replaces a usable member make before break once it carried
     `rotate_max_bytes` either way or is `rotate_max_age` seconds old, each
     reduced by a random fraction of up to `rotate_jitter` (`None`: no
@@ -646,6 +654,7 @@ class PipePool:
         rotate_max_bytes: int | None = None,
         rotate_max_age: float | None = None,
         rotate_jitter: float = 0.0,
+        backoff: _t.Backoff | None = None,
         pool_policy: PoolPolicy | str | bytes | Mapping[str, Any] | None = None,
         options: PipeOptions | None = None,
         decision_rejected: Callable[[str], object] | None = None,
@@ -671,28 +680,32 @@ class Candidate:
     options' PSK."""
 
     @staticmethod
-    def http(
-        addr: str,
+    def streaming(
+        host: str,
+        port: int,
         *,
         path: str = "/zmux",
         carrier_credential: _CarrierCredential | None = None,
         pair_field: str | None = None,
     ) -> Candidate:
         """A bidirectional streaming POST over HTTP/1.1 (kind `streaming`, as
-        `dial_http`)."""
+        `dial_streaming`)."""
     @staticmethod
-    def http_split(
-        addr: str,
+    def split(
+        host: str,
+        port: int,
         *,
         path: str = "/zmux",
         carrier_credential: _CarrierCredential | None = None,
         pair_field: str | None = None,
     ) -> Candidate:
-        """A split bootstrap (kind `split`, as `dial_http_split`); as a
+        """A split bootstrap (kind `split`, as `dial_split`); as a
         further pipe, a downlink and an uplink. Its halves are paired by the
         request field `pair_field` (default `Zmux-Pipe-Pair`)."""
     @staticmethod
-    def exchange(addr: str, *, options: ExchangeOptions | None = None) -> Candidate:
+    def exchange(
+        host: str, port: int, *, options: ExchangeOptions | None = None
+    ) -> Candidate:
         """The exchange carrier, for paths that buffer whole bodies (kind
         `exchange`, as `dial_exchange`)."""
     @staticmethod
@@ -707,11 +720,12 @@ class Candidate:
         `dial_websocket`)."""
     @staticmethod
     def quic(
-        addr: str,
+        host: str,
+        port: int,
         *,
         tls: TlsConfig | None = None,
         server_name: str | None = None,
-        lanes: int = 4,
+        lanes: int = DEFAULT_LANES,
         carrier_credential: _CarrierCredential | None = None,
     ) -> Candidate:
         """A QUIC connection, where the client reaches the server directly
@@ -721,18 +735,19 @@ class Candidate:
         url: str,
         *,
         tls: TlsConfig | None = None,
-        addr: str | None = None,
-        lanes: int = 4,
+        addr: tuple[str, int] | None = None,
+        lanes: int = DEFAULT_LANES,
         carrier_credential: _CarrierCredential | None = None,
     ) -> Candidate:
-        """An HTTP/3 request to an `https://` URL, sent to `addr` when given
+        """An HTTP/3 request to an `https://` URL, sent to `addr`, a `(host,
+        port)`, when given
         (kind `http3`, as `dial_http3`)."""
     @staticmethod
     def webtransport(
         url: str,
         *,
         tls: TlsConfig | None = None,
-        lanes: int = 4,
+        lanes: int = DEFAULT_LANES,
         carrier_credential: _CarrierCredential | None = None,
     ) -> Candidate:
         """A WebTransport session to an `https://` URL (kind `webtransport`,
@@ -888,8 +903,7 @@ class ExchangeOptions:
         up_requests: int = 2,
         up_piece: int | _t.Auto = _t.AUTO,
         max_down_piece: int | _t.Auto = _t.AUTO,
-        backoff_initial: float = 0.02,
-        backoff_max: float = 2.0,
+        backoff: _t.Backoff | None = None,
         request_timeout: float = 25.0,
         deadline: float = 30.0,
         hold: float = 20.0,
@@ -910,7 +924,8 @@ class ExchangeOptions:
         the part before the first placeholder. Client: outstanding
         `down_requests` and `up_requests`, `up_piece` and `max_down_piece`
         (`AUTO`: from the encoding, and the larger of 1 MiB and that), the
-        repetition backoff from `backoff_initial` doubling to `backoff_max`,
+        repetition `backoff` (a `Backoff`; `None`: from 0.02 s doubling to 2 s,
+        jitter 0.2),
         `request_timeout`, `deadline`. Server: `hold`, `coalesce`,
         `down_piece` and `max_up_piece` (`AUTO` as the client's),
         `down_window`, `up_store`, `idle_timeout`, `gone_memory`,
@@ -926,17 +941,18 @@ class ExchangeOptions:
         """The fixed DOWN path, or `AUTO`."""
 
 async def dial_exchange(
-    addr: str,
+    host: str,
+    port: int,
     *,
     options: ExchangeOptions | None = None,
-    down_addr: str | None = None,
+    down_addr: tuple[str, int] | None = None,
     tls: TlsConfig | None = None,
     server_name: str | None = None,
     carrier_credential: _CarrierCredential | None = None,
 ) -> PipeIo:
     """A pipe input on the HTTP exchange carrier (kind `exchange`): plain
-    HTTP/1.1 POST requests to `addr` (`host:port`), DOWN requests to
-    `down_addr` when given, over TLS with `tls`; with `carrier_credential`,
+    HTTP/1.1 POST requests to `host` and `port`, DOWN requests to
+    `down_addr`, a `(host, port)`, when given, over TLS with `tls`; with `carrier_credential`,
     its prefix starts the uplink, for a server's admission. Returns without
     a round trip."""
 
@@ -944,19 +960,19 @@ async def dial_http3(
     url: str,
     *,
     tls: TlsConfig | None = None,
-    addr: str | None = None,
-    lanes: int = 4,
+    addr: tuple[str, int] | None = None,
+    lanes: int = DEFAULT_LANES,
     carrier_credential: _CarrierCredential | None = None,
 ) -> PipeIo:
     """A pipe input on an HTTP/3 request to `url` (`https://`; kind
-    `http3`), sent to `addr` when given. With `carrier_credential`, its
+    `http3`), sent to `addr`, a `(host, port)`, when given. With `carrier_credential`, its
     prefix is the first bytes of every request body."""
 
 async def dial_webtransport(
     url: str,
     *,
     tls: TlsConfig | None = None,
-    lanes: int = 4,
+    lanes: int = DEFAULT_LANES,
     carrier_credential: _CarrierCredential | None = None,
 ) -> PipeIo:
     """A pipe input on a new WebTransport session to `url` (`https://`; kind
@@ -970,8 +986,9 @@ class Http2Connection:
     connection."""
 
     @staticmethod
-    async def connect(
-        addr: str,
+    async def dial(
+        host: str,
+        port: int,
         *,
         path: str = "/zmux",
         tls: TlsConfig | None = None,
@@ -981,17 +998,18 @@ class Http2Connection:
     ) -> Http2Connection:
         """With `carrier_credential` (unbound), its prefix is the first bytes
         of every request body."""
-    async def dial(
+    async def open_pipe(
         self, *, direction: _t.Direction | str = _t.Direction.BIDI
     ) -> PipeIo:
-        """A pipe input on a new request of `direction` (see `dial_http`)."""
-    async def dial_split(self) -> PipeIo:
+        """A pipe input on a new request of `direction` (see
+        `dial_streaming`)."""
+    async def open_split(self) -> PipeIo:
         """A split bootstrap on two new requests of the connection."""
     async def join_split(
         self, session: Session, *, options: PipeOptions | None = None
     ) -> list[Pipe]:
         """Joins a split carrier on two new requests of the connection to
-        `session` as two further pipes (see `join_http_split`)."""
+        `session` as two further pipes (see `join_split`)."""
 
 @final
 class ZeroRtt:
@@ -1020,20 +1038,23 @@ class QuicClient:
         self,
         tls: TlsConfig | None = None,
         *,
-        lanes: int = 4,
+        lanes: int = DEFAULT_LANES,
         zero_rtt: bool = False,
         memory_capacity: int | None = None,
-        bind: str = "0.0.0.0:0",
+        bind: tuple[str, int] = ("0.0.0.0", 0),
         carrier_credential: _CarrierCredential | None = None,
     ) -> None:
         """`memory_capacity` bounds the servers remembered (`None`: no
-        bound). With `carrier_credential`, its prefix is the first stream's
+        bound); `bind` is the local `(host, port)`. With `carrier_credential`, its prefix is the first stream's
         first bytes and no 0-RTT data is sent."""
-    async def dial(self, addr: str, *, server_name: str | None = None) -> PipeIo:
+    async def dial(
+        self, host: str, port: int, *, server_name: str | None = None
+    ) -> PipeIo:
         """A pipe input on a new connection."""
     async def connect(
         self,
-        addr: str,
+        host: str,
+        port: int,
         *,
         server_name: str | None = None,
         config: _t.Config | None = None,
@@ -1052,11 +1073,13 @@ class SendStream:
     """The sending half of a stream.
 
     `finish()` ends it cleanly, `reset(code)` abandons it (unsent data is
-    dropped). Both are idempotent in effect: a later call fails with
-    `StreamError` (kind `ClosedLocally`). Use `async with` to finish on a
-    normal exit and reset on an exception; leaving a stream neither
-    finished nor reset keeps it half-open until the session ends. One
-    operation at a time: a second concurrent call raises `RuntimeError`."""
+    dropped). A later call fails with `StreamClosedError`. Use `async with`
+    to finish on a normal exit and reset with `ZMUX_CANCELLED` on an
+    exception; leaving a stream neither finished nor reset keeps it
+    half-open until the session ends. One operation at a time: a second
+    concurrent call raises `StreamBusyError`. The runtime settings
+    `send_buffer`, `scheduler` and `redundant` are writable properties and
+    read back as in force."""
 
     @property
     def id(self) -> int | None:
@@ -1067,9 +1090,12 @@ class SendStream:
         assigning a `Priority` or `(urgency, incremental)` changes it."""
     @priority.setter
     def priority(self, priority: _Prio) -> None: ...
-    async def write(self, data: bytes) -> None:
-        """Writes all of `data`, waiting for flow control. If cancelled, a
-        prefix of `data` may have been sent."""
+    async def write(self, data: bytes) -> int:
+        """Writes all of `data`, waiting for flow control, and returns the
+        number of bytes taken (`len(data)`). Not cancellation-safe in the
+        sense of leaving the stream unchanged: if cancelled, a prefix of
+        `data` may have been sent and nothing says how much, so a stream
+        whose write was cancelled is to be reset, not written to again."""
     async def flush(self) -> None:
         """Opens the stream now and waits until the opening frame and the data
         written so far left for a carrier: the peer sees the stream even with
@@ -1079,15 +1105,16 @@ class SendStream:
         frame owed."""
     async def finish(self) -> None:
         """Ends the stream (FIN) after the written data."""
-    def reset(self, code: int = 0) -> None:
+    def reset(self, code: int) -> None:
         """Abandons the stream with an application error code (< 2**62);
         never blocks, like `asyncio.Transport.abort`. While a write is in
         progress the reset follows once that write returns or is
         cancelled. During the read drain after the peer's close it raises
         the session's error; the exit of `async with` ignores it."""
-    async def write_chunk(self, buffer: Buffer) -> None:
-        """Writes any buffer-protocol object without copying it; the caller
-        does not modify it afterwards."""
+    async def write_chunk(self, buffer: Buffer) -> int:
+        """Writes any buffer-protocol object without copying it, and returns
+        the number of bytes taken; the caller does not modify it afterwards.
+        Cancelled, it may have sent a prefix, as `write`."""
     def set_reliable_boundary(self) -> None:
         """Marks the bytes written so far as delivered even if the stream is
         reset later (RESET_STREAM_AT Reliable Size)."""
@@ -1097,14 +1124,25 @@ class SendStream:
     async def wait_send_capacity(self, minimum: int) -> int:
         """Waits until the send capacity is at least `minimum` (>= 1), or above 0
         while nothing is unsent, and returns it; the stream's error otherwise."""
-    def set_send_buffer(self, n: int) -> None:
-        """The written-but-unreleased bytes this part may hold."""
-    def set_scheduler(self, scheduler: Scheduler | str | None) -> None:
-        """The part's scheduling policy; `None` follows the session's."""
-    def set_redundant(self, on: bool | None) -> None:
-        """Sends the part's chunks redundantly on a second pipe of the tier
-        (multipath): `True` on, `False` off, `None` following the session's
-        `redundancy`."""
+    @property
+    def send_buffer(self) -> int:
+        """The written-but-unreleased bytes this part may hold: the last
+        assignment, else the session's `Config.send_buffer`."""
+    @send_buffer.setter
+    def send_buffer(self, n: int) -> None: ...
+    @property
+    def scheduler(self) -> Scheduler | None:
+        """The part's scheduling policy; `None` (the default, and assigned)
+        follows the session's. A name is accepted when assigning."""
+    @scheduler.setter
+    def scheduler(self, scheduler: Scheduler | str | None) -> None: ...
+    @property
+    def redundant(self) -> bool | None:
+        """Whether the part's chunks go redundantly on a second pipe of the
+        tier (multipath): `True` on, `False` off, `None` (the default)
+        following the session's `redundancy`."""
+    @redundant.setter
+    def redundant(self, on: bool | None) -> None: ...
     def max_datagram_size(self, context: int = 0) -> int | None:
         """The largest payload the peer currently accepts in a datagram of
         this stream with the context ID `context`; `None` without datagram
@@ -1123,7 +1161,11 @@ class RecvStream:
     """The receiving half of a stream; `async for chunk in stream` reads to the end.
 
     `stop(code)` asks the peer to stop sending. Cancelling a pending read
-    loses no data. `async with` stops the stream on an exception."""
+    loses no data. Leaving `async with` stops the stream with code 0 (a
+    no-op once it ended; it returns at once). `async for` ends silently at the end of the stream and raises
+    the stream's error otherwise. The runtime settings `receive_window` and
+    `peer_priority` are writable properties and read back as last
+    assigned."""
 
     @property
     def id(self) -> int | None:
@@ -1155,7 +1197,7 @@ class RecvStream:
     async def read_to_end(self, limit: int = 16777216) -> bytes:
         """The rest of the stream; `LimitExceededError` beyond `limit` bytes.
         A cancelled call loses no byte."""
-    def stop(self, code: int = 0) -> None:
+    def stop(self, code: int) -> None:
         """Asks the peer to stop sending (STOP_SENDING) with an application
         error code; never blocks. While a read is in progress the stop
         follows once that read returns or is cancelled. During the read
@@ -1167,14 +1209,21 @@ class RecvStream:
     def reject(self) -> None:
         """Declines the stream before reading it (ZMUX_REJECTED); the handle,
         and the sending one of a stream not written to, are used up."""
-    def set_receive_window(self, initial: int, maximum: int) -> None:
-        """The stream's receive window: `initial` now, auto-tuned up to
-        `maximum`."""
-    def set_peer_priority(self, priority: _Prio) -> None:
-        """Asks the peer to send the stream with `priority`."""
-    async def read_datagram(self) -> tuple[int, bytes]:
-        """The next datagram of the stream: `(context, payload)`; ends with
-        the stream's error."""
+    @property
+    def receive_window(self) -> tuple[int, int]:
+        """The stream's receive window, `(window, maximum)`: the window now
+        advertised, which auto-tuning raises up to `maximum`."""
+    @receive_window.setter
+    def receive_window(self, window: tuple[int, int]) -> None: ...
+    @property
+    def peer_priority(self) -> Priority | None:
+        """The priority last asked of the peer for the stream (assigned as a
+        `Priority` or `(urgency, incremental)`, or given at opening); `None`
+        when none was asked."""
+    @peer_priority.setter
+    def peer_priority(self, priority: _Prio) -> None: ...
+    async def read_datagram(self) -> StreamDatagram:
+        """The next datagram of the stream; ends with the stream's error."""
     def stats(self) -> StreamStats:
         """A snapshot of the stream; its final values once the session released it."""
     def __aiter__(self) -> Self: ...
@@ -1186,8 +1235,9 @@ class RecvStream:
 class Pipe:
     """One pipe (carrier) of a multipath session. `close()` removes it
     gracefully (drain), `abort()` at once; `async with` closes it on a
-    normal exit and aborts on an exception. Watch `Session.events()` for
-    its state changes."""
+    normal exit and aborts on an exception; `await wait_closed()` waits for
+    its end. Watch `Session.events()` for its state changes. Its runtime
+    settings change only through `update`."""
 
     @property
     def id(self) -> _t.PipeId:
@@ -1219,7 +1269,7 @@ class Pipe:
         `joined()` returned and the peer acknowledged a byte of it (an
         inbound-only pipe: once a record arrived). `PipeError` if the join
         failed or the pipe ended first; bound it with `asyncio.timeout`."""
-    async def closed(self) -> None:
+    async def wait_closed(self) -> None:
         """Waits until the pipe ended: returns once every direction closed
         (or the session released it); `PipeError` if it failed or the
         session ended first."""
@@ -1233,24 +1283,17 @@ class Pipe:
         weight: int | _t.Clear = ...,
         probation: float | _t.Auto | _t.Clear | None = ...,
         liveness: _t.PipeLiveness | _t.Clear = ...,
+        quality_band: QualityBand | _t.Clear = ...,
     ) -> None:
         """Changes these settings together (both receive fields: one
         PIPE_STATUS). A keyword left out keeps its value; `zmux.CLEAR`
         clears it (the `send_*` fields then follow the peer's request, the
         `receive_*` fields request the default again, `weight` is 1,
-        `probation` and `liveness` follow the session's); a value sets it
-        (`probation=None` turns probation off). A field fixed when the pipe
+        `probation`, `liveness` and `quality_band` follow the session's); a
+        value sets it (`probation=None` turns probation off). A field fixed when the pipe
         is added or an unknown name raises `TypeError`; an invalid value
         raises `ValueError` and changes nothing. Nothing is sent for
         `liveness`."""
-    def set_send_priority(self, priority: int) -> None:
-        """Sets the tier of the local outbound direction (`update`)."""
-    def set_receive_priority(self, priority: int) -> None:
-        """Requests a tier for the peer's outbound direction (`update`)."""
-    def set_send_standby(self, standby: bool) -> None:
-        """Sets whether the local outbound direction is standby (`update`)."""
-    def set_receive_standby(self, standby: bool) -> None:
-        """Requests standby for the peer's outbound direction (`update`)."""
     def close(self) -> None:
         """Removes the pipe gracefully: PIPE_ABANDON and drain."""
     def abort(self) -> None:
@@ -1258,8 +1301,6 @@ class Pipe:
     def stats(self) -> PipeStats | None:
         """A snapshot; `None` once the pipe is retired or the session
         released it (reads never raise; operations then raise `PipeError`)."""
-    def set_quality_band(self, band: QualityBand | None) -> None:
-        """The pipe's own quality band; `None` uses the session's."""
     async def __aenter__(self) -> Self: ...
     async def __aexit__(self, *exc: object) -> Literal[False]: ...
 
@@ -1287,18 +1328,23 @@ class Session:
     most) and `abort(code, reason)` ends it at once; both return at once
     and are idempotent, and `await wait_closed()` waits for the end.
     `await shutdown()` sends GOAWAY and closes once the open streams ended.
-    `async with` closes and waits on a normal exit and aborts with code 0
-    on an exception; `async for send, recv in session` accepts
-    bidirectional streams until it ends."""
+    `async with` closes and waits on a normal exit; an exit by an exception
+    starts a close with `ZMUX_CANCELLED` and an empty reason and returns at
+    once, so the peer can tell it from a normal end. `async for send, recv in
+    session` accepts bidirectional streams until the session ends: silently
+    when it was closed by either application with code 0, with the session's
+    error otherwise. The runtime settings `scheduler`, `quality_band`,
+    `capacity_floor`, `shaper`, `shaping_limits` and `liveness` are writable
+    properties; an invalid value raises `ValueError` and changes nothing."""
 
     @staticmethod
-    async def connect(pipe: PipeIo, config: _t.Config | None = None) -> Session:
+    async def connect(pipe: PipeIo, *, config: _t.Config | None = None) -> Session:
         """Establishes a session as the dialling side of `pipe`."""
     @staticmethod
-    async def accept(pipe: PipeIo, config: _t.Config | None = None) -> Session:
+    async def accept(pipe: PipeIo, *, config: _t.Config | None = None) -> Session:
         """Establishes a single-pipe session as the accepting side of `pipe`."""
     @staticmethod
-    async def symmetric(pipe: PipeIo, config: _t.Config | None = None) -> Session:
+    async def symmetric(pipe: PipeIo, *, config: _t.Config | None = None) -> Session:
         """Establishes a session over a symmetric carrier: the roles are
         negotiated (role auto)."""
     @property
@@ -1315,7 +1361,7 @@ class Session:
         pipe_carrier: bool = False,
         priority: _Prio | None = None,
         peer_priority: _Prio | None = None,
-    ) -> tuple[SendStream, RecvStream]:
+    ) -> BiStream:
         """Opens a bidirectional stream, waiting for stream credit; the
         preamble (`info`, `tlvs`, `pipe_carrier`) is fixed before its first
         frame. A cancelled open leaves no stream behind for the caller."""
@@ -1327,9 +1373,9 @@ class Session:
         pipe_carrier: bool = False,
         priority: _Prio | None = None,
         peer_priority: _Prio | None = None,
-    ) -> tuple[SendStream, RecvStream]:
+    ) -> BiStream:
         """Opens a bidirectional stream if stream credit is available now;
-        `OpenError` otherwise. Never waits."""
+        `StreamError` of kind `Blocked` (retryable) otherwise. Never waits."""
     async def open_stream_pair(
         self,
         *,
@@ -1338,9 +1384,11 @@ class Session:
         priority: _Prio | None = None,
         peer_priority: _Prio | None = None,
         high_water: int = 65536,
+        limit: int = 65536,
     ) -> tuple[StreamPairReader, StreamPairWriter]:
         """Opens a bidirectional stream as an asyncio-style pair: the reader
-        offers `asyncio.StreamReader`'s reads, the writer
+        offers `asyncio.StreamReader`'s reads (`limit` its buffer limit, as
+        `asyncio.open_connection(limit=...)`), the writer
         `asyncio.StreamWriter`'s writes (`high_water` the queued bytes
         above which `drain` waits). The other keywords are `open_bi`'s."""
     async def open_pipe_stream(
@@ -1352,10 +1400,24 @@ class Session:
         """Opens a carrier stream (PIPE_CARRIER) with the open info `info`
         and the application TLVs `tlvs`, as the pipe input of a nested
         session."""
-    def set_quality_band(self, band: QualityBand | None) -> None:
-        """The default quality band of the session's pipes; `None`: no reports."""
-    def set_capacity_floor(self, floor: CapacityFloor | None) -> None:
-        """The floor under the session's outbound capacity; `None`: none."""
+    @property
+    def quality_band(self) -> QualityBand | None:
+        """The default quality band of the session's pipes; `None` (the
+        default): no reports."""
+    @quality_band.setter
+    def quality_band(self, band: QualityBand | None) -> None: ...
+    @property
+    def capacity_floor(self) -> CapacityFloor | None:
+        """The floor under the session's outbound capacity; `None` (the
+        default): none."""
+    @capacity_floor.setter
+    def capacity_floor(self, floor: CapacityFloor | None) -> None: ...
+    @property
+    def scheduler(self) -> Scheduler:
+        """The default scheduling policy of new stream data: the
+        configuration's until assigned (a name is accepted when assigning)."""
+    @scheduler.setter
+    def scheduler(self, scheduler: Scheduler | str) -> None: ...
     async def open_uni(
         self,
         *,
@@ -1364,7 +1426,7 @@ class Session:
         priority: _Prio | None = None,
     ) -> SendStream:
         """Opens a unidirectional stream."""
-    async def accept_bi(self) -> tuple[SendStream, RecvStream]:
+    async def accept_bi(self) -> BiStream:
         """The next bidirectional stream the peer opened;
         `SessionClosedError` once the session ended."""
     async def accept_uni(self) -> RecvStream:
@@ -1392,7 +1454,8 @@ class Session:
         exits right after `close` awaits `wait_closed()` first. Idempotent
         with `abort`: the first call of either decides what is sent, code and
         reason included; an `abort` while the close is still flushing ends it
-        at once. The peer sees `CloseInfo(code, reason, remote=True)`."""
+        at once. The peer's `wait_closed()` returns an `ApplicationClosedError` with
+        `code`, `reason` and `remote=True`."""
     def abort(self, code: int, reason: bytes = b"") -> None:
         """Ends the session at once with the application error `code` and
         `reason`, draining nothing: unsent data is discarded and
@@ -1401,8 +1464,9 @@ class Session:
         later call of either sends nothing more."""
     async def shutdown(self, code: int = 0, reason: bytes = b"") -> None:
         """Graceful: GOAWAY, then close once the streams ended."""
-    async def wait_closed(self) -> CloseInfo:
-        """Waits for the session's whole end and tells why it ended. It
+    async def wait_closed(self) -> SessionClosedError:
+        """Waits for the session's whole end and returns the
+        `SessionClosedError` that describes it (it is not raised). It
         returns once every pipe's inbound side has ended (the peer read the
         close and ended its side) or the linger timeout has passed, so a
         return before the linger confirms that the peer read the close. For
@@ -1425,24 +1489,18 @@ class Session:
         reads: each event goes to one reader."""
     def stats(self) -> SessionStats:
         """A snapshot of the session."""
-    def set_shaper(
-        self,
-        *,
-        definition: str | None = None,
-        by_kind: Mapping[_t.CarrierKind | str | None, str] | None = None,
-        by_variant: Mapping[str, str] | None = None,
-        limits: _t.ShapingSizeLimits | None = None,
-        seed: bytes | None = None,
-        budget: Callable[[], _t.ShapingBudget] | None = None,
-    ) -> None:
-        """Shapes every outbound pipe by the JSON `definition`, under `budget`, called once here,
-        bounded by `limits`; none: no shaping. `by_kind` maps carrier kinds
-        (`None`: the default, for a pipe of no kind or of a kind not listed)
-        to definitions in the JSON form, and `by_variant` carrier variants,
-        which come first; a pipe without a definition is not
-        shaped. `seed` (for tests) makes
-        every pipe draw the same deterministic sequence instead of the
-        operating system's generator; never use it for real traffic."""
+    @property
+    def shaper(self) -> InstalledShaper | None:
+        """The shaper in force on every outbound pipe, the `Config`'s or the
+        last one assigned, as an opaque `InstalledShaper`; `None` for no
+        shaping. Assigning takes a `Shaper` (a JSON definition, or
+        definitions by carrier kind and by variant, with limits, a seed and
+        a budget), a `ShapingBundle`, an `InstalledShaper` or `None`; an
+        invalid definition raises `ValueError` and changes nothing."""
+    @shaper.setter
+    def shaper(
+        self, shaper: _t.Shaper | ShapingBundle | InstalledShaper | None
+    ) -> None: ...
     @property
     def shaping_limits(self) -> _t.ShapingLimits:
         """The session's shaping limits. Assigning replaces them, also
@@ -1504,15 +1562,12 @@ class Session:
         """Adds a carrier as a further pipe (multipath). Returns once the peer
         attached it, or with `options.return_on_reply` once the Reply was
         verified; `Config.join_timeout` bounds the call. A pipe not attached
-        by then is aborted and `TimeoutError` raised; one that fails or is
+        by then is aborted and `DeadlineExceededError` raised; one that fails or is
         removed first raises the pipe error, the session's end the session
         error; a cancelled call aborts the pipe. A failed call leaves no pipe."""
     def maintain_pipes(self, pool: PipePool) -> MaintainHandle:
         """Keeps `pool`'s pipes up (dials, redials with backoff, rotation, the
         pool policy's decisions); needs a running event loop, on which `dial` runs."""
-    @property
-    def join_ready(self) -> bool:
-        """Whether a pipe added now would join at once rather than wait for the handshake."""
     def revalidate_pipes(self) -> None:
         """Probes every live outbound pipe again, for example after a network change."""
     def advance_epoch(self) -> None:
@@ -1590,144 +1645,63 @@ class Session:
     async def __aenter__(self) -> Self: ...
     async def __aexit__(self, *exc: object) -> Literal[False]: ...
     def __aiter__(self) -> Self: ...
-    async def __anext__(self) -> tuple[SendStream, RecvStream]: ...
+    async def __anext__(self) -> BiStream: ...
 
 @final
 class Listener:
     """Accepts sessions (and multipath joins) from any number of carriers.
-    Each `serve_*` binds `addr` (port 0 picks one) and returns the bound
-    address. `async for session in listener` until `close()`."""
+    Each `serve_*` binds `host` and `port` (port 0 picks one) and returns the
+    bound address as `(host, port)`. `async for session in listener` until
+    `close()` (the loop ends silently, as `accept` raises
+    `ListenerClosedError`). `config` is the `Config` of its sessions,
+    `listener_config` the `ListenerConfig`; each left out is the default."""
 
     def __init__(
         self,
-        config: _t.Config | None = None,
         *,
-        max_pending: int | None = 1024,
-        max_pending_per_source: int = 8,
-        source_prefix_v4: int = 32,
-        source_prefix_v6: int = 64,
-        max_pending_per_session: int = 4,
-        first_record_timeout: float = 2.0,
-        handshake_timeout: float = 10.0,
-        max_record_size: int = 65535,
-        accept_sessions: bool = True,
-        max_suspended: int = 1024,
-        memory_budget: int | None = 1 << 30,
-        instance_id: bytes = b"",
-        on_memory_pressure: Callable[[int, int, bool], None] | None = None,
-        trusted_proxies: list[str] | None = None,
-        forwarded_header: str | None = None,
-        proxy_protocol: bool = False,
-        admission: Admission | None = None,
-        inbound_transform: Callable[[PipeIo, PipeHint], Awaitable[PipeIo] | PipeIo]
-        | None = None,
-        on_reject: Callable[[_t.RejectInfo], _t.RejectAction | str] | None = None,
-        secure_server: SecureServer | None = None,
-        session_config: Callable[[_t.SessionCarrier], _t.Config | None] | None = None,
-        logger: logging.Logger | None = None,
-    ) -> None:
-        """Arguments left out keep the library's defaults. `max_pending`
-        (1024; `None`: unlimited) bounds every carrier before it enters a
-        session, from its source slot through the outer handshake, the
-        admission, the transform, classification and join verification;
-        when it is full the oldest stalled carrier makes room, else the new
-        one is closed. `max_pending_per_source` (8) bounds those of one
-        source, a source counted by its first `source_prefix_v4` bits (1 to
-        32, default 32: the address on its own) when IPv4 and its first
-        `source_prefix_v6` bits (1 to 128, default 64) when IPv6, ports
-        ignored and an IPv4-mapped IPv6 address counted as IPv4; the same
-        aggregation serves the source's stalled carriers, the stall duration
-        and the limit on failed join verifications, and a value outside its
-        range raises `ValueError`; `max_pending_per_session` (4) the pending joins of one
-        session. `first_record_timeout` (2 s) and `handshake_timeout`
-        (10 s) bound carriers that have not proved anything; they have no
-        off setting (`None` raises `ValueError`). `max_record_size`
-        (65535), `accept_sessions` (`True`), `max_suspended` (1024),
-        `memory_budget` (1 GiB; `None`: unlimited). `instance_id` (at most 8
-        bytes) starts every session locator, for load-balancer stickiness.
-        `session_config(carrier)` runs once for every carrier that starts a
-        session, never for a join, on a native thread holding the GIL (quick,
-        not blocking), and returns its `Config`, or `None` for the listener's;
-        joins verify with the session's own. The listener's memory budget and
-        carrier-level bounds stay its own. An invalid configuration, an
-        exception or another value closes the carrier without a byte, counted
-        as `rejected`.
-        `on_memory_pressure(used, budget, active)` is called when memory
-        pressure starts and ends.
-
-        Behind reverse proxies, load balancers or CDNs, `trusted_proxies`
-        lists their networks (`"10.0.0.0/8"`, a bare address): a carrier from
-        one of them has as its source, for the per-source limits and the
-        admission, the client the intermediary reports, in a PROXY protocol
-        header with `proxy_protocol`, or in the HTTP header field
-        `forwarded_header` (`Forwarded`, or a list such as
-        `X-Forwarded-For`). Reports from other peers are ignored.
-
-        `admission` applies at every entry (every `serve_*` and
-        `handle_pipe`), in one order: the carrier takes a slot of its
-        source's `max_pending_per_source` (refused at once beyond it), then
-        its outer handshake (TLS, HTTP upgrade, QUIC), then the admission,
-        then its first record.
-
-        `inbound_transform(pipe, hint)` runs once for every carrier after its
-        admission and before its first record, each half of a split
-        bootstrap included, and returns the carrier the listener goes on
-        with (typically `await pipe.wrap(layer, server_side=True)`, or `pipe`
-        itself); `async`, it runs on the event loop of the listener's
-        creation, which must be running (`RuntimeError` otherwise). It holds
-        the carrier's source slot and `handshake_timeout` bounds it (then it
-        is cancelled); the first-record timeout runs from its return. A
-        carrier of another kind (other halves or framing), an exception or
-        the bound closes the carrier as a setup failure; an exception other
-        than a cancellation is reported as unraisable.
-
-        `on_reject(info)` decides what happens to an unauthenticated carrier:
-        an unknown Locator, a failed Hello, a refused Establish. Nothing is sent
-        either way. `secure_server` runs Establish on every new carrier; it is a
-        transform, so not together with `inbound_transform`.
-
-        `logger` receives the failures of the listener's own callbacks that it
-        contains; its sessions log through their `Config.logger`.
-        """
-    def join_prefix(self, prefix: bytes) -> tuple[_t.JoinPrefix, int]:
-        """For an admission's `decide`: whether `prefix`, a byte-stream
-        carrier's first bytes, begins a Join Hello whose Locator names a
-        current session of this listener: `(JoinPrefix, need)`, `need` the
-        bytes wanted in all for `NEED_MORE` (ask for them with `AdmissionVerdict.more`;
-        the admission's `max_peek` must allow it) and 0 otherwise. Advisory:
-        the join still authenticates, and a session that ended meanwhile
-        makes the Locator unknown."""
-    async def serve_tcp(self, addr: str) -> str:
-        """Serves plain TCP on `addr`; returns the bound address. With the
-        listener's `admission`, a connection reaches it only once admitted."""
-    async def serve_tls(self, addr: str, *, tls: TlsConfig) -> str:
+        config: _t.Config | None = None,
+        listener_config: _t.ListenerConfig | None = None,
+    ) -> None: ...
+    async def serve_tcp(self, host: str, port: int) -> tuple[str, int]:
+        """Serves plain TCP on `host` and `port`; returns the bound address.
+        With the listener's `admission`, a connection reaches it only once
+        admitted."""
+    async def serve_tls(
+        self, host: str, port: int, *, tls: TlsConfig
+    ) -> tuple[str, int]:
         """Without ALPN identifiers in `tls`, zmux's are accepted. The
         admission decides after the handshake, with its exporter."""
     async def serve_quic(
         self,
-        addr: str,
+        host: str,
+        port: int,
         *,
         tls: TlsConfig,
-        lanes: int = 4,
+        lanes: int = DEFAULT_LANES,
         zero_rtt: bool = False,
-    ) -> str:
+    ) -> tuple[str, int]:
         """With `zero_rtt`, 0-RTT is accepted when `Config(carrier_early_data=True)`.
         With the listener's `admission`, the prefix is the first stream's
         first bytes; it excludes `zero_rtt` (ValueError)."""
-    async def serve_http3(self, addr: str, *, tls: TlsConfig, lanes: int = 4) -> str:
+    async def serve_http3(
+        self, host: str, port: int, *, tls: TlsConfig, lanes: int = DEFAULT_LANES
+    ) -> tuple[str, int]:
         """With the listener's `admission`, each request is decided on the
         first bytes of its body."""
     async def serve_webtransport(
-        self, addr: str, *, tls: TlsConfig, lanes: int = 4
-    ) -> str:
+        self, host: str, port: int, *, tls: TlsConfig, lanes: int = DEFAULT_LANES
+    ) -> tuple[str, int]:
         """With the listener's `admission`, each session request is decided
         on its request head (no prefix), with the QUIC connection's exporter."""
-    async def serve_websocket(self, addr: str, *, tls: TlsConfig | None = None) -> str:
+    async def serve_websocket(
+        self, host: str, port: int, *, tls: TlsConfig | None = None
+    ) -> tuple[str, int]:
         """With the listener's `admission`, each upgrade is decided on its
         request head (no prefix), with the TLS exporter under `tls`."""
     async def serve_http(
         self,
-        addr: str,
+        host: str,
+        port: int,
         *,
         path: str = "/zmux",
         tls: TlsConfig | None = None,
@@ -1735,7 +1709,7 @@ class Listener:
         websocket: bool = False,
         websocket_no_subprotocol: bool = False,
         pair_field: str | None = None,
-    ) -> str:
+    ) -> tuple[str, int]:
         """One HTTP endpoint for every HTTP carrier: HTTP/1.1 and HTTP/2
         (prior knowledge, or ALPN with `tls`), each request classified by its
         head: bidirectional, uplink and downlink requests and split
@@ -1816,6 +1790,20 @@ class ReplayFilter:
         """Checks `key` with the clock at `now` (Unix milliseconds)."""
     def __len__(self) -> int:
         """The keys held now."""
+
+def join_prefix(listener: Listener, prefix: bytes) -> tuple[_t.JoinPrefix, int]:
+    """For an admission's `decide`: whether `prefix`, a byte-stream
+    carrier's first bytes, begins a Join Hello whose Locator names a current
+    session of `listener`: `(JoinPrefix, need)`, `need` the bytes wanted in
+    all for `NEED_MORE` (ask for them with `AdmissionVerdict.more`; the
+    admission's `max_peek` must allow it) and 0 otherwise. Advisory: the
+    join still authenticates, and a session that ended meanwhile makes the
+    Locator unknown."""
+
+def join_ready(session: Session) -> bool:
+    """Whether a pipe added to `session` now would join at once rather than
+    wait: its join keys are in place, it has room for a join, and no join
+    backoff is running."""
 
 def classify_first_bytes(
     data: bytes, *, framing: _t.Framing | str = "byte_stream"
@@ -1964,7 +1952,7 @@ class SigningKey:
 
 @final
 class SecureServer:
-    """The server's side of Establish, for `Listener(secure_server=...)`. `shaper`, a
+    """The server's side of Establish, for `ListenerConfig(secure_server=...)`. `shaper`, a
     `ShapingBundle` or a callable, is asked before a handshake message with a
     `HandshakeView` and returns a `UnitPlan`, or `None` for no plan.
     `accepted_profiles` (unset: 1 and 3; empty raises `ValueError`) is the only way to accept a
@@ -2030,6 +2018,12 @@ async def establish(
     server's (`DEFAULT_MAX_APP_DATA` bytes; `None`: no bound beyond the message);
     `require_pq_auth` fails a server without post-quantum authentication; `signer`
     proves message 3 for a server whose verdict names its key."""
+
+@final
+class InstalledShaper:
+    """The shaper in force on a session's outbound pipes, as `Session.shaper`
+    reads it: opaque, and assignable to the `Session.shaper` of another
+    session (without a budget)."""
 
 @final
 class ShapingBundle:

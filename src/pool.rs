@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use pyo3::exceptions::{PyRuntimeError, PyTypeError, PyValueError};
+use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyString};
 use pyo3_async_runtimes::TaskLocals;
@@ -238,6 +238,7 @@ pub(crate) struct PipePool {
     choice: Option<(zmux::CarrierChoice, zmux::CarrierChoicePolicy)>,
     options: zmux::PipeOptions,
     rotate: Option<zmux::helpers::RotatePolicy>,
+    backoff: Option<zmux::Backoff>,
     policy: Option<Arc<StdMutex<MachinePoolPolicy>>>,
     decision_rejected: Option<Arc<Py<PyAny>>>,
 }
@@ -252,8 +253,8 @@ impl PipePool {
     /// in seconds. An invalid choice or policy raises `ValueError`.
     #[new]
     #[pyo3(signature = (count=1, dial=None, *, join=None, choice=None, choice_policy=None,
-        rotate_max_bytes=None, rotate_max_age=None, rotate_jitter=0.0, pool_policy=None,
-        options=None, decision_rejected=None))]
+        rotate_max_bytes=None, rotate_max_age=None, rotate_jitter=0.0, backoff=None,
+        pool_policy=None, options=None, decision_rejected=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         count: usize,
@@ -264,6 +265,7 @@ impl PipePool {
         rotate_max_bytes: Option<u64>,
         rotate_max_age: Option<f64>,
         rotate_jitter: f64,
+        backoff: Option<Bound<'_, PyAny>>,
         pool_policy: Option<Bound<'_, PyAny>>,
         options: Option<Bound<'_, PyAny>>,
         decision_rejected: Option<Py<PyAny>>,
@@ -297,6 +299,7 @@ impl PipePool {
             rotate_max_bytes,
             rotate_max_age,
             rotate_jitter,
+            backoff,
             pool_policy,
             options,
             decision_rejected,
@@ -320,6 +323,7 @@ impl PipePool {
         rotate_max_bytes: Option<u64>,
         rotate_max_age: Option<f64>,
         rotate_jitter: f64,
+        backoff: Option<Bound<'_, PyAny>>,
         pool_policy: Option<Bound<'_, PyAny>>,
         options: Option<Bound<'_, PyAny>>,
         decision_rejected: Option<Py<PyAny>>,
@@ -350,6 +354,7 @@ impl PipePool {
             join: join.map(Arc::new),
             choice,
             options: pipe_options(options)?,
+            backoff: backoff.as_ref().map(crate::backoff_of).transpose()?,
             rotate,
             policy: pool_policy
                 .map(|p| PoolPolicy::of(&p))
@@ -407,6 +412,9 @@ impl PipePool {
         if let Some(r) = self.rotate {
             p = p.with_rotate(r);
         }
+        if let Some(b) = self.backoff {
+            p = p.with_backoff(b);
+        }
         if let Some(s) = &self.policy {
             p = p.with_policy(Shared(s.clone()));
         }
@@ -447,8 +455,12 @@ impl MaintainHandle {
 /// Keeps `pool`'s pipes of `session` up; called with a running event loop,
 /// on which the pool's `dial` runs.
 pub(crate) fn maintain(py: Python<'_>, s: &Session, pool: &PipePool) -> PyResult<MaintainHandle> {
-    let locals = pyo3_async_runtimes::tokio::get_current_locals(py)
-        .map_err(|_| PyRuntimeError::new_err("maintain_pipes needs a running event loop"))?;
+    let locals = pyo3_async_runtimes::tokio::get_current_locals(py).map_err(|_| {
+        crate::new_err(
+            "NoRunningLoopError",
+            "maintain_pipes needs a running event loop",
+        )
+    })?;
     let p = pool.native(locals);
     let _g = get_runtime().enter();
     Ok(MaintainHandle(

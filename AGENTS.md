@@ -8,7 +8,9 @@
   on every public item.
 - Options after the first argument are keyword-only.
 - Every coroutine stays cancellation-safe: a cancelled call leaves the
-  session, stream or pipe usable and leaks nothing.
+  session, stream or pipe usable and leaks nothing. The writes are the one
+  exception to "loses nothing": a cancelled write may have sent a prefix, and
+  its documentation says so.
 - Tests must not leak tasks, streams or file descriptors.
 - Never commit build outputs, IDE settings or other generated files.
 - Commit subjects are short, English and imperative.

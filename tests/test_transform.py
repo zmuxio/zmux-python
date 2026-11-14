@@ -70,12 +70,12 @@ def xor_layer(
 
 
 async def test_inbound_transform_wraps_and_sees_the_admitted_value() -> None:
-    hints: list[zmux.PipeHint] = []
+    hints: list[zmux.adapter.PipeHint] = []
 
     def decide(info: zmux.CarrierInfo, prefix: bytes) -> zmux.AdmissionVerdict:
         return zmux.AdmissionVerdict.accept(1, value={"user": prefix.decode()})
 
-    async def transform(pipe: zmux.PipeIo, hint: zmux.PipeHint) -> zmux.PipeIo:
+    async def transform(pipe: zmux.PipeIo, hint: zmux.adapter.PipeHint) -> zmux.PipeIo:
         hints.append(hint)
         wrapped = await pipe.wrap(xor_layer(0x5A), server_side=True)
         wrapped.write_overhead = 0
@@ -83,9 +83,11 @@ async def test_inbound_transform_wraps_and_sees_the_admitted_value() -> None:
 
     admission = zmux.Admission(decide, peek=1, peek_timeout=5)
     async with zmux.Listener(
-        admission=admission, inbound_transform=transform
+        listener_config=zmux.ListenerConfig(
+            admission=admission, inbound_transform=transform
+        )
     ) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+        addr = await listener.serve_tcp("127.0.0.1", 0)
 
         class Cred:
             def prefix(self, info: zmux.CarrierInfo) -> bytes:
@@ -94,7 +96,7 @@ async def test_inbound_transform_wraps_and_sees_the_admitted_value() -> None:
             def header(self, info: zmux.CarrierInfo) -> tuple[str, str]:
                 return ("x", "u")
 
-        pipe = await zmux.dial_tcp(addr, carrier_credential=Cred())
+        pipe = await zmux.dial_tcp(*addr, carrier_credential=Cred())
         pipe = await pipe.wrap(xor_layer(0x5A))
         async with asyncio.timeout(10):
             client_task = asyncio.ensure_future(zmux.Session.connect(pipe))
@@ -119,16 +121,18 @@ async def echo_one(session: zmux.Session) -> None:
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
 async def test_a_failing_transform_is_a_setup_failure() -> None:
-    async def transform(pipe: zmux.PipeIo, hint: zmux.PipeHint) -> zmux.PipeIo:
+    async def transform(pipe: zmux.PipeIo, hint: zmux.adapter.PipeHint) -> zmux.PipeIo:
         raise RuntimeError("no")
 
     async with zmux.Listener(
-        inbound_transform=transform, handshake_timeout=2
+        listener_config=zmux.ListenerConfig(
+            inbound_transform=transform, handshake_timeout=2
+        )
     ) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         with pytest.raises(zmux.ZmuxError):
             async with asyncio.timeout(10):
-                await zmux.connect_tcp(addr)
+                await zmux.connect_tcp(*addr)
         # Counted once the listener's handling returned, which may follow
         # the client's view of the close.
         async with asyncio.timeout(5):
@@ -138,12 +142,16 @@ async def test_a_failing_transform_is_a_setup_failure() -> None:
 
 def test_a_transform_needs_a_running_loop() -> None:
     with pytest.raises(RuntimeError):
-        zmux.Listener(inbound_transform=lambda pipe, hint: pipe)
+        zmux.Listener(
+            listener_config=zmux.ListenerConfig(
+                inbound_transform=lambda pipe, hint: pipe
+            )
+        )
 
 
 async def test_open_carrier_writes_once_per_write() -> None:
-    pipe, end = zmux.pipe_pair()
-    reader, writer = await zmux.open_carrier(pipe)
+    pipe, end = zmux.adapter.pipe_pair()
+    reader, writer = await zmux.adapter.open_carrier(pipe)
     # The in-memory pipe is a byte stream, which joins writes it holds
     # together: read each write before the next one.
     for chunk in (b"a", b"bc", b"def"):
@@ -168,10 +176,10 @@ def test_verdict_values() -> None:
 
 def test_write_overhead_bounds() -> None:
     for bad in (-1, 65536):
-        pipe, _ = zmux.pipe_pair()
+        pipe, _ = zmux.adapter.pipe_pair()
         with pytest.raises(ValueError):
             pipe.write_overhead = bad
-    pipe, _ = zmux.pipe_pair()
+    pipe, _ = zmux.adapter.pipe_pair()
     pipe.write_overhead = 65535
     assert pipe.write_overhead == 65535
     assert pipe.carrier_kind is None
@@ -188,18 +196,23 @@ async def test_an_unknown_join_goes_to_on_reject() -> None:
         return zmux.RejectAction.CLOSE
 
     async with (
-        zmux.Listener(config, instance_id=b"i") as home,
-        zmux.Listener(config, instance_id=b"i", on_reject=on_reject) as other,
+        zmux.Listener(
+            config=config, listener_config=zmux.ListenerConfig(instance_id=b"i")
+        ) as home,
+        zmux.Listener(
+            config=config,
+            listener_config=zmux.ListenerConfig(instance_id=b"i", on_reject=on_reject),
+        ) as other,
     ):
-        addr = await home.serve_tcp("127.0.0.1:0")
-        other_addr = await other.serve_tcp("127.0.0.1:0")
+        addr = await home.serve_tcp("127.0.0.1", 0)
+        other_addr = await other.serve_tcp("127.0.0.1", 0)
         server = asyncio.ensure_future(echo(home))
         async with (
             asyncio.timeout(10),
-            await zmux.connect_tcp(addr, config=config) as session,
+            await zmux.connect_tcp(*addr, config=config) as session,
         ):
             with pytest.raises(zmux.ZmuxError):
-                await session.add_pipe(await zmux.dial_tcp(other_addr))
+                await session.add_pipe(await zmux.dial_tcp(*other_addr))
             # Only the join failed.
             await round_trip(session)
             assert other.stats().rejected >= 1
@@ -210,9 +223,9 @@ async def test_an_unknown_join_goes_to_on_reject() -> None:
 
 async def test_pipe_loss_statistics() -> None:
     async with zmux.Listener() as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         server = asyncio.ensure_future(echo(listener))
-        async with await zmux.connect_tcp(addr) as session:
+        async with await zmux.connect_tcp(*addr) as session:
             await round_trip(session)
             (st,) = session.pipe_stats()
             assert st.bytes_lost in (0, None) and st.records_lost in (0, None)
@@ -225,22 +238,22 @@ async def test_choice_pool() -> None:
     config = zmux.Config(
         max_pipes=4, pipe_auth=zmux.PipeAuth.psk(b"k" * 32).with_end_to_end()
     )
-    async with zmux.Listener(config) as listener:
-        addr = await listener.serve_http("127.0.0.1:0")
+    async with zmux.Listener(config=config) as listener:
+        addr = await listener.serve_http("127.0.0.1", 0)
         server = asyncio.ensure_future(echo(listener))
         cache = zmux.CarrierCache()
-        choice = zmux.CarrierChoice.auto([zmux.Candidate.http(addr)])
+        choice = zmux.CarrierChoice.auto([zmux.Candidate.streaming(*addr)])
         with pytest.raises(ValueError):
-            zmux.PipePool(
+            zmux.helpers.PipePool(
                 2,
                 choice=choice,
                 choice_policy=zmux.CarrierChoicePolicy(timer_factor=-1),
             )
         with pytest.raises(ValueError):
-            zmux.PipePool(
+            zmux.helpers.PipePool(
                 2, choice=choice, choice_policy=zmux.CarrierChoicePolicy(settle=-1)
             )
-        pool = zmux.PipePool(
+        pool = zmux.helpers.PipePool(
             2,
             choice=choice,
             choice_policy=zmux.CarrierChoicePolicy(cache=cache, key="k"),
@@ -248,7 +261,7 @@ async def test_choice_pool() -> None:
         assert pool.count == 2
         async with (
             asyncio.timeout(20),
-            await zmux.connect_http(addr, config=config) as session,
+            await zmux.connect_streaming(*addr, config=config) as session,
         ):
             handle = session.maintain_pipes(pool)
             while len(session.pipes()) < 3:
@@ -272,14 +285,14 @@ EXIT_SCRIPT = textwrap.dedent(
         return pipe
 
     async def main():
-        listener = zmux.Listener(admission=zmux.Admission(decide, peek=0), inbound_transform=transform)
-        addr = await listener.serve_tcp("127.0.0.1:0")
+        listener = zmux.Listener(listener_config=zmux.ListenerConfig(admission=zmux.Admission(decide, peek=0), inbound_transform=transform))
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         sessions = []
 
         async def churn():
             while True:
                 try:
-                    sessions.append(await zmux.connect_tcp(addr))
+                    sessions.append(await zmux.connect_tcp(*addr))
                 except zmux.ZmuxError:
                     pass
 
@@ -358,16 +371,18 @@ async def test_a_tls_layer(tmp_path: Path) -> None:
         await writer.start_tls(client_ctx, server_hostname="localhost")
         return reader, writer
 
-    async def transform(pipe: zmux.PipeIo, hint: zmux.PipeHint) -> zmux.PipeIo:
+    async def transform(pipe: zmux.PipeIo, hint: zmux.adapter.PipeHint) -> zmux.PipeIo:
         wrapped = await pipe.wrap(server_tls, server_side=True)
         wrapped.write_overhead = 22
         return wrapped
 
-    async with zmux.Listener(inbound_transform=transform) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+    async with zmux.Listener(
+        listener_config=zmux.ListenerConfig(inbound_transform=transform)
+    ) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         server = asyncio.ensure_future(echo(listener))
         async with asyncio.timeout(10):
-            pipe = await (await zmux.dial_tcp(addr)).wrap(client_tls)
+            pipe = await (await zmux.dial_tcp(*addr)).wrap(client_tls)
             async with await zmux.Session.connect(pipe) as session:
                 await round_trip(session, b"t" * 300_000)
         server.cancel()

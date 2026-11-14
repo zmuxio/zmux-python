@@ -816,7 +816,7 @@ impl SecureServer {
 /// The verdict of a Python `on_reject`; one that raises closes the carrier.
 pub(crate) fn on_reject(f: Py<PyAny>) -> zmux::proto::listener::OnReject {
     use zmux::proto::listener::RejectAction;
-    zmux::proto::listener::OnReject(Arc::new(move |info| {
+    zmux::proto::listener::OnReject::new(move |info| {
         rt::attach(|py| {
             let asked = (|| -> PyResult<String> {
                 let mode = info
@@ -841,7 +841,7 @@ pub(crate) fn on_reject(f: Py<PyAny>) -> zmux::proto::listener::OnReject {
                 }
             }
         })
-    }))
+    })
 }
 
 /// `Config(record_policy=...)`: called with the carrier's description.

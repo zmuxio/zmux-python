@@ -10,7 +10,7 @@ import pytest
 import zmux
 
 NODE = hashlib.sha256(b"node").digest()
-HANDLE, PSK = zmux.derive_handle_psk(b"s" * 32, b"tests")
+HANDLE, PSK = zmux.adapter.derive_handle_psk(b"s" * 32, b"tests")
 CONFIG = zmux.Config(max_pipes=4)
 
 
@@ -80,14 +80,17 @@ async def round_trip(session: zmux.Session, data: bytes = b"over it") -> None:
 async def test_establish_join_and_modes() -> None:
     gate = Gate()
     async with zmux.Listener(
-        CONFIG, secure_server=zmux.SecureServer(gate, NODE)
+        config=CONFIG,
+        listener_config=zmux.ListenerConfig(
+            secure_server=zmux.SecureServer(gate, NODE)
+        ),
     ) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         server = asyncio.ensure_future(echo(listener))
         verifier = Trusting()
         async with asyncio.timeout(10):
             pipe, peer = await zmux.establish(
-                await zmux.dial_tcp(addr), verifier=verifier, handle=HANDLE, psk=PSK
+                await zmux.dial_tcp(*addr), verifier=verifier, handle=HANDLE, psk=PSK
             )
             assert verifier.seen is not None
             assert verifier.seen.role is zmux.Role.SERVER
@@ -98,7 +101,7 @@ async def test_establish_join_and_modes() -> None:
             assert peer.pq_confidential and not peer.pq_authenticated
             # A pin of what was seen passes, and a wrong one does not.
             again, _ = await zmux.establish(
-                await zmux.dial_tcp(addr),
+                await zmux.dial_tcp(*addr),
                 verifier=zmux.PinVerifier(zmux.static_key_id(peer.static_key)),
                 handle=HANDLE,
                 psk=PSK,
@@ -106,16 +109,16 @@ async def test_establish_join_and_modes() -> None:
             del again
             with pytest.raises(zmux.ZmuxError):
                 await zmux.establish(
-                    await zmux.dial_tcp(addr),
+                    await zmux.dial_tcp(*addr),
                     verifier=zmux.PinVerifier(bytes(32)),
                     handle=HANDLE,
                     psk=PSK,
                 )
-            async with await zmux.Session.connect(pipe, CONFIG) as session:
+            async with await zmux.Session.connect(pipe, config=CONFIG) as session:
                 assert session.weakest_record_mode is zmux.RecordMode.SEALED
                 await round_trip(session)
                 extra = await session.add_pipe(
-                    await zmux.dial_tcp(addr),
+                    await zmux.dial_tcp(*addr),
                     options=zmux.PipeOptions(
                         record_mode="sealed", key_group=zmux.KeyGroup.X25519
                     ),
@@ -143,12 +146,14 @@ async def test_a_websocket_join_takes_over_from_the_first_pipe(
         allow_record_mode=lambda *_: True,
     )
     server = zmux.SecureServer(Gate(), NODE)
-    async with zmux.Listener(config, secure_server=server) as listener:
+    async with zmux.Listener(
+        config=config, listener_config=zmux.ListenerConfig(secure_server=server)
+    ) as listener:
         if endpoint == "serve_http":
-            addr = await listener.serve_http("127.0.0.1:0", websocket=True)
+            addr = await listener.serve_http("127.0.0.1", 0, websocket=True)
         else:
-            addr = await listener.serve_websocket("127.0.0.1:0")
-        url = f"ws://{addr}/zmux"
+            addr = await listener.serve_websocket("127.0.0.1", 0)
+        url = f"ws://{addr[0]}:{addr[1]}/zmux"
         serving = asyncio.ensure_future(echo(listener))
         async with asyncio.timeout(20):
             pipe, _ = await zmux.establish(
@@ -157,7 +162,7 @@ async def test_a_websocket_join_takes_over_from_the_first_pipe(
                 handle=HANDLE,
                 psk=PSK,
             )
-            async with await zmux.Session.connect(pipe, config) as session:
+            async with await zmux.Session.connect(pipe, config=config) as session:
                 await round_trip(session)
                 first = session.pipes()[0]
                 extra = await session.add_pipe(
@@ -185,24 +190,26 @@ async def test_a_server_credential_and_the_shaper() -> None:
     probe = Trusting()
     calls: list[tuple[str, str]] = []
 
-    def shaper(v: zmux.HandshakeView) -> zmux.UnitPlan | None:
+    def shaper(v: zmux.shaping.HandshakeView) -> zmux.shaping.UnitPlan | None:
         calls.append((v.handshake, v.message))
         if v.message == "finish":
             raise ValueError("no plan from a hook that fails")
-        return zmux.UnitPlan(pad_to=600, delay=0.001)
+        return zmux.shaping.UnitPlan(pad_to=600, delay=0.001)
 
     gate = Gate()
     server = zmux.SecureServer(gate, NODE, shaper=shaper)
-    async with zmux.Listener(CONFIG, secure_server=server) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+    async with zmux.Listener(
+        config=CONFIG, listener_config=zmux.ListenerConfig(secure_server=server)
+    ) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         async with asyncio.timeout(10):
             _, peer = await zmux.establish(
-                await zmux.dial_tcp(addr), verifier=probe, handle=HANDLE, psk=PSK
+                await zmux.dial_tcp(*addr), verifier=probe, handle=HANDLE, psk=PSK
             )
             assert probe.seen is not None and probe.seen.credential is None
             gate.cred = (7, b"opaque")
             _, peer = await zmux.establish(
-                await zmux.dial_tcp(addr),
+                await zmux.dial_tcp(*addr),
                 verifier=probe,
                 handle=HANDLE,
                 psk=PSK,
@@ -228,24 +235,26 @@ async def test_each_profile(profile: int) -> None:
     handle, psk = (HANDLE, PSK) if with_psk else (b"", b"")
     gate = Gate()
     server = zmux.SecureServer(gate, NODE, accepted_profiles=[profile])
-    async with zmux.Listener(CONFIG, secure_server=server) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+    async with zmux.Listener(
+        config=CONFIG, listener_config=zmux.ListenerConfig(secure_server=server)
+    ) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         served = asyncio.ensure_future(echo(listener))
         async with asyncio.timeout(10):
             pipe, peer = await zmux.establish(
-                await zmux.dial_tcp(addr),
+                await zmux.dial_tcp(*addr),
                 verifier=Trusting(),
                 allowed_profiles=[profile],
                 handle=handle,
                 psk=psk,
             )
             assert peer.profile == profile
-            async with await zmux.Session.connect(pipe, CONFIG) as session:
+            async with await zmux.Session.connect(pipe, config=CONFIG) as session:
                 await round_trip(session, b"h" * 50_000)
             # Another Profile is refused, and nothing falls back.
             with pytest.raises(zmux.ZmuxError):
                 await zmux.establish(
-                    await zmux.dial_tcp(addr),
+                    await zmux.dial_tcp(*addr),
                     verifier=Trusting(),
                     allowed_profiles=[profile ^ 2 if with_psk else 9 - profile],
                     reply_timeout=0.3,
@@ -260,9 +269,9 @@ def test_a_bundle_chooses_a_candidate_and_plans() -> None:
       {"requires":["later"],"nonsense":1},
       {"handshakes":{"join":{"hello":{"pad_to":{"t":"a"},"delay":2000}}},
        "budget":{"wire":{"initial":500}}}]}}"""
-    b = zmux.ShapingBundle.from_json(text)
+    b = zmux.shaping.ShapingBundle.from_json(text)
     assert b.selected("default") == 1
-    assert b.plan("websocket", "join", "hello") == zmux.UnitPlan(
+    assert b.plan("websocket", "join", "hello") == zmux.shaping.UnitPlan(
         pad_to=100, delay=0.002
     )
     assert b.plan("default", "join", "reply") is None
@@ -270,9 +279,11 @@ def test_a_bundle_chooses_a_candidate_and_plans() -> None:
     assert budget is not None and budget.wire.initial == 500
     zmux.Config(shaping_bundle=b)
     with pytest.raises(ValueError, match="no_candidate"):
-        zmux.ShapingBundle.from_json('{"kinds":{"default":[{"requires":["later"]}]}}')
+        zmux.shaping.ShapingBundle.from_json(
+            '{"kinds":{"default":[{"requires":["later"]}]}}'
+        )
     with pytest.raises(ValueError, match="duplicate_key"):
-        zmux.ShapingBundle.from_json('{"kinds":{"default":[]},"kinds":{}}')
+        zmux.shaping.ShapingBundle.from_json('{"kinds":{"default":[]},"kinds":{}}')
 
 
 async def test_a_refused_establish_goes_to_on_reject() -> None:
@@ -284,13 +295,14 @@ async def test_a_refused_establish_goes_to_on_reject() -> None:
 
     server = zmux.SecureServer(Gate(psk=b"w" * 32), NODE)
     async with zmux.Listener(
-        CONFIG, secure_server=server, on_reject=on_reject
+        config=CONFIG,
+        listener_config=zmux.ListenerConfig(secure_server=server, on_reject=on_reject),
     ) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         async with asyncio.timeout(10):
             with pytest.raises(zmux.ZmuxError):
                 await zmux.establish(
-                    await zmux.dial_tcp(addr),
+                    await zmux.dial_tcp(*addr),
                     verifier=Trusting(),
                     handle=HANDLE,
                     psk=PSK,
@@ -319,14 +331,14 @@ async def test_record_policy_and_declare_end_to_end() -> None:
     server_config = zmux.Config(
         max_pipes=4, pipe_auth=auth.with_end_to_end(), allow_record_mode=allow
     )
-    async with zmux.Listener(server_config) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+    async with zmux.Listener(config=server_config) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         server = asyncio.ensure_future(echo(listener))
         async with asyncio.timeout(10):
-            async with await zmux.connect_tcp(addr, config=config) as session:
+            async with await zmux.connect_tcp(*addr, config=config) as session:
                 assert session.weakest_record_mode is zmux.RecordMode.UNMANAGED
                 session.declare_end_to_end()
-                extra = await session.add_pipe(await zmux.dial_tcp(addr))
+                extra = await session.add_pipe(await zmux.dial_tcp(*addr))
                 await extra.joined()
                 await round_trip(session)
         server.cancel()
@@ -364,15 +376,15 @@ async def test_a_secure_carrier_authorized_join_and_tracer() -> None:
     server_config = zmux.Config(
         max_pipes=4, pipe_auth=auth.with_end_to_end(), authorize_join=authorize
     )
-    async with zmux.Listener(server_config) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+    async with zmux.Listener(config=server_config) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         server = asyncio.ensure_future(echo(listener))
         async with asyncio.timeout(10):
-            async with await zmux.connect_tcp(addr, config=config) as session:
+            async with await zmux.connect_tcp(*addr, config=config) as session:
                 session.declare_end_to_end()
-                carrier = await zmux.dial_tcp(addr)
+                reader, writer = await asyncio.open_connection(*addr)
+                carrier = zmux.pipe_from_streams(reader, writer, max_record=4096)
                 carrier.declare_secure()
-                carrier.max_record = 4096
                 extra = await session.add_pipe(carrier)
                 await extra.joined()
                 await round_trip(session)
@@ -407,11 +419,13 @@ async def test_a_profile_without_a_key_is_accepted_only_when_listed() -> None:
     for listed in (False, True):
         profiles = [4, 5] if listed else None
         server = zmux.SecureServer(Gate(), NODE, accepted_profiles=profiles)
-        async with zmux.Listener(CONFIG, secure_server=server) as listener:
-            addr = await listener.serve_tcp("127.0.0.1:0")
+        async with zmux.Listener(
+            config=CONFIG, listener_config=zmux.ListenerConfig(secure_server=server)
+        ) as listener:
+            addr = await listener.serve_tcp("127.0.0.1", 0)
             async with asyncio.timeout(10):
                 go = zmux.establish(
-                    await zmux.dial_tcp(addr),
+                    await zmux.dial_tcp(*addr),
                     verifier=Trusting(),
                     allowed_profiles=[4],
                     reply_timeout=0.3,
@@ -433,39 +447,44 @@ async def test_configuration_errors_and_names() -> None:
     assert issubclass(zmux.PipeGoneError, zmux.PipeError)
     assert zmux.EventKind.RESUME_UNATTENDED.value == "ResumeUnattended"
     async with zmux.Listener() as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         async with asyncio.timeout(10):
             for bad in (
                 zmux.Config(max_pipes=2),
                 zmux.Config(max_pipes=2, pipe_auth=zmux.PipeAuth().with_end_to_end()),
-                zmux.Config(join_timeout=0),
-                zmux.Config(
-                    max_pipes=4,
-                    session_crypto=zmux.SessionCrypto(suites=(1,), groups=(1,)),
-                ),
             ):
                 with pytest.raises(ValueError):
-                    await zmux.connect_tcp(addr, config=bad)
-    with pytest.raises(ValueError):
-        zmux.Listener(zmux.Config(join_timeout=0))
+                    await zmux.connect_tcp(*addr, config=bad)
+    # A configuration the core cannot use is refused when it is made.
+    with pytest.raises(zmux.InvalidArgumentError):
+        zmux.Config(join_timeout=0)
+    with pytest.raises(zmux.InvalidArgumentError):
+        zmux.Config(
+            max_pipes=4,
+            session_crypto=zmux.SessionCrypto(suites=(1,), groups=(1,)),
+        )
 
 
 def test_join_psk_derivation() -> None:
     mine = zmux.SessionCrypto(suites=(1,), groups=(zmux.KeyGroup.X25519_MLKEM768,))
-    crypto = zmux.session_crypto(mine, mine)
+    crypto = zmux.adapter.session_crypto(mine, mine)
     secret = b"e" * 32
-    i = zmux.derive_join_psk(1, secret, role=zmux.Role.CLIENT, session_crypto=crypto)
-    r = zmux.derive_join_psk(1, secret, role=zmux.Role.SERVER, session_crypto=crypto)
+    i = zmux.adapter.derive_join_psk(
+        1, secret, role=zmux.Role.CLIENT, session_crypto=crypto
+    )
+    r = zmux.adapter.derive_join_psk(
+        1, secret, role=zmux.Role.SERVER, session_crypto=crypto
+    )
     assert len(i) == 32 and i != r
-    assert i == zmux.expand_join_psk(
+    assert i == zmux.adapter.expand_join_psk(
         1, secret, role=zmux.Role.CLIENT, session_crypto=crypto, length=32
     )
     with pytest.raises(ValueError):
-        zmux.derive_join_psk(
+        zmux.adapter.derive_join_psk(
             1 << 40, secret, role=zmux.Role.CLIENT, session_crypto=crypto
         )
     with pytest.raises(ValueError):
-        zmux.session_crypto(zmux.SessionCrypto(suites=(), groups=(2,)), mine)
+        zmux.adapter.session_crypto(zmux.SessionCrypto(suites=(), groups=(2,)), mine)
 
 
 class Judge:
@@ -523,12 +542,14 @@ async def test_application_data_and_the_verdict() -> None:
         app_data=server_data,
         local_context=b"listener",
     )
-    async with zmux.Listener(CONFIG, secure_server=server) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+    async with zmux.Listener(
+        config=CONFIG, listener_config=zmux.ListenerConfig(secure_server=server)
+    ) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         verifier = Judge()
         async with asyncio.timeout(10):
             _, peer = await zmux.establish(
-                await zmux.dial_tcp(addr),
+                await zmux.dial_tcp(*addr),
                 verifier=verifier,
                 handle=HANDLE,
                 psk=PSK,
@@ -573,15 +594,17 @@ async def test_too_much_application_data_fails_and_none_is_unbounded() -> None:
         return b"x" * 300 if message == 2 else None
 
     server = zmux.SecureServer(Gate(), NODE, app_data=big)
-    async with zmux.Listener(CONFIG, secure_server=server) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+    async with zmux.Listener(
+        config=CONFIG, listener_config=zmux.ListenerConfig(secure_server=server)
+    ) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         async with asyncio.timeout(10):
             with pytest.raises(zmux.ZmuxError):
                 await zmux.establish(
-                    await zmux.dial_tcp(addr), verifier=Judge(), handle=HANDLE, psk=PSK
+                    await zmux.dial_tcp(*addr), verifier=Judge(), handle=HANDLE, psk=PSK
                 )
             _, peer = await zmux.establish(
-                await zmux.dial_tcp(addr),
+                await zmux.dial_tcp(*addr),
                 verifier=Judge(),
                 handle=HANDLE,
                 psk=PSK,
@@ -614,12 +637,14 @@ async def test_transcript_proofs_and_pq_authentication() -> None:
         client_verifier=Judge(proof_key=client_key.key_id),
         require_pq_auth=True,
     )
-    async with zmux.Listener(CONFIG, secure_server=server) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
-        node_id = zmux.static_key_id((await establish_once(addr)).static_key)
+    async with zmux.Listener(
+        config=CONFIG, listener_config=zmux.ListenerConfig(secure_server=server)
+    ) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
+        node_id = zmux.static_key_id((await establish_once(*addr)).static_key)
         async with asyncio.timeout(10):
             _, peer = await zmux.establish(
-                await zmux.dial_tcp(addr),
+                await zmux.dial_tcp(*addr),
                 verifier=zmux.PinVerifier(node_id, proof_key=server_key.key_id),
                 handle=HANDLE,
                 psk=PSK,
@@ -632,7 +657,7 @@ async def test_transcript_proofs_and_pq_authentication() -> None:
             # A verdict naming another proof key fails the server.
             with pytest.raises(zmux.ZmuxError):
                 await zmux.establish(
-                    await zmux.dial_tcp(addr),
+                    await zmux.dial_tcp(*addr),
                     verifier=Judge(proof_key=bytes(32)),
                     handle=HANDLE,
                     psk=PSK,
@@ -649,11 +674,11 @@ async def test_transcript_proofs_and_pq_authentication() -> None:
         )
 
 
-async def establish_once(addr: str) -> zmux.Peer:
+async def establish_once(host: str, port: int) -> zmux.Peer:
     """The server's static key, as an unpinned client learns it."""
     async with asyncio.timeout(10):
         _, peer = await zmux.establish(
-            await zmux.dial_tcp(addr), verifier=Judge(), handle=HANDLE, psk=PSK
+            await zmux.dial_tcp(host, port), verifier=Judge(), handle=HANDLE, psk=PSK
         )
     return peer
 
@@ -680,15 +705,16 @@ async def test_a_rejection_and_a_temporary_failure(
     gate = Gate()
     server = zmux.SecureServer(gate, NODE, client_verifier=Judge(raises))
     async with zmux.Listener(
-        CONFIG, secure_server=server, on_reject=on_reject
+        config=CONFIG,
+        listener_config=zmux.ListenerConfig(secure_server=server, on_reject=on_reject),
     ) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         async with asyncio.timeout(10):
             pipe, _ = await zmux.establish(
-                await zmux.dial_tcp(addr), verifier=Judge(), handle=HANDLE, psk=PSK
+                await zmux.dial_tcp(*addr), verifier=Judge(), handle=HANDLE, psk=PSK
             )
             with pytest.raises(zmux.ZmuxError):
-                async with await zmux.Session.connect(pipe, CONFIG) as session:
+                async with await zmux.Session.connect(pipe, config=CONFIG) as session:
                     await round_trip(session)
             if rejected:
                 await until(lambda: reasons)
@@ -699,18 +725,21 @@ async def test_a_rejection_and_a_temporary_failure(
 async def test_an_epoch_advance_is_reported() -> None:
     config = zmux.Config(max_pipes=4, epoch_policy=zmux.EpochPolicy.MANUAL)
     async with zmux.Listener(
-        config, secure_server=zmux.SecureServer(Gate(), NODE)
+        config=config,
+        listener_config=zmux.ListenerConfig(
+            secure_server=zmux.SecureServer(Gate(), NODE)
+        ),
     ) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         server = asyncio.ensure_future(echo(listener))
         async with asyncio.timeout(10):
             pipe, _ = await zmux.establish(
-                await zmux.dial_tcp(addr), verifier=Judge(), handle=HANDLE, psk=PSK
+                await zmux.dial_tcp(*addr), verifier=Judge(), handle=HANDLE, psk=PSK
             )
-            async with await zmux.Session.connect(pipe, config) as session:
+            async with await zmux.Session.connect(pipe, config=config) as session:
                 await round_trip(session)
                 extra = await session.add_pipe(
-                    await zmux.dial_tcp(addr),
+                    await zmux.dial_tcp(*addr),
                     options=zmux.PipeOptions(record_mode="sealed"),
                 )
                 await extra.joined()
@@ -736,12 +765,12 @@ async def test_an_epoch_advance_is_reported() -> None:
 
 
 async def test_replace_pipes_replaces_every_pipe() -> None:
-    where: list[str] = []
+    where: list[tuple[str, int]] = []
 
     async def redial(direction: zmux.Direction) -> zmux.PipeIo:
         assert direction == "bidi"
         pipe, _ = await zmux.establish(
-            await zmux.dial_tcp(where[0]), verifier=Judge(), handle=HANDLE, psk=PSK
+            await zmux.dial_tcp(*where[0]), verifier=Judge(), handle=HANDLE, psk=PSK
         )
         return pipe
 
@@ -751,34 +780,40 @@ async def test_replace_pipes_replaces_every_pipe() -> None:
     plain = zmux.Config(max_pipes=4, epoch_policy=zmux.EpochPolicy.MANUAL)
     with pytest.raises(ValueError, match="redial"):
         async with zmux.Listener(
-            plain, secure_server=zmux.SecureServer(Gate(), NODE)
+            config=plain,
+            listener_config=zmux.ListenerConfig(
+                secure_server=zmux.SecureServer(Gate(), NODE)
+            ),
         ) as listener:
-            addr = await listener.serve_tcp("127.0.0.1:0")
+            addr = await listener.serve_tcp("127.0.0.1", 0)
             server = asyncio.ensure_future(echo(listener))
             try:
                 pipe, _ = await zmux.establish(
-                    await zmux.dial_tcp(addr), verifier=Judge(), handle=HANDLE, psk=PSK
+                    await zmux.dial_tcp(*addr), verifier=Judge(), handle=HANDLE, psk=PSK
                 )
-                async with await zmux.Session.connect(pipe, plain) as session:
+                async with await zmux.Session.connect(pipe, config=plain) as session:
                     # Without the redial hook it fails at once.
                     async with asyncio.timeout(5):
                         await session.replace_pipes()
             finally:
                 server.cancel()
     async with zmux.Listener(
-        config, secure_server=zmux.SecureServer(Gate(), NODE)
+        config=config,
+        listener_config=zmux.ListenerConfig(
+            secure_server=zmux.SecureServer(Gate(), NODE)
+        ),
     ) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         where.append(addr)
         server = asyncio.ensure_future(echo(listener))
         async with asyncio.timeout(20):
             pipe, _ = await zmux.establish(
-                await zmux.dial_tcp(addr), verifier=Judge(), handle=HANDLE, psk=PSK
+                await zmux.dial_tcp(*addr), verifier=Judge(), handle=HANDLE, psk=PSK
             )
-            async with await zmux.Session.connect(pipe, config) as session:
+            async with await zmux.Session.connect(pipe, config=config) as session:
                 await round_trip(session)
                 extra = await session.add_pipe(
-                    await zmux.dial_tcp(addr),
+                    await zmux.dial_tcp(*addr),
                     options=zmux.PipeOptions(record_mode="sealed"),
                 )
                 await extra.joined()
@@ -805,7 +840,7 @@ def test_static_public_matches_the_handshake() -> None:
 
 async def test_a_single_pipe_session_has_no_epoch() -> None:
     async with zmux.Listener() as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         async with asyncio.timeout(10):
-            async with await zmux.connect_tcp(addr) as session:
+            async with await zmux.connect_tcp(*addr) as session:
                 assert session.epoch is None

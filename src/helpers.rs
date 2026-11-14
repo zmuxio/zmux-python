@@ -190,15 +190,16 @@ fn dial_err(e: PyErr) -> std::io::Error {
 /// `Config(redial=...)`: an async callable given the `Direction` that
 /// returns the carrier replacing the lost pipe. The Config is made inside a running
 /// event loop, which runs the callable.
-pub(crate) fn redial_of(v: &Bound<'_, PyAny>) -> PyResult<zmux::Dial> {
+pub(crate) fn redial_of(v: &Bound<'_, PyAny>) -> PyResult<zmux::Redial> {
     let py = v.py();
     let locals = Arc::new(get_current_locals(py).map_err(|_| {
-        pyo3::exceptions::PyRuntimeError::new_err(
+        crate::new_err(
+            "NoRunningLoopError",
             "redial needs the Config made inside a running event loop",
         )
     })?);
     let f = Arc::new(v.clone().unbind());
-    Ok(zmux::Dial::new(move |req: zmux::DialRequest| {
+    Ok(zmux::Redial::new(move |req: zmux::DialRequest| {
         let (f, locals) = (f.clone(), locals.clone());
         let need = req.direction;
         async move {
@@ -221,8 +222,8 @@ pub(crate) fn redial_of(v: &Bound<'_, PyAny>) -> PyResult<zmux::Dial> {
 #[pyo3(signature = (s1, s2, *, local_identity=None, peer_identity=None, rejoin=None))]
 fn resolve_duplicate<'p>(
     py: Python<'p>,
-    s1: &Session,
-    s2: &Session,
+    s1: &Bound<'p, Session>,
+    s2: &Bound<'p, Session>,
     local_identity: Option<Vec<u8>>,
     peer_identity: Option<Vec<u8>>,
     rejoin: Option<Py<PyAny>>,
@@ -248,12 +249,19 @@ fn resolve_duplicate<'p>(
     }
     let r = {
         let _g = get_runtime().enter();
-        zmux::helpers::resolve_duplicate(&s1.0, &s2.0, &opts)
+        zmux::helpers::resolve_duplicate(&s1.get().0, &s2.get().0, &opts)
     }
     .map_err(|e| PyValueError::new_err(e.to_string()))?;
     let d = PyDict::new(py);
-    d.set_item("survivor", Session::new(r.survivor))?;
-    d.set_item("loser", Session::new(r.loser))?;
+    // The caller's own objects (with their returned-result queues and
+    // 0-RTT state), not new wrappers.
+    let (first, second) = if r.survivor.stable_id() == s1.get().0.stable_id() {
+        (s1, s2)
+    } else {
+        (s2, s1)
+    };
+    d.set_item("survivor", first)?;
+    d.set_item("loser", second)?;
     d.set_item("rule", snake(&kind_of(&r.rule)))?;
     d.set_item("rejoin_started", r.rejoin_started)?;
     types(py)?.getattr("Resolved")?.call((), Some(&d))

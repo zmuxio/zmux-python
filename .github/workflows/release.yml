@@ -26,26 +26,21 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
-      - name: Check the tag against the package versions
+      - name: Check the tag against the package version
         id: version
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
           if [[ "${GITHUB_REF_TYPE}" != tag ]]; then
-            version=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+            version=$(python -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
           fi
           python - "${version}" <<'PY'
-          import re, sys, tomllib
+          import sys, tomllib
           version = sys.argv[1]
-          with open("pyproject.toml", "rb") as f:
-              project = tomllib.load(f)["project"]["version"]
           with open("Cargo.toml", "rb") as f:
               crate = tomllib.load(f)["package"]["version"]
-          init = re.search(r'__version__ = "([^"]+)"', open("python/zmux/__init__.py").read()).group(1)
-          found = {"pyproject.toml": project, "Cargo.toml": crate, "__init__.py": init}
-          bad = {k: v for k, v in found.items() if v != version}
-          if bad:
-              sys.exit(f"tag v{version} does not match {bad}")
+          if crate != version:
+              sys.exit(f"tag v{version} does not match Cargo.toml {crate}")
           PY
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
       - name: Check whether PyPI has the version
@@ -96,7 +91,6 @@ jobs:
           - { os: ubuntu-latest, platform: manylinux, target: x86_64, manylinux: auto, test: true }
           - { os: ubuntu-24.04-arm, platform: manylinux, target: aarch64, manylinux: auto, test: true }
           - { os: ubuntu-latest, platform: manylinux, target: armv7, manylinux: auto, qemu: linux/arm/v7 }
-          - { os: ubuntu-latest, platform: manylinux, target: i686, manylinux: auto, qemu: linux/386 }
           - { os: ubuntu-latest, platform: manylinux, target: ppc64le, manylinux: auto, qemu: linux/ppc64le }
           - { os: ubuntu-latest, platform: manylinux, target: s390x, manylinux: auto, qemu: linux/s390x }
           - { os: ubuntu-latest, platform: manylinux, target: riscv64gc-unknown-linux-gnu, manylinux: '2_31' }

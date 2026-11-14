@@ -37,7 +37,7 @@ def shape(session: zmux.Session) -> None:
     with open(path, encoding="utf-8") as f:
         definition = f.read()
     try:
-        session.set_shaper(definition=definition)
+        session.shaper = zmux.shaping.Shaper(definition=definition)
     except ValueError as e:
         die(f"def: {e}")
 
@@ -55,8 +55,8 @@ def report(session: zmux.Session) -> None:
 
 async def server() -> None:
     async with zmux.Listener() as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
-        print("LISTEN", addr, flush=True)
+        addr = await listener.serve_tcp("127.0.0.1", 0)
+        print(f"LISTEN {addr[0]}:{addr[1]}", flush=True)
         session = await listener.accept()
     shape(session)
 
@@ -74,7 +74,8 @@ async def server() -> None:
 
 
 async def client(addr: str) -> None:
-    session = await zmux.Session.connect(await zmux.dial_tcp(addr))
+    host, _, port = addr.rpartition(":")
+    session = await zmux.Session.connect(await zmux.dial_tcp(host, int(port)))
     shape(session)
 
     async def one(i: int) -> None:

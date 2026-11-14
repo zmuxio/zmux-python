@@ -1,6 +1,6 @@
 [package]
 name = "zmux-python"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
@@ -14,15 +14,15 @@ pyo3 = { version = "0.30", features = ["abi3-py312"] }
 pyo3-async-runtimes = { version = "0.30", features = ["tokio-runtime"] }
 tokio = { version = "1.54", features = ["net", "rt-multi-thread", "sync", "io-util"] }
 bytes = "1"
-zmux = "1.2.6"
-zmux-shaping = { version = "1.2.6", features = ["tokio"] }
-zmux-rustls = "1.2.6"
-zmux-quinn = { version = "1.2.6", features = ["rustls-ring"] }
-zmux-websocket = "1.2.6"
-zmux-seal = "1.2.6"
-zmux-http = { version = "1.2.6", features = ["websocket"] }
-zmux-h3 = "1.2.6"
-zmux-webtransport = "1.2.6"
+zmux = "1.2.7"
+zmux-shaping = { version = "1.2.7", features = ["tokio"] }
+zmux-rustls = "1.2.7"
+zmux-quinn = { version = "1.2.7", features = ["rustls-ring"] }
+zmux-websocket = "1.2.7"
+zmux-seal = "1.2.7"
+zmux-http = { version = "1.2.7", features = ["websocket"] }
+zmux-h3 = "1.2.7"
+zmux-webtransport = "1.2.7"
 http = "1"
 tokio-tungstenite = { version = "0.30", default-features = false }
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }

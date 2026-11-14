@@ -10,9 +10,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use pyo3::IntoPyObjectExt;
-use pyo3::exceptions::{
-    PyRuntimeError, PyStopAsyncIteration, PyTimeoutError, PyTypeError, PyValueError,
-};
+use pyo3::exceptions::{PyStopAsyncIteration, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::PyType;
@@ -144,52 +142,88 @@ fn stream_err(e: zmux::StreamError) -> PyErr {
             Some(code.into_inner()),
         ),
         zmux::StreamError::SessionLost(s) => session_err(s.clone()),
-        zmux::StreamError::PreambleTooLarge => new_err("PreambleTooLargeError", e.to_string()),
+        zmux::StreamError::PreambleTooLarge => {
+            raise("PreambleTooLargeError", &e, e.is_retryable(), None)
+        }
         zmux::StreamError::Rejected => raise("StreamRejectedError", &e, e.is_retryable(), None),
         zmux::StreamError::GoingAway => raise("GoingAwayError", &e, e.is_retryable(), None),
+        zmux::StreamError::ClosedLocally => raise("StreamClosedError", &e, false, None),
+        zmux::StreamError::NotNegotiated => raise("NotNegotiatedError", &e, false, None),
+        zmux::StreamError::NotEstablished => raise("NotEstablishedError", &e, false, None),
         _ => raise("StreamError", &e, e.is_retryable(), None),
     }
 }
 
+/// An open's failure, classified by what happened.
 fn open_err(e: zmux::OpenError) -> PyErr {
-    match e {
-        zmux::OpenError::SessionLost(s) => session_err(s),
-        zmux::OpenError::PreambleTooLarge => new_err("PreambleTooLargeError", e.to_string()),
-        e => raise("OpenError", &e, e.is_retryable(), None),
+    match &e {
+        zmux::OpenError::SessionLost(s) => session_err(s.clone()),
+        zmux::OpenError::PreambleTooLarge => {
+            raise("PreambleTooLargeError", &e, e.is_retryable(), None)
+        }
+        zmux::OpenError::GoingAway => raise("GoingAwayError", &e, e.is_retryable(), None),
+        zmux::OpenError::NotNegotiated => raise("NotNegotiatedError", &e, false, None),
+        zmux::OpenError::NotEstablished => raise("NotEstablishedError", &e, false, None),
+        zmux::OpenError::InvalidArgument => raise("InvalidArgumentError", &e, false, None),
+        _ => raise("StreamError", &e, e.is_retryable(), None),
     }
 }
 
 fn datagram_err(e: zmux::DatagramError) -> PyErr {
-    match e {
-        zmux::DatagramError::SessionLost(s) => session_err(s),
-        e => raise("DatagramError", &e, e.is_retryable(), None),
+    match &e {
+        zmux::DatagramError::SessionLost(s) => session_err(s.clone()),
+        zmux::DatagramError::NotNegotiated => raise("NotNegotiatedError", &e, false, None),
+        zmux::DatagramError::ClosedStream => raise("StreamClosedError", &e, false, None),
+        _ => raise("DatagramError", &e, e.is_retryable(), None),
     }
 }
 
 fn pipe_err(e: zmux::PipeError) -> PyErr {
-    match e {
-        zmux::PipeError::SessionLost(s) => session_err(s),
-        // Invalid options are the language's existing argument error.
-        zmux::PipeError::InvalidOptions(_) => PyValueError::new_err(e.to_string()),
-        // `add_pipe`'s bound passed: the language's deadline error.
-        zmux::PipeError::TimedOut => PyTimeoutError::new_err(e.to_string()),
-        zmux::PipeError::NotNegotiated => raise("NotNegotiatedError", &e, e.is_retryable(), None),
-        zmux::PipeError::NotEstablished => raise("NotEstablishedError", &e, e.is_retryable(), None),
+    use zmux::PipeFailure as F;
+    match &e {
+        zmux::PipeError::SessionLost(s) => session_err(s.clone()),
+        zmux::PipeError::InvalidOptions(_) | zmux::PipeError::InvalidArgument => {
+            raise("InvalidArgumentError", &e, false, None)
+        }
+        zmux::PipeError::NotNegotiated => raise("NotNegotiatedError", &e, false, None),
+        zmux::PipeError::NotEstablished => raise("NotEstablishedError", &e, true, None),
         zmux::PipeError::JoinPending(_) => raise("JoinPendingError", &e, e.is_retryable(), None),
-        zmux::PipeError::JoinRefused => raise("JoinRefusedError", &e, e.is_retryable(), None),
-        zmux::PipeError::JoinSecretSet => raise("JoinSecretSetError", &e, e.is_retryable(), None),
-        zmux::PipeError::UnknownPipe => raise("PipeGoneError", &e, e.is_retryable(), None),
-        e => raise("PipeError", &e, e.is_retryable(), None),
+        zmux::PipeError::JoinSecretSet => raise("JoinSecretSetError", &e, false, None),
+        zmux::PipeError::UnknownPipe => raise("PipeGoneError", &e, false, None),
+        // The join was refused, or `join_timeout` passed: the language's
+        // deadline error.
+        zmux::PipeError::Failed(F::JoinRefused) => {
+            raise("JoinRefusedError", &e, e.is_retryable(), None)
+        }
+        zmux::PipeError::Failed(F::JoinTimedOut) => {
+            raise("DeadlineExceededError", &e, e.is_retryable(), None)
+        }
+        _ => raise("PipeError", &e, e.is_retryable(), None),
     }
 }
 
 fn connect_err(e: zmux::ConnectError) -> PyErr {
-    match e {
-        zmux::ConnectError::SessionLost(s) => session_err(s),
-        // The language's configuration error.
-        zmux::ConnectError::InvalidConfig(why) => PyValueError::new_err(why.to_string()),
-        e => raise("ConnectError", &e, e.is_retryable(), None),
+    match &e {
+        zmux::ConnectError::SessionLost(s) => session_err(s.clone()),
+        zmux::ConnectError::InvalidConfig(_) => raise("InvalidArgumentError", &e, false, None),
+        _ => raise("ConnectError", &e, e.is_retryable(), None),
     }
+}
+
+/// The stream finished before `expected` bytes arrived: `partial` holds
+/// those read.
+fn incomplete_read(partial: &[u8], expected: usize) -> PyErr {
+    let e = zmux::ReadExactError::FinishedEarly(partial.len());
+    rt::attach(|py| {
+        let cls = err_type(py, "IncompleteReadError");
+        match cls.call1((PyBytes::new(py, partial), expected)) {
+            Ok(v) => {
+                let _ = v.setattr("kind", typed(py, "ErrorKind", kind_of(&e)));
+                PyErr::from_value(v)
+            }
+            Err(err) => err,
+        }
+    })
 }
 
 fn export_err(e: zmux::ExportError) -> PyErr {
@@ -257,7 +291,10 @@ fn pyb(b: &[u8]) -> Py<PyBytes> {
 }
 
 fn busy() -> PyErr {
-    PyRuntimeError::new_err("another operation on this stream is in progress")
+    new_err(
+        "StreamBusyError",
+        "another operation on this stream is in progress",
+    )
 }
 
 // ---- configuration --------------------------------------------------------------------
@@ -353,28 +390,46 @@ fn probation_obj<'p>(py: Python<'p>, p: Option<zmux::Cap<Duration>>) -> PyResult
 }
 
 /// The scheduling policy of a name.
-fn policy(name: &str) -> PyResult<zmux::Policy> {
+fn policy(name: &str) -> PyResult<zmux::sched::Scheduler> {
     Ok(match name {
-        "affinity" => zmux::Policy::Affinity,
-        "session-affinity" => zmux::Policy::SessionAffinity,
-        "spread-eta" => zmux::Policy::SpreadEta,
-        "spread-round-robin" => zmux::Policy::SpreadRoundRobin,
-        "spread-rate-weighted" => zmux::Policy::SpreadRateWeighted,
+        "affinity" => zmux::sched::Scheduler::Affinity,
+        "session-affinity" => zmux::sched::Scheduler::SessionAffinity,
+        "spread-eta" => zmux::sched::Scheduler::SpreadEta,
+        "spread-round-robin" => zmux::sched::Scheduler::SpreadRoundRobin,
+        "spread-rate-weighted" => zmux::sched::Scheduler::SpreadRateWeighted,
         _ => {
             return Err(PyValueError::new_err(format!("unknown scheduler {name:?}")));
         }
     })
 }
 
+/// The scheduling policy of a `zmux.Scheduler` or its name; `None` is none.
+fn scheduler_of(v: Option<&Bound<'_, PyAny>>) -> PyResult<Option<zmux::sched::Scheduler>> {
+    match v {
+        Some(v) if !v.is_none() => policy(&v.str()?.extract::<String>()?).map(Some),
+        _ => Ok(None),
+    }
+}
+
 /// The name of a built-in scheduling policy.
-fn policy_name(p: &zmux::Policy) -> &'static str {
+fn policy_name(p: &zmux::sched::Scheduler) -> &'static str {
     match p {
-        zmux::Policy::SessionAffinity => "session-affinity",
-        zmux::Policy::SpreadEta => "spread-eta",
-        zmux::Policy::SpreadRoundRobin => "spread-round-robin",
-        zmux::Policy::SpreadRateWeighted => "spread-rate-weighted",
+        zmux::sched::Scheduler::SessionAffinity => "session-affinity",
+        zmux::sched::Scheduler::SpreadEta => "spread-eta",
+        zmux::sched::Scheduler::SpreadRoundRobin => "spread-round-robin",
+        zmux::sched::Scheduler::SpreadRateWeighted => "spread-rate-weighted",
         _ => "affinity",
     }
+}
+
+/// The native backoff of a `zmux.Backoff`.
+pub(crate) fn backoff_of(v: &Bound<'_, PyAny>) -> PyResult<zmux::Backoff> {
+    let min = field_secs("min", &v.getattr("min")?)?;
+    let max = field_secs("max", &v.getattr("max")?)?;
+    let mut b = zmux::Backoff::new(min, max);
+    b.jitter = required("jitter", &v.getattr("jitter")?)?.extract()?;
+    b.validate().map_err(value_err)?;
+    Ok(b)
 }
 
 /// A `logging.Logger` as the session's logger: zmux's levels as logging's.
@@ -632,8 +687,6 @@ fn _config_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     )?;
     d.set_item("max_lanes", c.max_lanes.get())?;
     d.set_item("resume_timeout", dur(c.resume_timeout))?;
-    d.set_item("redial_min_backoff", c.redial_min_backoff.as_secs_f64())?;
-    d.set_item("redial_max_backoff", c.redial_max_backoff.as_secs_f64())?;
     d.set_item("join_early_hello", c.join_early_hello)?;
     d.set_item("scheduler", policy_name(&c.scheduler))?;
     d.set_item("spread_chunk", c.spread_chunk)?;
@@ -663,6 +716,26 @@ fn _config_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     ld.set_item("probe_interval", dur(l.probe_interval))?;
     ld.set_item("probe_jitter", l.probe_jitter)?;
     d.set_item("liveness", ld)?;
+    Ok(d)
+}
+
+/// The library's defaults of the `zmux.ListenerConfig` fields that hold
+/// values, the one source of the Python defaults.
+#[pyfunction]
+fn _listener_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
+    let l = zmux::ListenerConfig::default();
+    let d = PyDict::new(py);
+    d.set_item("max_pending", l.max_pending)?;
+    d.set_item("max_pending_per_source", l.max_pending_per_source)?;
+    d.set_item("source_prefix_v4", l.source_prefix_v4)?;
+    d.set_item("source_prefix_v6", l.source_prefix_v6)?;
+    d.set_item("max_pending_per_session", l.max_pending_per_session)?;
+    d.set_item("first_record_timeout", l.first_record_timeout.as_secs_f64())?;
+    d.set_item("handshake_timeout", l.handshake_timeout.as_secs_f64())?;
+    d.set_item("max_record_size", l.max_record_size)?;
+    d.set_item("accept_sessions", l.accept_sessions)?;
+    d.set_item("max_suspended", l.max_suspended)?;
+    d.set_item("memory_budget", l.memory_budget)?;
     Ok(d)
 }
 
@@ -739,8 +812,7 @@ impl Config {
                         ));
                     }
                 }
-                "redial_min_backoff" => c.redial_min_backoff = field_secs(&k, v)?,
-                "redial_max_backoff" => c.redial_max_backoff = field_secs(&k, v)?,
+                "redial_backoff" => c.redial_backoff = backoff_of(required(&k, v)?)?,
                 "join_early_hello" => {
                     c.join_early_hello = if v.is_none() {
                         None
@@ -812,6 +884,7 @@ impl Config {
             )?;
             c.shaper = Some(Arc::new(f));
         }
+        c.validate().map_err(value_err)?;
         Ok(Config(Arc::new(c)))
     }
 }
@@ -1168,7 +1241,10 @@ impl PipeIo {
 }
 
 fn used() -> PyErr {
-    PyRuntimeError::new_err("pipe already used")
+    new_err(
+        "PipeUsedError",
+        "the pipe input was given to a session already",
+    )
 }
 
 /// The settings of a pipe input, writable until it is given to a session.
@@ -1186,16 +1262,6 @@ impl PipeIo {
     fn set_carrier_kind(&self, kind: &Bound<'_, PyAny>) -> PyResult<()> {
         let k = shaping::carrier_kind(kind)?;
         self.modify(|io| io.with_carrier(k))
-    }
-
-    /// The carrier's unsent count, an `UnsentCount` the application keeps
-    /// up to date: the bytes the carrier took and has not yet transmitted,
-    /// or `None` when it cannot tell. The session's driver reads it
-    /// without the interpreter lock. Write-only.
-    #[setter]
-    fn set_unsent(&self, count: &UnsentCount) -> PyResult<()> {
-        let c = count.0.clone();
-        self.modify(move |io| io.with_unsent(move || UnsentCount::decode(&c)))
     }
 
     /// The fixed bytes (0 to 65535) the layers below zmux add to each write
@@ -1221,16 +1287,6 @@ impl PipeIo {
         self.modify(zmux::PipeIo::with_carrier_secure)
     }
 
-    /// The largest record plaintext (at least 1) the carrier takes, applied
-    /// beside the peer's `max_record_size`. Write-only.
-    #[setter]
-    fn set_max_record(&self, size: usize) -> PyResult<()> {
-        if size == 0 {
-            return Err(PyValueError::new_err("max_record is at least 1"));
-        }
-        self.modify(|io| io.with_max_record(size))
-    }
-
     /// The host's name of the transform the carrier runs, or `None`:
     /// reported in `PipeStats.variant`, and what a shaper by variant picks
     /// by.
@@ -1242,17 +1298,6 @@ impl PipeIo {
     #[setter]
     fn set_variant(&self, variant: &str) -> PyResult<()> {
         self.modify(|io| io.with_variant(variant))
-    }
-
-    /// The exporter of the carrier's innermost end-to-end handshake:
-    /// `export(label, context, length)` returns the value, or `None` while
-    /// the handshake is incomplete. Write-only.
-    #[setter]
-    fn set_exporter(&self, export: Py<PyAny>) -> PyResult<()> {
-        let export = Arc::new(export);
-        self.modify(move |io| {
-            io.with_exporter(move |label, context, out| call_exporter(&export, label, context, out))
-        })
     }
 
     /// What the TLS or QUIC handshake this process ran for the carrier
@@ -1352,21 +1397,45 @@ impl PipeEnd {
             } else {
                 w.write_all(&data).await
             };
-            r.map_err(|e| PyRuntimeError::new_err(e.to_string()))
+            r.map_err(io_err)
         })
     }
 }
 
 /// An in-memory pipe whose other end Python drives (the stream-pair entry).
-/// `carrier_kind`: the pipe's carrier kind (`PipeIo.carrier_kind`).
+/// `carrier_kind`: the pipe's carrier kind (`PipeIo.carrier_kind`); `unsent`,
+/// the carrier's unsent count the application keeps up to date; `max_record`,
+/// the largest record plaintext (at least 1) the carrier takes, applied
+/// beside the peer's `max_record_size`; `exporter(label, context, length)`,
+/// the exporter of the carrier's innermost end-to-end handshake.
 #[pyfunction]
-#[pyo3(signature = (*, carrier_kind=None))]
-fn pipe_pair(carrier_kind: Option<Bound<'_, PyAny>>) -> PyResult<(PipeIo, PipeEnd)> {
+#[pyo3(signature = (*, carrier_kind=None, unsent=None, max_record=None, exporter=None))]
+fn pipe_pair(
+    carrier_kind: Option<Bound<'_, PyAny>>,
+    unsent: Option<PyRef<'_, UnsentCount>>,
+    max_record: Option<usize>,
+    exporter: Option<Py<PyAny>>,
+) -> PyResult<(PipeIo, PipeEnd)> {
     let (a, b) = tokio::io::duplex(256 * 1024);
     let (r, w) = tokio::io::split(b);
     let mut io = zmux::PipeIo::new(a);
     if let Some(k) = carrier_kind {
         io = io.with_carrier(shaping::carrier_kind(&k)?);
+    }
+    if let Some(count) = unsent {
+        let c = count.0.clone();
+        io = io.with_unsent(move || UnsentCount::decode(&c));
+    }
+    if let Some(size) = max_record {
+        if size == 0 {
+            return Err(PyValueError::new_err("max_record is at least 1"));
+        }
+        io = io.with_max_record(size);
+    }
+    if let Some(export) = exporter {
+        let export = Arc::new(export);
+        io = io
+            .with_exporter(move |label, context, out| call_exporter(&export, label, context, out));
     }
     Ok((
         PipeIo::wrap(io),
@@ -1395,12 +1464,14 @@ async fn lookup(addr: &str) -> std::io::Result<SocketAddr> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (addr, *, carrier_credential=None))]
+#[pyo3(signature = (host, port, *, carrier_credential=None))]
 fn dial_tcp<'p>(
     py: Python<'p>,
-    addr: String,
+    host: String,
+    port: u16,
     carrier_credential: Option<Bound<'p, PyAny>>,
 ) -> PyResult<Bound<'p, PyAny>> {
+    let addr = hostport(&host, port);
     let credential = admission::carrier_credential(carrier_credential)?;
     future_into_py(py, async move {
         let mut tcp = tokio::net::TcpStream::connect(addr).await.map_err(io_err)?;
@@ -1414,7 +1485,7 @@ fn dial_tcp<'p>(
             };
             tcp.write_all(&prefix).await.map_err(io_err)?;
         }
-        Ok(PipeIo::wrap(zmux::PipeIo::tcp(tcp)))
+        Ok(PipeIo::wrap(zmux::PipeIo::from_tcp(tcp)))
     })
 }
 
@@ -1424,14 +1495,16 @@ fn client_tls(tls: Option<PyRef<'_, TlsConfig>>) -> TlsConfig {
 }
 
 #[pyfunction]
-#[pyo3(signature = (addr, *, tls=None, server_name=None, carrier_credential=None))]
+#[pyo3(signature = (host, port, *, tls=None, server_name=None, carrier_credential=None))]
 fn dial_tls<'p>(
     py: Python<'p>,
-    addr: String,
+    host: String,
+    port: u16,
     tls: Option<PyRef<'_, TlsConfig>>,
     server_name: Option<String>,
     carrier_credential: Option<Bound<'p, PyAny>>,
 ) -> PyResult<Bound<'p, PyAny>> {
+    let addr = hostport(&host, port);
     let c = Arc::new(client_tls(tls).client_zmux()?);
     let server_name = server_name.unwrap_or_else(|| host_of(&addr));
     let credential = admission::carrier_credential(carrier_credential)?;
@@ -1492,23 +1565,26 @@ impl QuicDial {
 }
 
 #[pyfunction]
-#[pyo3(signature = (addr, *, tls=None, server_name=None, lanes=4, carrier_credential=None))]
+#[pyo3(signature = (host, port, *, tls=None, server_name=None, lanes=zmux_quinn::LaneWindows::default().lanes, carrier_credential=None))]
 fn dial_quic<'p>(
     py: Python<'p>,
-    addr: String,
+    host: String,
+    port: u16,
     tls: Option<PyRef<'_, TlsConfig>>,
     server_name: Option<String>,
     lanes: u32,
     carrier_credential: Option<Bound<'p, PyAny>>,
 ) -> PyResult<Bound<'p, PyAny>> {
+    let addr = hostport(&host, port);
     let d = QuicDial::new(addr, tls, server_name, lanes, carrier_credential)?;
     future_into_py(py, async move {
         Ok(PipeIo::wrap(d.open().await.map_err(io_err)?))
     })
 }
 
+/// A configuration or argument error of the core: a `ValueError` of zmux.
 fn value_err(e: impl Display) -> PyErr {
-    PyValueError::new_err(e.to_string())
+    new_err("InvalidArgumentError", e.to_string())
 }
 
 const HTTP1: &[u8] = b"http/1.1";
@@ -1576,16 +1652,19 @@ struct Http2Connection(zmux_http::Http2Connection);
 #[pymethods]
 impl Http2Connection {
     #[staticmethod]
-    #[pyo3(signature = (addr, *, path="/zmux".to_owned(), tls=None, server_name=None, carrier_credential=None, pair_field=None))]
-    fn connect<'p>(
+    #[pyo3(signature = (host, port, *, path="/zmux".to_owned(), tls=None, server_name=None, carrier_credential=None, pair_field=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn dial<'p>(
         py: Python<'p>,
-        addr: String,
+        host: String,
+        port: u16,
         path: String,
         tls: Option<PyRef<'_, TlsConfig>>,
         server_name: Option<String>,
         carrier_credential: Option<Bound<'p, PyAny>>,
         pair_field: Option<String>,
     ) -> PyResult<Bound<'p, PyAny>> {
+        let addr = hostport(&host, port);
         let opts = http_client_options(path, carrier_credential, pair_field)?;
         let tls = tls
             .map(|t| t.client_alpn(|| vec![b"h2".to_vec()]))
@@ -1611,9 +1690,9 @@ impl Http2Connection {
     }
 
     /// A pipe input on a new request of the connection, of `direction`
-    /// (`Direction`; see `dial_http`).
+    /// (`Direction`; see `dial_streaming`).
     #[pyo3(signature = (*, direction="bidi".to_owned()))]
-    fn dial<'p>(&self, py: Python<'p>, direction: String) -> PyResult<Bound<'p, PyAny>> {
+    fn open_pipe<'p>(&self, py: Python<'p>, direction: String) -> PyResult<Bound<'p, PyAny>> {
         let request = dial_request(&direction)?;
         let c = self.0.clone();
         future_into_py(py, async move {
@@ -1624,7 +1703,7 @@ impl Http2Connection {
     }
 
     /// A split bootstrap on two new requests of the connection.
-    fn dial_split<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+    fn open_split<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let c = self.0.clone();
         future_into_py(py, async move {
             Ok(PipeIo::wrap(c.open_split().await.map_err(io_err)?))
@@ -1632,7 +1711,7 @@ impl Http2Connection {
     }
 
     /// Joins a split carrier on two new requests of the connection to
-    /// `session` as two further pipes (see `join_http_split`).
+    /// `session` as two further pipes (see `join_split`).
     #[pyo3(signature = (session, *, options=None))]
     fn join_split<'p>(
         &self,
@@ -1648,6 +1727,20 @@ impl Http2Connection {
             Ok(pipes_of(pipes, &owner))
         })
     }
+}
+
+/// `host:port` as the standard library takes it: an IPv6 host in brackets.
+pub(crate) fn hostport(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// A reported address as `(host, port)`.
+pub(crate) fn host_port(a: SocketAddr) -> (String, u16) {
+    (a.ip().to_string(), a.port())
 }
 
 /// The host part of `host:port`, without IPv6 brackets.
@@ -1689,13 +1782,13 @@ impl H3Dial {
     pub(crate) fn new(
         url: String,
         tls: Option<PyRef<'_, TlsConfig>>,
-        addr: Option<String>,
+        addr: Option<(String, u16)>,
         lanes: u32,
         carrier_credential: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let uri: http::Uri = url.parse().map_err(value_err)?;
         let addr = match addr {
-            Some(a) => a,
+            Some((h, p)) => hostport(&h, p),
             None => authority_of(&uri)?,
         };
         let mut opts =
@@ -1724,12 +1817,12 @@ impl H3Dial {
 /// A pipe on a new HTTP/3 connection: a request to `url` (`https://`),
 /// to `addr` when given, else to the URL's host and port.
 #[pyfunction]
-#[pyo3(signature = (url, *, tls=None, addr=None, lanes=4, carrier_credential=None))]
+#[pyo3(signature = (url, *, tls=None, addr=None, lanes=zmux_quinn::LaneWindows::default().lanes, carrier_credential=None))]
 fn dial_http3<'p>(
     py: Python<'p>,
     url: String,
     tls: Option<PyRef<'_, TlsConfig>>,
-    addr: Option<String>,
+    addr: Option<(String, u16)>,
     lanes: u32,
     carrier_credential: Option<Bound<'p, PyAny>>,
 ) -> PyResult<Bound<'p, PyAny>> {
@@ -1809,7 +1902,7 @@ impl WebTransportDial {
 /// connection to the URL's host, whose exporter a bound credential is
 /// given.
 #[pyfunction]
-#[pyo3(signature = (url, *, tls=None, lanes=4, carrier_credential=None))]
+#[pyo3(signature = (url, *, tls=None, lanes=zmux_quinn::LaneWindows::default().lanes, carrier_credential=None))]
 fn dial_webtransport<'p>(
     py: Python<'p>,
     url: String,
@@ -1837,13 +1930,13 @@ struct QuicClient {
 #[pymethods]
 impl QuicClient {
     #[new]
-    #[pyo3(signature = (tls=None, *, lanes=4, zero_rtt=false, memory_capacity=None, bind="0.0.0.0:0".to_owned(), carrier_credential=None))]
+    #[pyo3(signature = (tls=None, *, lanes=zmux_quinn::LaneWindows::default().lanes, zero_rtt=false, memory_capacity=None, bind=("0.0.0.0".to_owned(), 0), carrier_credential=None))]
     fn new(
         tls: Option<PyRef<'_, TlsConfig>>,
         lanes: u32,
         zero_rtt: bool,
         memory_capacity: Option<usize>,
-        bind: String,
+        bind: (String, u16),
         carrier_credential: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let memory = zero_rtt.then(|| match memory_capacity {
@@ -1859,7 +1952,7 @@ impl QuicClient {
         }
         let qc =
             zmux_quinn::client_config(client_tls(tls).client_zmux()?, &opts).map_err(value_err)?;
-        let bind: SocketAddr = bind.parse().map_err(value_err)?;
+        let bind: SocketAddr = hostport(&bind.0, bind.1).parse().map_err(value_err)?;
         let _g = get_runtime().enter();
         let mut ep = quinn::Endpoint::client(bind).map_err(io_err)?;
         ep.set_default_client_config(qc);
@@ -1867,13 +1960,15 @@ impl QuicClient {
     }
 
     /// A pipe on a new connection.
-    #[pyo3(signature = (addr, *, server_name=None))]
+    #[pyo3(signature = (host, port, *, server_name=None))]
     fn dial<'p>(
         &self,
         py: Python<'p>,
-        addr: String,
+        host: String,
+        port: u16,
         server_name: Option<String>,
     ) -> PyResult<Bound<'p, PyAny>> {
+        let addr = hostport(&host, port);
         let server_name = server_name.unwrap_or_else(|| host_of(&addr));
         let (ep, opts) = (self.ep.clone(), self.opts.clone());
         future_into_py(py, async move {
@@ -1888,14 +1983,16 @@ impl QuicClient {
 
     /// A session on a new connection, with what became of its 0-RTT data:
     /// `(Session, ZeroRtt)`.
-    #[pyo3(signature = (addr, *, server_name=None, config=None))]
+    #[pyo3(signature = (host, port, *, server_name=None, config=None))]
     fn connect<'p>(
         &self,
         py: Python<'p>,
-        addr: String,
+        host: String,
+        port: u16,
         server_name: Option<String>,
         config: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Bound<'p, PyAny>> {
+        let addr = hostport(&host, port);
         let (ep, opts, c) = (self.ep.clone(), self.opts.clone(), cfg(config)?);
         let server_name = server_name.unwrap_or_else(|| host_of(&addr));
         future_into_py(py, async move {
@@ -1993,16 +2090,18 @@ fn dial_request(direction: &str) -> PyResult<zmux::DialRequest> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (addr, *, path="/zmux".to_owned(), carrier_credential=None,
+#[pyo3(signature = (host, port, *, path="/zmux".to_owned(), carrier_credential=None,
     direction="bidi".to_owned(), pair_field=None))]
-fn dial_http<'p>(
+fn dial_streaming<'p>(
     py: Python<'p>,
-    addr: String,
+    host: String,
+    port: u16,
     path: String,
     carrier_credential: Option<Bound<'p, PyAny>>,
     direction: String,
     pair_field: Option<String>,
 ) -> PyResult<Bound<'p, PyAny>> {
+    let addr = hostport(&host, port);
     let opts = http_client_options(path, carrier_credential, pair_field)?;
     let request = dial_request(&direction)?;
     future_into_py(py, async move {
@@ -2021,14 +2120,16 @@ fn dial_http<'p>(
 /// A split bootstrap over two HTTP/1.1 connections: an uplink `POST` and
 /// a downlink `GET` paired by a fresh token.
 #[pyfunction]
-#[pyo3(signature = (addr, *, path="/zmux".to_owned(), carrier_credential=None, pair_field=None))]
-fn dial_http_split<'p>(
+#[pyo3(signature = (host, port, *, path="/zmux".to_owned(), carrier_credential=None, pair_field=None))]
+fn dial_split<'p>(
     py: Python<'p>,
-    addr: String,
+    host: String,
+    port: u16,
     path: String,
     carrier_credential: Option<Bound<'p, PyAny>>,
     pair_field: Option<String>,
 ) -> PyResult<Bound<'p, PyAny>> {
+    let addr = hostport(&host, port);
     let opts = http_client_options(path, carrier_credential, pair_field)?;
     future_into_py(py, async move {
         Ok(PipeIo::wrap(
@@ -2044,17 +2145,20 @@ fn dial_http_split<'p>(
 /// the two directions, `options` choosing its direction; returns `[pipe]`
 /// as `add_pipe` does (a split bootstrap's carrier joins no session). A `PipePool(join=...)` keeps such pairs up.
 #[pyfunction]
-#[pyo3(signature = (session, addr, *, path="/zmux".to_owned(), carrier_credential=None, pair_field=None,
+#[pyo3(signature = (session, host, port, *, path="/zmux".to_owned(), carrier_credential=None, pair_field=None,
     options=None))]
-fn join_http_split<'p>(
+#[allow(clippy::too_many_arguments)]
+fn join_split<'p>(
     py: Python<'p>,
     session: Bound<'p, Session>,
-    addr: String,
+    host: String,
+    port: u16,
     path: String,
     carrier_credential: Option<Bound<'p, PyAny>>,
     pair_field: Option<String>,
     options: Option<Bound<'p, PyAny>>,
 ) -> PyResult<Bound<'p, PyAny>> {
+    let addr = hostport(&host, port);
     let opts = http_client_options(path, carrier_credential, pair_field)?;
     let po = pipe_options(options)?;
     let s = session.get().0.clone();
@@ -2091,8 +2195,7 @@ impl ExchangeOptions {
     #[pyo3(signature = (*, psk=Vec::new(), unauthenticated=false, encoding="binary".to_owned(),
         path=zmux_http::ExchangeOptions::default().path, down_path=None, query=zmux_http::ExchangeOptions::default().query, down_requests=zmux_http::ExchangeOptions::default().down_requests,
         up_requests=zmux_http::ExchangeOptions::default().up_requests, up_piece=None, max_down_piece=None,
-        backoff_initial=zmux_http::ExchangeOptions::default().backoff.initial.as_secs_f64(),
-        backoff_max=zmux_http::ExchangeOptions::default().backoff.max.as_secs_f64(),
+        backoff=None,
         request_timeout=zmux_http::ExchangeOptions::default().request_timeout.as_secs_f64(), deadline=zmux_http::ExchangeOptions::default().deadline.as_secs_f64(),
         hold=zmux_http::ExchangeOptions::default().hold.as_secs_f64(), coalesce=zmux_http::ExchangeOptions::default().coalesce.as_secs_f64(), down_piece=None,
         down_window=zmux_http::ExchangeOptions::default().down_window, max_up_piece=None, up_store=zmux_http::ExchangeOptions::default().up_store,
@@ -2111,8 +2214,7 @@ impl ExchangeOptions {
         up_requests: usize,
         up_piece: Option<Bound<'_, PyAny>>,
         max_down_piece: Option<Bound<'_, PyAny>>,
-        backoff_initial: f64,
-        backoff_max: f64,
+        backoff: Option<Bound<'_, PyAny>>,
         request_timeout: f64,
         deadline: f64,
         hold: f64,
@@ -2159,8 +2261,9 @@ impl ExchangeOptions {
         o.up_store = up_store;
         o.max_carriers = max_carriers;
         o.max_recorded = max_recorded;
-        o.backoff.initial = seconds("backoff_initial", backoff_initial)?;
-        o.backoff.max = seconds("backoff_max", backoff_max)?;
+        if let Some(b) = backoff {
+            o.backoff = backoff_of(&b)?;
+        }
         o.request_timeout = seconds("request_timeout", request_timeout)?;
         o.deadline = seconds("deadline", deadline)?;
         o.hold = seconds("hold", hold)?;
@@ -2233,17 +2336,20 @@ fn exchange_endpoint(
 /// `down_addr` when given), over TLS with `tls`; with `credential`, its
 /// prefix starts the uplink, for a server's admission.
 #[pyfunction]
-#[pyo3(signature = (addr, *, options=None, down_addr=None, tls=None, server_name=None,
+#[pyo3(signature = (host, port, *, options=None, down_addr=None, tls=None, server_name=None,
     carrier_credential=None))]
+#[allow(clippy::too_many_arguments)]
 fn dial_exchange<'p>(
     py: Python<'p>,
-    addr: String,
+    host: String,
+    port: u16,
     options: Option<PyRef<'_, ExchangeOptions>>,
-    down_addr: Option<String>,
+    down_addr: Option<(String, u16)>,
     tls: Option<PyRef<'_, TlsConfig>>,
     server_name: Option<String>,
     carrier_credential: Option<Bound<'_, PyAny>>,
 ) -> PyResult<Bound<'p, PyAny>> {
+    let addr = hostport(&host, port);
     let mut opts = options.map(|o| o.0.clone()).unwrap_or_default();
     if let Some(c) = admission::carrier_credential(carrier_credential)? {
         opts = opts.with_carrier_credential(c);
@@ -2254,7 +2360,7 @@ fn dial_exchange<'p>(
         .map(|c| tokio_rustls::TlsConnector::from(Arc::new(c)));
     let up = exchange_endpoint(addr, tls.as_ref(), server_name.as_deref())?;
     let down = match down_addr {
-        Some(d) => exchange_endpoint(d, tls.as_ref(), server_name.as_deref())?,
+        Some((h, p)) => exchange_endpoint(hostport(&h, p), tls.as_ref(), server_name.as_deref())?,
         None => up.clone(),
     };
     future_into_py(py, async move {
@@ -2316,6 +2422,23 @@ fn quality_band(b: &Bound<'_, PyAny>) -> PyResult<zmux::QualityBand> {
     })
 }
 
+/// The `zmux.QualityBand` of a native band.
+fn quality_band_obj<'p>(py: Python<'p>, b: zmux::QualityBand) -> PyResult<Bound<'p, PyAny>> {
+    let d = PyDict::new(py);
+    d.set_item("rtt", dur(b.rtt))?;
+    d.set_item("rate_ratio", b.rate_ratio)?;
+    d.set_item("min_interval", b.min_interval.as_secs_f64())?;
+    types(py)?.getattr("QualityBand")?.call((), Some(&d))
+}
+
+/// The `zmux.CapacityFloor` of a native floor.
+fn capacity_floor_obj<'p>(py: Python<'p>, f: zmux::CapacityFloor) -> PyResult<Bound<'p, PyAny>> {
+    let d = PyDict::new(py);
+    d.set_item("rate", f.rate)?;
+    d.set_item("rate_ratio", f.rate_ratio)?;
+    types(py)?.getattr("CapacityFloor")?.call((), Some(&d))
+}
+
 /// A `zmux.CapacityFloor`.
 fn capacity_floor(f: &Bound<'_, PyAny>) -> PyResult<zmux::CapacityFloor> {
     Ok(zmux::CapacityFloor {
@@ -2355,6 +2478,7 @@ struct SessionReturned {
     bi: Returned<Py<PyAny>>,
     uni: Returned<Py<PyAny>>,
     datagrams: Returned<Py<PyAny>>,
+    events: Returned<Py<PyAny>>,
 }
 
 impl Session {
@@ -2381,22 +2505,23 @@ fn start<'p>(
     })
 }
 
-fn bi(py: Python<'_>, (s, r): (zmux::SendStream, zmux::RecvStream)) -> PyResult<Py<PyTuple>> {
-    Ok(PyTuple::new(
-        py,
-        [
-            SendStream::wrap(s).into_py_any(py)?,
-            RecvStream::wrap(r).into_py_any(py)?,
-        ],
-    )?
-    .unbind())
+/// The application error code of an abandoned stream or session
+/// (`ZMUX_CANCELLED`).
+const ZMUX_CANCELLED: u32 = 0x5a4d_0001;
+
+/// A `zmux.BiStream` of the two parts of a bidirectional stream.
+fn bi(py: Python<'_>, (s, r): (zmux::SendStream, zmux::RecvStream)) -> PyResult<Py<PyAny>> {
+    Ok(types(py)?
+        .getattr("BiStream")?
+        .call1((SendStream::wrap(s), RecvStream::wrap(r)))?
+        .unbind())
 }
 
 #[pymethods]
 impl Session {
     /// Establishes a session as the dialling side of `pipe`.
     #[staticmethod]
-    #[pyo3(signature = (pipe, config=None))]
+    #[pyo3(signature = (pipe, *, config=None))]
     fn connect<'p>(
         py: Python<'p>,
         pipe: &PipeIo,
@@ -2406,7 +2531,7 @@ impl Session {
     }
     /// Establishes a single-pipe session as the accepting side of `pipe`.
     #[staticmethod]
-    #[pyo3(signature = (pipe, config=None))]
+    #[pyo3(signature = (pipe, *, config=None))]
     fn accept<'p>(
         py: Python<'p>,
         pipe: &PipeIo,
@@ -2417,7 +2542,7 @@ impl Session {
     /// Establishes a session over a symmetric carrier: the roles are
     /// negotiated (role auto).
     #[staticmethod]
-    #[pyo3(signature = (pipe, config=None))]
+    #[pyo3(signature = (pipe, *, config=None))]
     fn symmetric<'p>(
         py: Python<'p>,
         pipe: &PipeIo,
@@ -2462,9 +2587,11 @@ impl Session {
     /// Opens a bidirectional stream as an asyncio-style pair
     /// `(StreamPairReader, StreamPairWriter)`: the reader offers
     /// `asyncio.StreamReader`'s reads, the writer `asyncio.StreamWriter`'s
-    /// writes. The keywords are those of `open_bi`.
+    /// writes (`high_water` the queued bytes above which `drain` waits,
+    /// `limit` the reader's buffer limit). The other keywords are those of
+    /// `open_bi`.
     #[pyo3(signature = (*, info=None, tlvs=None, priority=None, peer_priority=None,
-        high_water=65536))]
+        high_water=65536, limit=65536))]
     #[allow(clippy::too_many_arguments)]
     fn open_stream_pair<'p>(
         &self,
@@ -2474,6 +2601,7 @@ impl Session {
         priority: Option<(u8, bool)>,
         peer_priority: Option<(u8, bool)>,
         high_water: usize,
+        limit: usize,
     ) -> PyResult<Bound<'p, PyAny>> {
         let s = self.0.clone();
         let p = preamble(info, tlvs, false);
@@ -2490,7 +2618,12 @@ impl Session {
                 let pair = py
                     .import("zmux._streams")?
                     .getattr("_stream_pair")?
-                    .call1((SendStream::wrap(send), RecvStream::wrap(recv), high_water))?;
+                    .call1((
+                        SendStream::wrap(send),
+                        RecvStream::wrap(recv),
+                        high_water,
+                        limit,
+                    ))?;
                 Ok(pair.unbind())
             })
         })
@@ -2507,7 +2640,7 @@ impl Session {
         pipe_carrier: bool,
         priority: Option<(u8, bool)>,
         peer_priority: Option<(u8, bool)>,
-    ) -> PyResult<Py<PyTuple>> {
+    ) -> PyResult<Py<PyAny>> {
         let prios = Prios::new(priority, peer_priority)?;
         let pair = match preamble(info, tlvs, pipe_carrier) {
             Some(p) => self.0.try_open_bi_with(&p),
@@ -2637,17 +2770,44 @@ impl Session {
 
     /// The default quality band of the session's pipes (`None`: no
     /// reports).
-    fn set_quality_band(&self, band: Option<Bound<'_, PyAny>>) -> PyResult<()> {
+    #[getter]
+    fn quality_band<'p>(&self, py: Python<'p>) -> PyResult<Option<Bound<'p, PyAny>>> {
         self.0
-            .set_quality_band(band.map(|b| quality_band(&b)).transpose()?)
-            .map_err(pipe_err)
+            .quality_band()
+            .map(|b| quality_band_obj(py, b))
+            .transpose()
+    }
+    #[setter]
+    fn set_quality_band(&self, band: Option<Bound<'_, PyAny>>) -> PyResult<()> {
+        let native = band.as_ref().map(quality_band).transpose()?;
+        self.0.set_quality_band(native).map_err(pipe_err)
     }
 
     /// The floor under the session's outbound capacity (`None`: none).
-    fn set_capacity_floor(&self, floor: Option<Bound<'_, PyAny>>) -> PyResult<()> {
+    #[getter]
+    fn capacity_floor<'p>(&self, py: Python<'p>) -> PyResult<Option<Bound<'p, PyAny>>> {
         self.0
-            .set_capacity_floor(floor.map(|f| capacity_floor(&f)).transpose()?)
-            .map_err(pipe_err)
+            .capacity_floor()
+            .map(|f| capacity_floor_obj(py, f))
+            .transpose()
+    }
+    #[setter]
+    fn set_capacity_floor(&self, floor: Option<Bound<'_, PyAny>>) -> PyResult<()> {
+        let native = floor.as_ref().map(capacity_floor).transpose()?;
+        self.0.set_capacity_floor(native).map_err(pipe_err)
+    }
+
+    /// The default scheduling policy of new stream data.
+    #[getter]
+    fn scheduler<'p>(&self, py: Python<'p>) -> Bound<'p, PyAny> {
+        typed(py, "Scheduler", policy_name(&self.0.scheduler()).to_owned())
+    }
+    #[setter]
+    fn set_scheduler(&self, scheduler: &Bound<'_, PyAny>) -> PyResult<()> {
+        let p = scheduler_of(Some(scheduler))?
+            .ok_or_else(|| PyValueError::new_err("scheduler has no off setting"))?;
+        self.0.set_scheduler(p);
+        Ok(())
     }
 
     #[pyo3(signature = (*, info=None, tlvs=None, priority=None))]
@@ -2751,26 +2911,18 @@ impl Session {
         })
     }
 
-    /// Waits for the session's whole end; returns a `CloseInfo`. It returns
-    /// once every pipe's inbound side has ended (the peer read the close and
-    /// ended its side) or the linger timeout has passed, so a return before
-    /// the linger confirms that the peer read the close. "Delivered, or
-    /// given up after d" is `async with asyncio.timeout(d): await
-    /// s.wait_closed()`; a timeout changes nothing in the session.
+    /// Waits for the session's whole end and returns the
+    /// `SessionClosedError` that describes it (it is not raised). It
+    /// returns once every pipe's inbound side has ended (the peer read the
+    /// close and ended its side) or the linger timeout has passed, so a
+    /// return before the linger confirms that the peer read the close.
+    /// "Delivered, or given up after d" is `async with asyncio.timeout(d):
+    /// await s.wait_closed()`; a timeout changes nothing in the session.
     fn wait_closed<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let s = self.0.clone();
         future_into_py(py, async move {
-            let e = s.wait().await;
-            rt::attach(|py| {
-                let v = session_err(e).into_value(py).into_bound(py);
-                let info = types(py)?.getattr("CloseInfo")?.call1((
-                    v.getattr("code")?,
-                    v.getattr("reason")?,
-                    v.getattr("remote")?,
-                    &v,
-                ))?;
-                Ok(info.unbind())
-            })
+            let e = s.closed().await;
+            rt::attach(|py| Ok(session_err(e).into_value(py)))
         })
     }
 
@@ -2784,7 +2936,7 @@ impl Session {
     /// The next session event, or `None` once the session ended.
     fn next_event<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let s = self.0.clone();
-        future_into_py(py, async move {
+        returned_first(py, &self.2.events, async move {
             match s.next_event().await {
                 Some(e) => rt::attach(|py| event_obj(py, &e).map(Some)),
                 None => Ok(None),
@@ -2794,7 +2946,7 @@ impl Session {
 
     /// Session events as an async iterator.
     fn events(&self) -> EventStream {
-        EventStream(self.0.clone())
+        EventStream(self.0.clone(), self.2.clone())
     }
 
     /// Received datagrams as an async iterator.
@@ -2802,42 +2954,57 @@ impl Session {
         DatagramStream(self.0.clone(), self.2.clone())
     }
 
-    /// Shapes every outbound pipe by the JSON `definition`, bounded by `limits` and drawing from a
-    /// generator seeded by `seed` (tests); neither: no shaping. `budget` is called once here.
-    #[pyo3(signature = (*, definition=None, by_kind=None, by_variant=None, limits=None,
-        seed=None, budget=None))]
-    #[allow(clippy::too_many_arguments)]
-    fn set_shaper(
-        &self,
-        definition: Option<&str>,
-        by_kind: Option<Bound<'_, PyAny>>,
-        by_variant: Option<Bound<'_, PyAny>>,
-        limits: Option<Bound<'_, PyAny>>,
-        seed: Option<Vec<u8>>,
-        budget: Option<Py<PyAny>>,
-    ) -> PyResult<()> {
-        let budget = budget.map(shaping::budget_hook);
-        let o = shaping::options(limits.as_ref(), seed)?;
-        let by_carrier = by_kind.is_some() || by_variant.is_some();
-        let f = match (definition, by_carrier) {
-            (Some(j), false) => zmux_shaping::MachineFactory::from_json(j.as_bytes(), o),
-            (None, true) => {
-                let f = shaping::by_carrier(by_kind.as_ref(), by_variant.as_ref(), &o)?;
-                self.0.set_shaper(Some(Arc::new(f)), budget);
-                return Ok(());
-            }
-            (None, false) => {
-                self.0.set_shaper(None, budget);
-                return Ok(());
-            }
-            _ => {
-                return Err(PyValueError::new_err(
-                    "definition and by_kind or by_variant exclude each other",
-                ));
-            }
+    /// The shaper in force on every outbound pipe, as an opaque
+    /// `InstalledShaper` (the configuration's or the last one assigned);
+    /// `None` for no shaping.
+    #[getter]
+    fn shaper(&self) -> Option<shaping::InstalledShaper> {
+        self.0.shaper().map(shaping::InstalledShaper)
+    }
+    #[setter]
+    fn set_shaper(&self, shaper: Option<Bound<'_, PyAny>>) -> PyResult<()> {
+        let Some(v) = &shaper else {
+            self.0.set_shaper(None, None);
+            return Ok(());
         };
-        let f = f.map_err(|e| PyValueError::new_err(e.to_string()))?;
-        self.0.set_shaper(Some(Arc::new(f)), budget);
+        if let Ok(i) = v.cast::<shaping::InstalledShaper>() {
+            self.0.set_shaper(Some(i.get().0.clone()), None);
+            return Ok(());
+        }
+        if let Ok(b) = v.cast::<shaping::ShapingBundle>() {
+            let b = b.get().0.clone();
+            let budget = b.resolve("default").and_then(|k| k.budget());
+            self.0.set_shaper(Some(b), budget);
+            return Ok(());
+        }
+        let get = |n: &str| v.getattr(n);
+        let definition: Option<String> = get("definition")?.extract()?;
+        let by_kind = Some(get("by_kind")?).filter(|x| !x.is_none());
+        let by_variant = Some(get("by_variant")?).filter(|x| !x.is_none());
+        let limits = Some(get("limits")?).filter(|x| !x.is_none());
+        let seed: Option<Vec<u8>> = get("seed")?.extract()?;
+        let budget = Some(get("budget")?)
+            .filter(|x| !x.is_none())
+            .map(|b| shaping::budget_hook(b.unbind()));
+        let o = shaping::options(limits.as_ref(), seed)?;
+        let factory: Option<Arc<dyn zmux::shaping::Factory>> =
+            match (definition, by_kind.is_some() || by_variant.is_some()) {
+                (Some(j), false) => Some(Arc::new(
+                    zmux_shaping::MachineFactory::from_json(j.as_bytes(), o).map_err(value_err)?,
+                )),
+                (None, true) => Some(Arc::new(shaping::by_carrier(
+                    by_kind.as_ref(),
+                    by_variant.as_ref(),
+                    &o,
+                )?)),
+                (None, false) => None,
+                _ => {
+                    return Err(PyValueError::new_err(
+                        "definition and by_kind or by_variant exclude each other",
+                    ));
+                }
+            };
+        self.0.set_shaper(factory, budget);
         Ok(())
     }
 
@@ -2969,12 +3136,6 @@ impl Session {
         pool: PyRef<'_, pool::PipePool>,
     ) -> PyResult<pool::MaintainHandle> {
         pool::maintain(py, self, &pool)
-    }
-
-    /// Whether a pipe added now would join at once rather than wait.
-    #[getter]
-    fn join_ready(&self) -> bool {
-        self.0.join_ready()
     }
 
     /// Revalidates every live outbound pipe after a network change.
@@ -3113,8 +3274,8 @@ impl Session {
         future_into_py(py, async move { Ok(o) })
     }
     /// A normal exit closes and waits for the end (`close`, then
-    /// `wait_closed`); an exit by an exception aborts with code 0 and an
-    /// empty reason and returns at once.
+    /// `wait_closed`); an exit by an exception starts a close with
+    /// `ZMUX_CANCELLED` and an empty reason and returns at once.
     fn __aexit__<'p>(
         &self,
         py: Python<'p>,
@@ -3124,12 +3285,13 @@ impl Session {
     ) -> PyResult<Bound<'p, PyAny>> {
         let s = self.0.clone();
         if !t.is_none() {
-            s.abort(zmux::VarInt::from_u32(0), b"");
+            // The close starts with the call; its future only waits.
+            drop(s.close_with_error(zmux::VarInt::from_u32(ZMUX_CANCELLED), b""));
             return future_into_py(py, async move { Ok(false) });
         }
         future_into_py(py, async move {
             s.close().await;
-            s.wait().await;
+            s.closed().await;
             Ok(false)
         })
     }
@@ -3142,9 +3304,25 @@ impl Session {
         returned_first(py, &self.2.bi, async move {
             match s.accept_bi().await {
                 Ok(pair) => rt::attach(|py| bi(py, pair)),
-                Err(_) => Err(PyStopAsyncIteration::new_err(())),
+                Err(e) => Err(iteration_end(e)),
             }
         })
+    }
+}
+
+/// Whether the session ended cleanly: closed by either application with
+/// code 0.
+fn clean_end(e: &zmux::SessionError) -> bool {
+    matches!(e, zmux::SessionError::ApplicationClosed { code, .. } if code.into_inner() == 0)
+}
+
+/// The end of an iteration over a session's streams or datagrams: the
+/// iteration stops on a clean end and raises any other error.
+fn iteration_end(e: zmux::SessionError) -> PyErr {
+    if clean_end(&e) {
+        PyStopAsyncIteration::new_err(())
+    } else {
+        session_err(e)
     }
 }
 
@@ -3305,7 +3483,7 @@ fn event_obj(py: Python<'_>, e: &zmux::SessionEvent) -> PyResult<Py<PyAny>> {
 
 /// `Session.events()`: session events until the session ended.
 #[pyclass(frozen, module = "zmux")]
-struct EventStream(zmux::Session);
+struct EventStream(zmux::Session, Arc<SessionReturned>);
 
 #[pymethods]
 impl EventStream {
@@ -3314,7 +3492,7 @@ impl EventStream {
     }
     fn __anext__<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let s = self.0.clone();
-        future_into_py(py, async move {
+        returned_first(py, &self.1.events, async move {
             match s.next_event().await {
                 Some(e) => rt::attach(|py| event_obj(py, &e)),
                 None => Err(PyStopAsyncIteration::new_err(())),
@@ -3337,7 +3515,7 @@ impl DatagramStream {
         returned_first(py, &self.1.datagrams, async move {
             match s.read_datagram().await {
                 Ok(b) => Ok(pyb(&b)),
-                Err(_) => Err(PyStopAsyncIteration::new_err(())),
+                Err(e) => Err(iteration_end(e)),
             }
         })
     }
@@ -3379,18 +3557,6 @@ pub(crate) fn direction_obj(py: Python<'_>, d: zmux::PipeDirection) -> Bound<'_,
     typed(py, "Direction", name.to_owned())
 }
 
-/// A local setting that follows the peer's request unless set
-/// (`zmux.AUTO`).
-fn auto_or<T>(
-    v: &Bound<'_, PyAny>,
-    set: impl FnOnce(&Bound<'_, PyAny>) -> PyResult<T>,
-) -> PyResult<Option<T>> {
-    if is_setting(v, "AUTO")? {
-        return Ok(None);
-    }
-    set(v).map(Some)
-}
-
 /// The Python value of a local setting that follows the peer's request
 /// unless set.
 fn auto_obj<'p, T: IntoPyObject<'p>>(py: Python<'p>, v: Option<T>) -> PyResult<Bound<'p, PyAny>> {
@@ -3398,11 +3564,6 @@ fn auto_obj<'p, T: IntoPyObject<'p>>(py: Python<'p>, v: Option<T>) -> PyResult<B
         None => setting(py, "AUTO"),
         Some(v) => v.into_bound_py_any(py),
     }
-}
-
-/// A pipe's probation: `zmux.INHERIT` the session's, else as the session's.
-fn pipe_probation(v: &Bound<'_, PyAny>) -> PyResult<zmux::Inherit<Option<zmux::Cap<Duration>>>> {
-    inherit(v, |x| probation_of("probation", x))
 }
 
 /// The native options of a pipe from a `PipeOptions` (`None`: the
@@ -3416,17 +3577,24 @@ pub(crate) fn pipe_options(options: Option<Bound<'_, PyAny>>) -> PyResult<zmux::
     o.direction = direction_of(&get("direction")?)?;
     o.record_mode = inherit(&get("record_mode")?, seal::record_mode_of)?;
     o.key_group = inherit(&get("key_group")?, |x| field_count("key_group", x))?;
-    o.send_priority = auto_or(&get("send_priority")?, |x| field_count("send_priority", x))?;
-    o.receive_priority = field_count("receive_priority", &get("receive_priority")?)?;
-    o.send_standby = auto_or(&get("send_standby")?, |x| {
+    o.send_priority = change(&get("send_priority")?, |x| field_count("send_priority", x))?;
+    o.receive_priority = change(&get("receive_priority")?, |x| {
+        field_count("receive_priority", x)
+    })?;
+    o.send_standby = change(&get("send_standby")?, |x| {
         required("send_standby", x)?.extract()
     })?;
-    o.receive_standby = required("receive_standby", &get("receive_standby")?)?.extract()?;
-    o.weight = field_count("weight", &get("weight")?)?;
-    o.probation = pipe_probation(&get("probation")?)?;
+    o.receive_standby = change(&get("receive_standby")?, |x| {
+        required("receive_standby", x)?.extract()
+    })?;
+    o.weight = change(&get("weight")?, |x| field_count("weight", x))?;
+    o.probation = change(&get("probation")?, |x| probation_of("probation", x))?;
     o.label = get("label")?.extract::<Option<String>>()?.map(Into::into);
     o.fate_group = field_count("fate_group", &get("fate_group")?)?;
-    o.liveness = pipe_liveness(required("liveness", &get("liveness")?)?)?;
+    o.liveness = change(&get("liveness")?, |x| {
+        pipe_liveness(required("liveness", x)?)
+    })?;
+    o.quality_band = change(&get("quality_band")?, quality_band)?;
     o.return_on_reply = required("return_on_reply", &get("return_on_reply")?)?.extract()?;
     o.validate().map_err(pipe_err)?;
     Ok(o)
@@ -3444,18 +3612,35 @@ pub(crate) fn options_obj<'p>(py: Python<'p>, o: &zmux::PipeOptions) -> PyResult
         "key_group",
         inherit_obj(py, o.key_group, |g| typed_int(py, "KeyGroup", g))?,
     )?;
-    d.set_item("send_priority", auto_obj(py, o.send_priority)?)?;
-    d.set_item("receive_priority", o.receive_priority)?;
-    d.set_item("send_standby", auto_obj(py, o.send_standby)?)?;
-    d.set_item("receive_standby", o.receive_standby)?;
-    d.set_item("weight", o.weight)?;
+    let plain = |v: u64| Ok(v.into_pyobject(py)?.into_any());
+    d.set_item("send_priority", change_obj(py, o.send_priority, plain)?)?;
+    d.set_item(
+        "receive_priority",
+        change_obj(py, o.receive_priority, plain)?,
+    )?;
+    d.set_item(
+        "send_standby",
+        change_obj(py, o.send_standby, |b| b.into_bound_py_any(py))?,
+    )?;
+    d.set_item(
+        "receive_standby",
+        change_obj(py, o.receive_standby, |b| b.into_bound_py_any(py))?,
+    )?;
+    d.set_item("weight", change_obj(py, o.weight, plain)?)?;
     d.set_item(
         "probation",
-        inherit_obj(py, o.probation, |p| probation_obj(py, p))?,
+        change_obj(py, o.probation, |p| probation_obj(py, p))?,
     )?;
     d.set_item("label", o.label.as_deref())?;
     d.set_item("fate_group", o.fate_group)?;
-    d.set_item("liveness", pipe_liveness_obj(py, &o.liveness)?)?;
+    d.set_item(
+        "liveness",
+        change_obj(py, o.liveness, |l| pipe_liveness_obj(py, &l))?,
+    )?;
+    d.set_item(
+        "quality_band",
+        change_obj(py, o.quality_band, |b| quality_band_obj(py, b))?,
+    )?;
     d.set_item("return_on_reply", o.return_on_reply)?;
     types(py)?.getattr("PipeOptions")?.call((), Some(&d))
 }
@@ -3472,7 +3657,7 @@ fn typed_int<'p>(py: Python<'p>, enum_name: &str, v: u64) -> PyResult<Bound<'p, 
 
 /// The options of a live pipe that `Pipe.update` changes, and those fixed
 /// when it is added.
-const UPDATABLE: [&str; 7] = [
+const UPDATABLE: [&str; 8] = [
     "send_priority",
     "receive_priority",
     "send_standby",
@@ -3480,6 +3665,7 @@ const UPDATABLE: [&str; 7] = [
     "weight",
     "probation",
     "liveness",
+    "quality_band",
 ];
 const FIXED: [&str; 6] = [
     "direction",
@@ -3499,6 +3685,19 @@ fn change<T>(
         return Ok(zmux::Change::Clear);
     }
     set(v).map(zmux::Change::Set)
+}
+
+/// The Python value of a pipe setting: `zmux.CLEAR` when it is the
+/// default, else its value.
+fn change_obj<'p, T>(
+    py: Python<'p>,
+    v: zmux::Change<T>,
+    set: impl FnOnce(T) -> PyResult<Bound<'p, PyAny>>,
+) -> PyResult<Bound<'p, PyAny>> {
+    match v {
+        zmux::Change::Set(t) => set(t),
+        _ => setting(py, "CLEAR"),
+    }
 }
 
 /// The native update of `Pipe.update(**fields)`.
@@ -3529,7 +3728,8 @@ fn pipe_update(kw: Option<&Bound<'_, PyDict>>) -> PyResult<zmux::PipeUpdate> {
             }
             "weight" => u.weight = change(v, |x| field_count(&k, x))?,
             "probation" => u.probation = change(v, |x| probation_of(&k, x))?,
-            _ => u.liveness = change(v, |x| pipe_liveness(required(&k, x)?))?,
+            "liveness" => u.liveness = change(v, |x| pipe_liveness(required(&k, x)?))?,
+            _ => u.quality_band = change(v, quality_band)?,
         }
     }
     Ok(u)
@@ -3707,7 +3907,7 @@ impl Pipe {
         future_into_py(py, async move { p.attached().await.map_err(pipe_err) })
     }
     /// Waits until the pipe ended.
-    fn closed<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+    fn wait_closed<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let p = self.0.clone();
         future_into_py(py, async move { p.closed().await.map_err(pipe_err) })
     }
@@ -3749,6 +3949,8 @@ impl Pipe {
         let o = slf.unbind();
         future_into_py(py, async move { Ok(o) })
     }
+    /// A normal exit closes the pipe gracefully, an exit by an exception
+    /// aborts it.
     fn __aexit__<'p>(
         &self,
         py: Python<'p>,
@@ -3771,32 +3973,6 @@ impl Pipe {
     }
     fn stats<'p>(&self, py: Python<'p>) -> PyResult<Option<Bound<'p, PyAny>>> {
         self.0.stats().map(|s| stats_dict(py, &s)).transpose()
-    }
-    /// Sets the tier of the local outbound direction (`update` with
-    /// `send_priority`).
-    fn set_send_priority(&self, priority: u64) -> PyResult<()> {
-        self.0.set_send_priority(priority).map_err(pipe_err)
-    }
-    /// Requests a tier for the peer's outbound direction (`update` with
-    /// `receive_priority`).
-    fn set_receive_priority(&self, priority: u64) -> PyResult<()> {
-        self.0.set_receive_priority(priority).map_err(pipe_err)
-    }
-    /// Sets whether the local outbound direction is standby (`update` with
-    /// `send_standby`).
-    fn set_send_standby(&self, standby: bool) -> PyResult<()> {
-        self.0.set_send_standby(standby).map_err(pipe_err)
-    }
-    /// Requests standby for the peer's outbound direction (`update` with
-    /// `receive_standby`).
-    fn set_receive_standby(&self, standby: bool) -> PyResult<()> {
-        self.0.set_receive_standby(standby).map_err(pipe_err)
-    }
-    /// The pipe's own quality band (`None`: the session's default).
-    fn set_quality_band(&self, band: Option<Bound<'_, PyAny>>) -> PyResult<()> {
-        self.0
-            .set_quality_band(band.map(|b| quality_band(&b)).transpose()?)
-            .map_err(pipe_err)
     }
 }
 
@@ -3822,7 +3998,7 @@ async fn held<T>(p: &Part<T>) -> PyResult<MappedMutexGuard<'_, T>> {
     MutexGuard::try_map(p.lock().await, Option::as_mut).map_err(|_| taken())
 }
 
-/// The part now, for the calls that never wait; `RuntimeError` while an
+/// The part now, for the calls that never wait; `StreamBusyError` while an
 /// operation is in progress.
 fn held_now<T>(p: &Part<T>) -> PyResult<MappedMutexGuard<'_, T>> {
     MutexGuard::try_map(p.try_lock().map_err(|_| busy())?, Option::as_mut).map_err(|_| taken())
@@ -3965,13 +4141,15 @@ impl SendStream {
         data: pyo3::pybacked::PyBackedBytes,
     ) -> PyResult<Bound<'p, PyAny>> {
         let s = self.0.clone();
+        let n = data.len();
         // Zero-copy for `bytes`: the chunk keeps the Python object alive.
         future_into_py(py, async move {
             held(&s)
                 .await?
                 .write_chunk(Bytes::from_owner(data))
                 .await
-                .map_err(stream_err)
+                .map_err(stream_err)?;
+            Ok(n)
         })
     }
     /// Writes the buffer without copying it; the caller does not modify it
@@ -3983,8 +4161,14 @@ impl SendStream {
     ) -> PyResult<Bound<'p, PyAny>> {
         let s = self.0.clone();
         let data = lend(buffer)?;
+        let n = data.len();
         future_into_py(py, async move {
-            held(&s).await?.write_chunk(data).await.map_err(stream_err)
+            held(&s)
+                .await?
+                .write_chunk(data)
+                .await
+                .map_err(stream_err)?;
+            Ok(n)
         })
     }
     /// Opens the stream now and waits until the opening frame and the data
@@ -3993,7 +4177,10 @@ impl SendStream {
     fn flush<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let s = self.0.clone();
         future_into_py(py, async move {
-            held(&s).await?.flush().await.map_err(stream_err)
+            {
+                use tokio::io::AsyncWriteExt;
+                held(&s).await?.flush().await.map_err(io_err)
+            }
         })
     }
     /// Ends the stream cleanly (FIN).
@@ -4010,7 +4197,6 @@ impl SendStream {
     /// returns or is cancelled. During the read drain after the peer's
     /// close it raises the session's error; the exit of `async with`
     /// ignores it.
-    #[pyo3(signature = (code=0))]
     fn reset(&self, code: u64) -> PyResult<()> {
         let code = varint(code)?;
         later(&self.0, move |s| s.reset(code))
@@ -4056,20 +4242,34 @@ impl SendStream {
                 .map_err(stream_err)
         })
     }
-    /// The bytes written and not yet released that the part may hold.
+    /// The bytes written and not yet released that the part may hold: the
+    /// last assignment, else the session's `Config.send_buffer`.
+    #[getter]
+    fn send_buffer(&self) -> PyResult<u64> {
+        held_now(&self.0)?.send_buffer().map_err(stream_err)
+    }
+    #[setter]
     fn set_send_buffer(&self, n: u64) -> PyResult<()> {
         held_now(&self.0)?.set_send_buffer(n).map_err(stream_err)
     }
-    /// The part's scheduling policy (a name of `Config.scheduler`); `None`
-    /// follows the session's.
-    #[pyo3(signature = (scheduler))]
-    fn set_scheduler(&self, scheduler: Option<&str>) -> PyResult<()> {
-        let p = scheduler.map(policy).transpose()?;
+    /// The part's scheduling policy; `None` follows the session's.
+    #[getter]
+    fn scheduler<'p>(&self, py: Python<'p>) -> PyResult<Option<Bound<'p, PyAny>>> {
+        let p = held_now(&self.0)?.scheduler().map_err(stream_err)?;
+        Ok(p.map(|p| typed(py, "Scheduler", policy_name(&p).to_owned())))
+    }
+    #[setter]
+    fn set_scheduler(&self, scheduler: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+        let p = scheduler_of(scheduler)?;
         held_now(&self.0)?.set_scheduler(p).map_err(stream_err)
     }
     /// Sends the part's chunks redundantly on a second pipe (multipath):
     /// `True` on, `False` off, `None` following the session's `redundancy`.
-    #[pyo3(signature = (on))]
+    #[getter]
+    fn redundant(&self) -> PyResult<Option<bool>> {
+        held_now(&self.0)?.redundant().map_err(stream_err)
+    }
+    #[setter]
     fn set_redundant(&self, on: Option<bool>) -> PyResult<()> {
         held_now(&self.0)?.set_redundant(on).map_err(stream_err)
     }
@@ -4095,7 +4295,8 @@ impl SendStream {
         let o = slf.unbind();
         future_into_py(py, async move { Ok(o) })
     }
-    /// Finishes on a normal exit (unless already ended), resets with code 0 on an exception.
+    /// Finishes on a normal exit (unless already ended), resets with
+    /// `ZMUX_CANCELLED` on an exception.
     fn __aexit__<'p>(
         &self,
         py: Python<'p>,
@@ -4106,14 +4307,16 @@ impl SendStream {
         let ok = t.is_none();
         let s = self.0.clone();
         future_into_py(py, async move {
+            if !ok {
+                // At once, as `reset()`: a write another task has blocked on
+                // flow control does not hold the exit.
+                let _ = later(&s, |g| g.reset(zmux::VarInt::from_u32(ZMUX_CANCELLED)));
+                return Ok(false);
+            }
             let mut g = s.lock().await;
             let Some(g) = g.as_mut() else {
                 return Ok(false);
             };
-            if !ok {
-                let _ = g.reset(zmux::VarInt::from_u32(0));
-                return Ok(false);
-            }
             match g.finish() {
                 Err(e) if kind_of(&e) == "ClosedLocally" => Ok(false),
                 r => r.map(|()| false).map_err(stream_err),
@@ -4380,14 +4583,7 @@ impl RecvStream {
                 let (have, part) = collect(&s, &unread, n).await?;
                 if have < n {
                     let partial = unread_drain(&unread, have);
-                    let e = zmux::ReadExactError::FinishedEarly(have);
-                    let err = raise("IncompleteReadError", &e, false, None);
-                    rt::attach(|py| {
-                        let v = err.value(py);
-                        let _ = v.setattr("partial", PyBytes::new(py, &partial));
-                        let _ = v.setattr("expected", n);
-                    });
-                    return Err(err);
+                    return Err(incomplete_read(&partial, n));
                 }
                 Ok((pyb(&unread_drain(&unread, n)), part))
             },
@@ -4417,7 +4613,6 @@ impl RecvStream {
     /// cancelled. During the read drain after the peer's close it discards
     /// the unread data and raises the session's error; the exit of
     /// `async with` ignores it.
-    #[pyo3(signature = (code=0))]
     fn stop(&self, code: u64) -> PyResult<()> {
         let code = varint(code)?;
         later(&self.0, move |r| r.stop(code))
@@ -4427,14 +4622,31 @@ impl RecvStream {
     fn reject(&self) -> PyResult<()> {
         take_now(&self.0)?.reject().map_err(stream_err)
     }
-    /// The receive window of the stream: `initial` now, auto-tuned up to
-    /// `maximum`.
-    fn set_receive_window(&self, initial: u64, maximum: u64) -> PyResult<()> {
+    /// The receive window of the stream, `(window, maximum)`: the window
+    /// now advertised, which auto-tuning raises up to `maximum`.
+    #[getter]
+    fn receive_window(&self) -> PyResult<(u64, u64)> {
+        held_now(&self.0)?.receive_window().map_err(stream_err)
+    }
+    #[setter]
+    fn set_receive_window(&self, window: (u64, u64)) -> PyResult<()> {
         held_now(&self.0)?
-            .set_receive_window(initial, maximum)
+            .set_receive_window(window.0, window.1)
             .map_err(stream_err)
     }
-    /// Asks the peer to send the stream with `priority`.
+    /// The priority last asked of the peer for the stream; `None` when
+    /// none was asked.
+    #[getter]
+    fn peer_priority<'p>(&self, py: Python<'p>) -> PyResult<Option<Bound<'p, PyAny>>> {
+        let Some(p) = held_now(&self.0)?.peer_priority().map_err(stream_err)? else {
+            return Ok(None);
+        };
+        types(py)?
+            .getattr("Priority")?
+            .call1((p.urgency(), p.incremental()))
+            .map(Some)
+    }
+    #[setter]
     fn set_peer_priority(&self, priority: (u8, bool)) -> PyResult<()> {
         held_now(&self.0)?
             .set_peer_priority(self::priority(priority.0, priority.1)?)
@@ -4446,8 +4658,13 @@ impl RecvStream {
         future_into_py(py, async move {
             // Holds nothing of the part: a read goes on while this waits.
             let fut = held(&s).await?.read_datagram_owned();
-            let (c, b) = fut.await.map_err(stream_err)?;
-            Ok((c, pyb(&b)))
+            let d = fut.await.map_err(stream_err)?;
+            rt::attach(|py| {
+                Ok(types(py)?
+                    .getattr("StreamDatagram")?
+                    .call1((d.context, PyBytes::new(py, &d.payload)))?
+                    .unbind())
+            })
         })
     }
     /// A snapshot of the stream's statistics.
@@ -4488,7 +4705,9 @@ impl RecvStream {
         let o = slf.unbind();
         future_into_py(py, async move { Ok(o) })
     }
-    /// Stops the stream with code 0 on an exception; nothing on a normal exit.
+    /// Releases the stream with `stop(0)` on exit, an exception or not
+    /// (automatic release): it returns at once, and is a no-op once the
+    /// stream ended.
     fn __aexit__<'p>(
         &self,
         py: Python<'p>,
@@ -4496,12 +4715,10 @@ impl RecvStream {
         _v: Bound<'p, PyAny>,
         _tb: Bound<'p, PyAny>,
     ) -> PyResult<Bound<'p, PyAny>> {
-        let ok = t.is_none();
+        let _ = t;
         let s = self.0.clone();
         future_into_py(py, async move {
-            if !ok && let Some(g) = s.lock().await.as_mut() {
-                let _ = g.stop(zmux::VarInt::from_u32(0));
-            }
+            let _ = later(&s, |r| r.stop(zmux::VarInt::from_u32(0)));
             Ok(false)
         })
     }
@@ -4619,19 +4836,46 @@ fn classify_first_bytes<'p>(
     data: &[u8],
     framing: &str,
 ) -> PyResult<(Bound<'p, PyAny>, usize)> {
-    use zmux::FirstBytes as F;
-    use zmux::proto::record::Framing;
+    use zmux::adapter::{FirstBytes as F, Framing};
     let framing = match framing {
         "byte_stream" => Framing::ByteStream,
         "records" => Framing::Records,
         f => return Err(PyValueError::new_err(format!("unknown framing {f:?}"))),
     };
-    let (name, need) = match zmux::classify_first_bytes(data, framing) {
+    let (name, need) = match zmux::adapter::classify_first_bytes(data, framing) {
         F::NeedMore(n) => ("need_more", n),
         F::Record => ("record", 0),
         F::Other => ("other", 0),
     };
     Ok((typed(py, "FirstBytes", name.to_owned()), need))
+}
+
+/// For an admission's `decide`: whether `prefix`, a byte-stream carrier's
+/// first bytes, begins a Join of a session of `listener`: `(JoinPrefix,
+/// need)`, `need` the bytes wanted in all for `NEED_MORE` (ask for them
+/// with `AdmissionVerdict.more`, within `max_peek`) and 0 otherwise.
+/// Advisory: the join still authenticates.
+#[pyfunction]
+fn join_prefix<'p>(
+    py: Python<'p>,
+    listener: &Listener,
+    prefix: &[u8],
+) -> PyResult<(Bound<'p, PyAny>, usize)> {
+    use zmux::adapter::JoinPrefix as J;
+    let (name, need) = match listener.inner.adapter().join_prefix(prefix) {
+        J::Known => ("known", 0),
+        J::Unknown => ("unknown", 0),
+        J::NotJoin => ("not_join", 0),
+        J::Need(n) => ("need_more", n),
+    };
+    Ok((typed(py, "JoinPrefix", name.to_owned()), need))
+}
+
+/// Whether a pipe added to `session` now would join at once rather than
+/// wait: join keys in place, room for a join and no join backoff running.
+#[pyfunction]
+fn join_ready(session: &Session) -> bool {
+    session.0.adapter().join_ready()
 }
 
 /// Accepts sessions (and multipath joins) from any number of carriers.
@@ -4655,7 +4899,7 @@ impl Listener {
         let tasks = self.spawner();
         future_into_py(py, async move {
             let tcp = tokio::net::TcpListener::bind(addr).await.map_err(io_err)?;
-            let local = tcp.local_addr().map_err(io_err)?.to_string();
+            let local = host_port(tcp.local_addr().map_err(io_err)?);
             tasks(tokio::spawn(run(l, tcp)));
             Ok(local)
         })
@@ -4677,42 +4921,48 @@ impl Listener {
 #[pymethods]
 impl Listener {
     #[new]
-    #[pyo3(signature = (config=None, *,
-        max_pending=Some(zmux::proto::listener::DEFAULT_MAX_PENDING), max_pending_per_source=8,
-        source_prefix_v4=32, source_prefix_v6=64,
-        max_pending_per_session=4, first_record_timeout=Some(2.0), handshake_timeout=Some(10.0),
-        max_record_size=65535, accept_sessions=true, max_suspended=1024,
-        memory_budget=Some(zmux::DEFAULT_MEMORY_BUDGET), instance_id=b"".to_vec(),
-        on_memory_pressure=None, trusted_proxies=None, forwarded_header=None,
-        proxy_protocol=false, admission=None, inbound_transform=None,
-        on_reject=None, secure_server=None, session_config=None, logger=None))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (*, config=None, listener_config=None))]
     fn new(
         py: Python<'_>,
         config: Option<Bound<'_, PyAny>>,
-        max_pending: Option<usize>,
-        max_pending_per_source: usize,
-        source_prefix_v4: i64,
-        source_prefix_v6: i64,
-        max_pending_per_session: usize,
-        first_record_timeout: Option<f64>,
-        handshake_timeout: Option<f64>,
-        max_record_size: u64,
-        accept_sessions: bool,
-        max_suspended: usize,
-        memory_budget: Option<u64>,
-        instance_id: Vec<u8>,
-        on_memory_pressure: Option<Py<PyAny>>,
-        trusted_proxies: Option<Vec<String>>,
-        forwarded_header: Option<String>,
-        proxy_protocol: bool,
-        admission: Option<PyRef<'_, Admission>>,
-        inbound_transform: Option<Py<PyAny>>,
-        on_reject: Option<Py<PyAny>>,
-        secure_server: Option<PyRef<'_, seal::SecureServer>>,
-        session_config: Option<Py<PyAny>>,
-        logger: Option<Bound<'_, PyAny>>,
+        listener_config: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
+        let lc = match listener_config {
+            Some(c) => c,
+            None => types(py)?.getattr("ListenerConfig")?.call0()?,
+        };
+        let get = |n: &str| lc.getattr(n);
+        let max_pending: Option<usize> = get("max_pending")?.extract()?;
+        let max_pending_per_source: usize = get("max_pending_per_source")?.extract()?;
+        let source_prefix_v4: i64 = get("source_prefix_v4")?.extract()?;
+        let source_prefix_v6: i64 = get("source_prefix_v6")?.extract()?;
+        let max_pending_per_session: usize = get("max_pending_per_session")?.extract()?;
+        let first_record_timeout: Option<f64> = get("first_record_timeout")?.extract()?;
+        let handshake_timeout: Option<f64> = get("handshake_timeout")?.extract()?;
+        let max_record_size: u64 = get("max_record_size")?.extract()?;
+        let accept_sessions: bool = get("accept_sessions")?.extract()?;
+        let max_suspended: usize = get("max_suspended")?.extract()?;
+        let memory_budget: Option<u64> = get("memory_budget")?.extract()?;
+        let instance_id: Vec<u8> = get("instance_id")?.extract()?;
+        let on_memory_pressure = Some(get("on_memory_pressure")?)
+            .filter(|f| !f.is_none())
+            .map(Bound::unbind);
+        let trusted_proxies: Option<Vec<String>> = get("trusted_proxies")?.extract()?;
+        let forwarded_header: Option<String> = get("forwarded_header")?.extract()?;
+        let proxy_protocol: bool = get("proxy_protocol")?.extract()?;
+        let admission: Option<PyRef<'_, Admission>> = get("admission")?.extract()?;
+        let inbound_transform = Some(get("inbound_transform")?)
+            .filter(|f| !f.is_none())
+            .map(Bound::unbind);
+        let on_reject = Some(get("on_reject")?)
+            .filter(|f| !f.is_none())
+            .map(Bound::unbind);
+        let secure_server: Option<PyRef<'_, seal::SecureServer>> =
+            get("secure_server")?.extract()?;
+        let session_config = Some(get("session_config")?)
+            .filter(|f| !f.is_none())
+            .map(Bound::unbind);
+        let logger = Some(get("logger")?).filter(|f| !f.is_none());
         let mut l = zmux::ListenerConfig::default();
         l.logger = logger.as_ref().map(logger_of);
         let mut trusted = zmux::TrustedProxies::new().with_proxy_protocol(proxy_protocol);
@@ -4748,18 +4998,19 @@ impl Listener {
             )));
         }
         if let Some(f) = on_memory_pressure {
-            l.on_memory_pressure = Some(zmux::OnMemoryPressure(Arc::new(move |m| {
+            l.on_memory_pressure = Some(zmux::OnMemoryPressure::new(move |m| {
                 rt::attach(|py| {
                     if let Err(e) = f.call1(py, (m.used, m.budget, m.active)) {
                         e.write_unraisable(py, Some(f.bind(py)));
                     }
                 });
-            })));
+            }));
         }
         l.admission = admission.map(|a| a.for_listener(py));
         if let Some(f) = inbound_transform {
             let locals = pyo3_async_runtimes::tokio::get_current_locals(py).map_err(|_| {
-                PyRuntimeError::new_err(
+                new_err(
+                    "NoRunningLoopError",
                     "inbound_transform needs the Listener made inside a running event loop",
                 )
             })?;
@@ -4772,7 +5023,8 @@ impl Listener {
                 ));
             }
             let locals = pyo3_async_runtimes::tokio::get_current_locals(py).map_err(|_| {
-                PyRuntimeError::new_err(
+                new_err(
+                    "NoRunningLoopError",
                     "secure_server needs the Listener made inside a running event loop",
                 )
             })?;
@@ -4789,38 +5041,21 @@ impl Listener {
         })
     }
 
-    /// For an admission's `decide`: whether `prefix`, a byte-stream
-    /// carrier's first bytes, begins a Join of a session of this listener:
-    /// `(JoinPrefix, need)`, `need` the bytes wanted in all for `NEED_MORE`
-    /// (ask for them with `AdmissionVerdict.more`, within `max_peek`) and 0
-    /// otherwise. Advisory: the join still authenticates.
-    fn join_prefix<'p>(
-        &self,
-        py: Python<'p>,
-        prefix: &[u8],
-    ) -> PyResult<(Bound<'p, PyAny>, usize)> {
-        use zmux::JoinPrefix as J;
-        let (name, need) = match self.inner.join_prefix(prefix) {
-            J::Known => ("known", 0),
-            J::Unknown => ("unknown", 0),
-            J::NotJoin => ("not_join", 0),
-            J::Need(n) => ("need_more", n),
-        };
-        Ok((typed(py, "JoinPrefix", name.to_owned()), need))
-    }
-
     /// Serves plain TCP on `addr`; returns the bound address. With the
     /// listener's `admission`, a connection reaches it only once admitted.
-    fn serve_tcp<'p>(&self, py: Python<'p>, addr: String) -> PyResult<Bound<'p, PyAny>> {
-        self.serve(py, addr, |l, tcp| l.serve(tcp))
+    #[pyo3(signature = (host, port))]
+    fn serve_tcp<'p>(&self, py: Python<'p>, host: String, port: u16) -> PyResult<Bound<'p, PyAny>> {
+        self.serve(py, hostport(&host, port), |l, tcp| l.serve(tcp))
     }
-    #[pyo3(signature = (addr, *, tls))]
+    #[pyo3(signature = (host, port, *, tls))]
     fn serve_tls<'p>(
         &self,
         py: Python<'p>,
-        addr: String,
+        host: String,
+        port: u16,
         tls: PyRef<'_, TlsConfig>,
     ) -> PyResult<Bound<'p, PyAny>> {
+        let addr = hostport(&host, port);
         let c = Arc::new(tls.server_zmux()?);
         self.serve(py, addr, move |l, tcp| zmux_rustls::serve(l, tcp, c))
     }
@@ -4833,13 +5068,14 @@ impl Listener {
     /// upgrades (with `websocket`). A connection from a trusted
     /// intermediary configured for the PROXY protocol reads its header
     /// first.
-    #[pyo3(signature = (addr, *, path="/zmux".to_owned(), tls=None, exchange=None,
+    #[pyo3(signature = (host, port, *, path="/zmux".to_owned(), tls=None, exchange=None,
         websocket=false, websocket_no_subprotocol=false, pair_field=None))]
     #[allow(clippy::too_many_arguments)]
     fn serve_http<'p>(
         &self,
         py: Python<'p>,
-        addr: String,
+        host: String,
+        port: u16,
         path: String,
         tls: Option<PyRef<'_, TlsConfig>>,
         exchange: Option<PyRef<'_, ExchangeOptions>>,
@@ -4847,6 +5083,7 @@ impl Listener {
         websocket_no_subprotocol: bool,
         pair_field: Option<String>,
     ) -> PyResult<Bound<'p, PyAny>> {
+        let addr = hostport(&host, port);
         let mut opts = zmux_http::Options::new().with_path(path);
         if let Some(f) = pair_field_of(pair_field)? {
             opts = opts.with_pair_field(f);
@@ -4869,14 +5106,15 @@ impl Listener {
             tls.server_alpn(|| vec![b"h2".to_vec(), HTTP1.to_vec()])?,
         ));
         self.serve(py, addr, move |l, tcp| async move {
-            let trusted = Arc::new(l.trusted_proxies().clone());
+            let trusted = Arc::new(l.adapter().trusted_proxies().clone());
             endpoint
                 .serve_proxied(
                     || tcp.accept(),
                     move |mut conn, peer| {
                         let (acc, trusted) = (acc.clone(), trusted.clone());
                         async move {
-                            let source = zmux::proxied_source(&mut conn, peer, &trusted).await?;
+                            let source =
+                                zmux::adapter::proxied_source(&mut conn, peer, &trusted).await?;
                             Ok((acc.accept(conn).await?, source))
                         }
                     },
@@ -4887,13 +5125,15 @@ impl Listener {
     /// `ws://`, or `wss://` with `tls`. With the listener's `admission`, an
     /// upgrade is decided on its request head (no prefix), over TLS with
     /// the connection's exporter.
-    #[pyo3(signature = (addr, *, tls=None))]
+    #[pyo3(signature = (host, port, *, tls=None))]
     fn serve_websocket<'p>(
         &self,
         py: Python<'p>,
-        addr: String,
+        host: String,
+        port: u16,
         tls: Option<PyRef<'_, TlsConfig>>,
     ) -> PyResult<Bound<'p, PyAny>> {
+        let addr = hostport(&host, port);
         let options = zmux_websocket::Options::default();
         let Some(tls) = tls else {
             return self.serve(py, addr, |l, tcp| zmux_websocket::serve(l, tcp, options));
@@ -4905,14 +5145,16 @@ impl Listener {
     }
     /// HTTP/3 requests to any path carry pipes. With the listener's
     /// `admission`, each request is decided on the first bytes of its body.
-    #[pyo3(signature = (addr, *, tls, lanes=4))]
+    #[pyo3(signature = (host, port, *, tls, lanes=zmux_quinn::LaneWindows::default().lanes))]
     fn serve_http3<'p>(
         &self,
         py: Python<'p>,
-        addr: String,
+        host: String,
+        port: u16,
         tls: PyRef<'_, TlsConfig>,
         lanes: u32,
     ) -> PyResult<Bound<'p, PyAny>> {
+        let addr = hostport(&host, port);
         let opts =
             zmux_h3::Options::new().with_windows(zmux_h3::LaneWindows::new().with_lanes(lanes));
         let sc = zmux_h3::server_config(tls.server()?, &opts).map_err(value_err)?;
@@ -4921,7 +5163,7 @@ impl Listener {
         future_into_py(py, async move {
             let addr = resolve(&addr).await?;
             let ep = quinn::Endpoint::server(sc, addr).map_err(io_err)?;
-            let local = ep.local_addr().map_err(io_err)?.to_string();
+            let local = host_port(ep.local_addr().map_err(io_err)?);
             tasks(tokio::spawn(zmux_h3::serve(l, ep, opts)));
             Ok(local)
         })
@@ -4929,14 +5171,16 @@ impl Listener {
     /// WebTransport sessions carry pipes. With the listener's `admission`, a
     /// session request is decided on its request head (no prefix), with the
     /// QUIC connection's exporter.
-    #[pyo3(signature = (addr, *, tls, lanes=4))]
+    #[pyo3(signature = (host, port, *, tls, lanes=zmux_quinn::LaneWindows::default().lanes))]
     fn serve_webtransport<'p>(
         &self,
         py: Python<'p>,
-        addr: String,
+        host: String,
+        port: u16,
         tls: PyRef<'_, TlsConfig>,
         lanes: u32,
     ) -> PyResult<Bound<'p, PyAny>> {
+        let addr = hostport(&host, port);
         let opts = zmux_webtransport::Options::new()
             .with_windows(zmux_webtransport::LaneWindows::new().with_lanes(lanes));
         let mut c = tls.server()?;
@@ -4949,7 +5193,7 @@ impl Listener {
         future_into_py(py, async move {
             let addr = resolve(&addr).await?;
             let ep = quinn::Endpoint::server(sc, addr).map_err(io_err)?;
-            let local = ep.local_addr().map_err(io_err)?.to_string();
+            let local = host_port(ep.local_addr().map_err(io_err)?);
             tasks(tokio::spawn(zmux_webtransport::serve(l, ep, opts)));
             Ok(local)
         })
@@ -4959,16 +5203,18 @@ impl Listener {
     /// With the listener's `admission`, a connection reaches the listener
     /// only once the first bytes of its first stream are admitted; it
     /// excludes `zero_rtt`.
-    #[pyo3(signature = (addr, *, tls, lanes=4, zero_rtt=false))]
+    #[pyo3(signature = (host, port, *, tls, lanes=zmux_quinn::LaneWindows::default().lanes, zero_rtt=false))]
     fn serve_quic<'p>(
         &self,
         py: Python<'p>,
-        addr: String,
+        host: String,
+        port: u16,
         tls: PyRef<'_, TlsConfig>,
         lanes: u32,
         zero_rtt: bool,
     ) -> PyResult<Bound<'p, PyAny>> {
-        if zero_rtt && self.inner.admission().is_some() {
+        let addr = hostport(&host, port);
+        if zero_rtt && self.inner.adapter().admission().is_some() {
             return Err(PyValueError::new_err(
                 "zero_rtt and admission are mutually exclusive",
             ));
@@ -4984,7 +5230,7 @@ impl Listener {
         future_into_py(py, async move {
             let addr = resolve(&addr).await?;
             let ep = quinn::Endpoint::server(sc, addr).map_err(io_err)?;
-            let local = ep.local_addr().map_err(io_err)?.to_string();
+            let local = host_port(ep.local_addr().map_err(io_err)?);
             tasks(tokio::spawn(zmux_quinn::serve(l, ep, opts, None)));
             Ok(local)
         })
@@ -5154,6 +5400,7 @@ fn _zmux(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Config>()?;
     m.add_function(wrap_pyfunction!(_config_defaults, m)?)?;
     m.add_class::<shaping::ShapingBundle>()?;
+    m.add_class::<shaping::InstalledShaper>()?;
     m.add_class::<TlsConfig>()?;
     m.add_class::<PipeIo>()?;
     m.add_class::<UnsentCount>()?;
@@ -5167,6 +5414,9 @@ fn _zmux(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Listener>()?;
     m.add_class::<ReplayFilter>()?;
     m.add_function(wrap_pyfunction!(classify_first_bytes, m)?)?;
+    m.add_function(wrap_pyfunction!(join_prefix, m)?)?;
+    m.add_function(wrap_pyfunction!(join_ready, m)?)?;
+    m.add_function(wrap_pyfunction!(_listener_defaults, m)?)?;
     m.add_class::<Http2Connection>()?;
     m.add_class::<ExchangeOptions>()?;
     admission::register(m)?;
@@ -5183,9 +5433,9 @@ fn _zmux(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dial_tls, m)?)?;
     m.add_function(wrap_pyfunction!(dial_quic, m)?)?;
     m.add_function(wrap_pyfunction!(dial_websocket, m)?)?;
-    m.add_function(wrap_pyfunction!(dial_http, m)?)?;
-    m.add_function(wrap_pyfunction!(dial_http_split, m)?)?;
-    m.add_function(wrap_pyfunction!(join_http_split, m)?)?;
+    m.add_function(wrap_pyfunction!(dial_streaming, m)?)?;
+    m.add_function(wrap_pyfunction!(dial_split, m)?)?;
+    m.add_function(wrap_pyfunction!(join_split, m)?)?;
     choice::register(m)?;
     seal::register(m)?;
     defaults(m)?;
@@ -5229,9 +5479,14 @@ fn defaults(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "DEFAULT_SUSPECT_FLOOR",
         zmux::Liveness::default().suspect_floor.as_secs_f64(),
     )?;
-    m.add("MAX_FIRST_BYTES", zmux::MAX_FIRST_BYTES)?;
+    m.add("DEFAULT_BACKOFF_JITTER", zmux::DEFAULT_BACKOFF_JITTER)?;
+    m.add("DEFAULT_LANES", zmux_quinn::LaneWindows::default().lanes)?;
+    m.add("MAX_FIRST_BYTES", zmux::adapter::MAX_FIRST_BYTES)?;
     m.add("MAX_STREAM_CREDIT", zmux::MAX_STREAM_CREDIT)?;
-    m.add("RESERVED_EXPORTER_PREFIX", zmux::RESERVED_EXPORTER_PREFIX)?;
+    m.add(
+        "RESERVED_EXPORTER_PREFIX",
+        zmux::adapter::RESERVED_EXPORTER_PREFIX,
+    )?;
     m.add("MIN_MAX_LEN", zmux::shaping::MIN_MAX_LEN)?;
     m.add("DEFAULT_MAX_SLOTS", zmux_shaping::DEFAULT_MAX_SLOTS)?;
     m.add(

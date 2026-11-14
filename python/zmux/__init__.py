@@ -1,20 +1,43 @@
-"""QMux-compatible stream and datagram multiplexing; a binding over the zmux Rust crates."""
+"""QMux-compatible stream and datagram multiplexing; a binding over the zmux Rust crates.
+
+The root namespace holds what an application uses: the sessions, listeners,
+pipes and streams, their configuration and options, events, statistics and
+errors, and the dial and serve entries. The sub-namespaces hold the rest:
+`zmux.adapter` (carrier adapters and accept loops), `zmux.sched` (scheduling),
+`zmux.shaping` and `zmux.helpers` (pipe pools, splice, limiters)."""
 
 from __future__ import annotations
 
-from typing import Any
+from importlib.metadata import PackageNotFoundError, version
 
+from . import adapter, helpers, sched, shaping
+
+from ._connect import (
+    connect_exchange,
+    connect_http2,
+    connect_http3,
+    connect_quic,
+    connect_split,
+    connect_streaming,
+    connect_tcp,
+    connect_tls,
+    connect_websocket,
+    connect_webtransport,
+    dial_http2,
+)
 from ._errors import (
     ApplicationClosedError,
     CarrierChoiceError,
     ConnectError,
     DatagramError,
+    DeadlineExceededError,
     EarlyDataRejectedError,
     ExportError,
     GoingAwayError,
     HandshakeTimeoutError,
     IdleTimeoutError,
     IncompleteReadError,
+    InvalidArgumentError,
     JoinPendingError,
     JoinRefusedError,
     JoinSecretSetError,
@@ -22,16 +45,19 @@ from ._errors import (
     ListenerClosedError,
     NoExporterError,
     NoReplyError,
+    NoRunningLoopError,
     NotEstablishedError,
     NotNegotiatedError,
-    OpenError,
     PipeError,
     PipeGoneError,
+    PipeUsedError,
     PipesLostError,
     PreambleTooLargeError,
     ResumeFailedError,
     ResumeTimeoutError,
     SessionClosedError,
+    StreamBusyError,
+    StreamClosedError,
     StreamError,
     StreamRejectedError,
     StreamResetError,
@@ -40,11 +66,6 @@ from ._errors import (
     VerifyRejectedError,
     VerifyUnavailableError,
     ZmuxError,
-)
-from ._layer import (
-    Layer,
-    LayerWriter,
-    open_carrier,
 )
 from ._streams import (
     StreamPairReader,
@@ -59,7 +80,10 @@ from ._types import (
     AdmissionStats,
     AdmissionVariants,
     AppData,
+    ApplicationErrorCode,
     Auto,
+    Backoff,
+    BiStream,
     CacheOutcome,
     CandidateOutcome,
     CandidateResult,
@@ -71,10 +95,8 @@ from ._types import (
     CarrierCredential,
     CarrierKind,
     Clear,
-    CloseInfo,
     Config,
     Direction,
-    DuplicateRule,
     EarlyDataState,
     EpochCommitted,
     EpochDeleted,
@@ -82,19 +104,14 @@ from ._types import (
     ErrorKind,
     Event,
     EventKind,
-    FirstBytes,
-    Forwarded,
-    Framing,
     GoAwayReceived,
-    HandshakeView,
     InboundState,
     Inherit,
     JoinAuthFailed,
-    JoinPrefix,
     KeyAlg,
     KeyGroup,
     LaneStats,
-    Limiter,
+    ListenerConfig,
     ListenerStats,
     Liveness,
     Multipath,
@@ -123,28 +140,19 @@ from ._types import (
     QualityBand,
     RecordMode,
     RecordPolicyInput,
-    Redundancy,
     RejectAction,
     RejectInfo,
-    ReplayVerdict,
-    Resolved,
     ResumeUnattended,
     Role,
     RttSource,
-    Scheduler,
     SessionCarrier,
     SessionCrypto,
     SessionResumed,
     SessionState,
     SessionStats,
     SessionSuspended,
-    ShapingAccount,
-    ShapingBudget,
-    ShapingLimits,
-    ShapingSizeLimits,
-    SpliceEnd,
-    Spliced,
     Staged,
+    StreamDatagram,
     StreamStats,
     Support,
     TierSaturation,
@@ -152,29 +160,25 @@ from ._types import (
     Tlv,
     Tracer,
     TransportErrorCode,
-    UnitPlan,
     UnknownEvent,
     VariantStats,
     VerifyInput,
     VerifyVerdict,
 )
 from ._zmux import (
+    DEFAULT_BACKOFF_JITTER,
     DEFAULT_IDLE_TIMEOUT,
     DEFAULT_JOIN_TIMEOUT,
     DEFAULT_KEEP_ALIVE_PERIOD,
+    DEFAULT_LANES,
     DEFAULT_MAX_APP_DATA,
     DEFAULT_MAX_BACKOFF,
-    DEFAULT_MAX_DELAY,
     DEFAULT_MAX_RECORD_SIZE,
-    DEFAULT_MAX_SLOTS,
     DEFAULT_MIN_BACKOFF,
     DEFAULT_PROBE_JITTER,
     DEFAULT_STANDBY_PROBE,
     DEFAULT_SUSPECT_FLOOR,
-    MAX_FIRST_BYTES,
     MAX_STREAM_CREDIT,
-    MIN_MAX_LEN,
-    RESERVED_EXPORTER_PREFIX,
     Admission,
     AdmissionVerdict,
     Candidate,
@@ -182,83 +186,63 @@ from ._zmux import (
     CarrierChoice,
     CarrierChoicePolicy,
     CarrierInfo,
-    CarrierStream,
     DatagramStream,
     Decision,
     EventStream,
     ExchangeOptions,
     Http2Connection,
     Listener,
-    MaintainHandle,
     PinVerifier,
     Pipe,
-    PipeEnd,
-    PipeHint,
     PipeIo,
-    PipePool,
-    PoolPolicy,
-    PoolPolicyDecision,
     PrefixAuth,
     QuicClient,
     RecvStream,
-    ReplayFilter,
     SecureServer,
     SendStream,
     Session,
-    ShapingBundle,
     SigningKey,
     TlsConfig,
-    UnsentCount,
     ZeroRtt,
-    classify_first_bytes,
     connect_choice,
-    derive_handle_psk,
-    derive_join_psk,
     dial_exchange,
-    dial_http,
     dial_http3,
-    dial_http_split,
     dial_quic,
+    dial_split,
+    dial_streaming,
     dial_tcp,
     dial_tls,
     dial_websocket,
     dial_webtransport,
     establish,
-    expand_join_psk,
-    join_http_split,
+    join_split,
     key_id,
-    pipe_pair,
-    resolve_duplicate,
-    session_crypto,
-    shaping_limits_from_json,
-    splice,
     static_key_id,
     static_public,
-    stream_pipe,
 )
 
-__version__ = "0.3.3"
+try:
+    __version__ = version("zmuxio")
+except PackageNotFoundError:  # not installed: run from a source tree
+    __version__ = "0+unknown"
 
 __all__ = [
     "AUTO",
     "CLEAR",
+    "DEFAULT_BACKOFF_JITTER",
     "DEFAULT_IDLE_TIMEOUT",
     "DEFAULT_JOIN_TIMEOUT",
     "DEFAULT_KEEP_ALIVE_PERIOD",
+    "DEFAULT_LANES",
     "DEFAULT_MAX_APP_DATA",
     "DEFAULT_MAX_BACKOFF",
-    "DEFAULT_MAX_DELAY",
     "DEFAULT_MAX_RECORD_SIZE",
-    "DEFAULT_MAX_SLOTS",
     "DEFAULT_MIN_BACKOFF",
     "DEFAULT_PROBE_JITTER",
     "DEFAULT_STANDBY_PROBE",
     "DEFAULT_SUSPECT_FLOOR",
     "INHERIT",
-    "MAX_FIRST_BYTES",
     "MAX_STREAM_CREDIT",
-    "MIN_MAX_LEN",
-    "RESERVED_EXPORTER_PREFIX",
     "STAGED",
     "Admission",
     "AdmissionStats",
@@ -266,7 +250,10 @@ __all__ = [
     "AdmissionVerdict",
     "AppData",
     "ApplicationClosedError",
+    "ApplicationErrorCode",
     "Auto",
+    "Backoff",
+    "BiStream",
     "CacheOutcome",
     "Candidate",
     "CandidateOutcome",
@@ -283,16 +270,14 @@ __all__ = [
     "CarrierCredential",
     "CarrierInfo",
     "CarrierKind",
-    "CarrierStream",
     "Clear",
-    "CloseInfo",
     "Config",
     "ConnectError",
     "DatagramError",
     "DatagramStream",
+    "DeadlineExceededError",
     "Decision",
     "Direction",
-    "DuplicateRule",
     "EarlyDataRejectedError",
     "EarlyDataState",
     "EpochCommitted",
@@ -304,41 +289,34 @@ __all__ = [
     "EventStream",
     "ExchangeOptions",
     "ExportError",
-    "FirstBytes",
-    "Forwarded",
-    "Framing",
     "GoAwayReceived",
     "GoingAwayError",
     "HandshakeTimeoutError",
-    "HandshakeView",
     "Http2Connection",
     "IdleTimeoutError",
     "InboundState",
     "IncompleteReadError",
     "Inherit",
+    "InvalidArgumentError",
     "JoinAuthFailed",
     "JoinPendingError",
-    "JoinPrefix",
     "JoinRefusedError",
     "JoinSecretSetError",
     "KeyAlg",
     "KeyGroup",
     "LaneStats",
-    "Layer",
-    "LayerWriter",
     "LimitExceededError",
-    "Limiter",
     "Listener",
     "ListenerClosedError",
+    "ListenerConfig",
     "ListenerStats",
     "Liveness",
-    "MaintainHandle",
     "Multipath",
     "NoExporterError",
     "NoReplyError",
+    "NoRunningLoopError",
     "NotEstablishedError",
     "NotNegotiatedError",
-    "OpenError",
     "OutboundState",
     "Peer",
     "PinVerifier",
@@ -346,28 +324,24 @@ __all__ = [
     "PipeAdded",
     "PipeAuth",
     "PipeClosed",
-    "PipeEnd",
     "PipeError",
     "PipeFailed",
     "PipeGoneError",
     "PipeHalf",
-    "PipeHint",
     "PipeId",
     "PipeIo",
     "PipeJoined",
     "PipeLiveness",
     "PipeOptions",
-    "PipePool",
     "PipePriorityChanged",
     "PipeQualityChanged",
     "PipeRecovered",
     "PipeRequest",
     "PipeStats",
     "PipeSuspect",
+    "PipeUsedError",
     "PipesLostError",
     "PipesRetired",
-    "PoolPolicy",
-    "PoolPolicyDecision",
     "Preamble",
     "PreambleTooLargeError",
     "PrefixAuth",
@@ -379,18 +353,13 @@ __all__ = [
     "RecordMode",
     "RecordPolicyInput",
     "RecvStream",
-    "Redundancy",
     "RejectAction",
     "RejectInfo",
-    "ReplayFilter",
-    "ReplayVerdict",
-    "Resolved",
     "ResumeFailedError",
     "ResumeTimeoutError",
     "ResumeUnattended",
     "Role",
     "RttSource",
-    "Scheduler",
     "SecureServer",
     "SendStream",
     "Session",
@@ -401,15 +370,11 @@ __all__ = [
     "SessionState",
     "SessionStats",
     "SessionSuspended",
-    "ShapingAccount",
-    "ShapingBudget",
-    "ShapingBundle",
-    "ShapingLimits",
-    "ShapingSizeLimits",
     "SigningKey",
-    "SpliceEnd",
-    "Spliced",
     "Staged",
+    "StreamBusyError",
+    "StreamClosedError",
+    "StreamDatagram",
     "StreamError",
     "StreamPairReader",
     "StreamPairWriter",
@@ -425,9 +390,7 @@ __all__ = [
     "Tracer",
     "TransportClosedError",
     "TransportErrorCode",
-    "UnitPlan",
     "UnknownEvent",
-    "UnsentCount",
     "VariantStats",
     "VerifyInput",
     "VerifyRejectedError",
@@ -435,148 +398,35 @@ __all__ = [
     "VerifyVerdict",
     "ZeroRtt",
     "ZmuxError",
-    "classify_first_bytes",
+    "adapter",
     "connect_choice",
     "connect_exchange",
-    "connect_http",
     "connect_http2",
     "connect_http3",
-    "connect_http_split",
     "connect_quic",
+    "connect_split",
+    "connect_streaming",
     "connect_tcp",
     "connect_tls",
     "connect_websocket",
     "connect_webtransport",
-    "derive_handle_psk",
-    "derive_join_psk",
     "dial_exchange",
-    "dial_http",
     "dial_http2",
     "dial_http3",
-    "dial_http_split",
     "dial_quic",
+    "dial_split",
+    "dial_streaming",
     "dial_tcp",
     "dial_tls",
     "dial_websocket",
     "dial_webtransport",
     "establish",
-    "expand_join_psk",
-    "join_http_split",
+    "helpers",
+    "join_split",
     "key_id",
-    "open_carrier",
     "pipe_from_streams",
-    "pipe_pair",
-    "resolve_duplicate",
-    "session_crypto",
-    "shaping_limits_from_json",
-    "splice",
+    "sched",
+    "shaping",
     "static_key_id",
     "static_public",
-    "stream_pipe",
 ]
-
-
-async def connect_tcp(
-    addr: str, /, *, config: Config | None = None, **dial: Any
-) -> Session:
-    """A client session on a TCP carrier: `dial_tcp(addr, **dial)`, then
-    `Session.connect(pipe, config)`."""
-    return await Session.connect(await dial_tcp(addr, **dial), config)
-
-
-async def connect_tls(
-    addr: str, /, *, config: Config | None = None, **dial: Any
-) -> Session:
-    """A client session on a TLS carrier: `dial_tls(addr, **dial)`, then
-    `Session.connect(pipe, config)`."""
-    return await Session.connect(await dial_tls(addr, **dial), config)
-
-
-async def connect_quic(
-    addr: str, /, *, config: Config | None = None, **dial: Any
-) -> Session:
-    """A client session on a QUIC carrier: `dial_quic(addr, **dial)`, then
-    `Session.connect(pipe, config)`."""
-    return await Session.connect(await dial_quic(addr, **dial), config)
-
-
-async def connect_websocket(
-    url: str, /, *, config: Config | None = None, **dial: Any
-) -> Session:
-    """A client session on a WebSocket carrier: `dial_websocket(url,
-    **dial)`, then `Session.connect(pipe, config)`."""
-    return await Session.connect(await dial_websocket(url, **dial), config)
-
-
-async def dial_http2(
-    addr: str,
-    /,
-    *,
-    path: str = "/zmux",
-    tls: TlsConfig | None = None,
-    server_name: str | None = None,
-    carrier_credential: PrefixAuth | CarrierCredential | None = None,
-    pair_field: str | None = None,
-) -> PipeIo:
-    """A pipe input on a new HTTP/2 connection (prior knowledge without
-    `tls`, ALPN `h2` with it): one bidirectional request to `path`. For
-    more requests on one connection use `Http2Connection`."""
-    conn = await Http2Connection.connect(
-        addr,
-        path=path,
-        tls=tls,
-        server_name=server_name,
-        carrier_credential=carrier_credential,
-        pair_field=pair_field,
-    )
-    return await conn.dial()
-
-
-async def connect_http2(
-    addr: str, /, *, config: Config | None = None, **dial: Any
-) -> Session:
-    """A client session on an HTTP/2 carrier: `dial_http2(addr, **dial)`,
-    then `Session.connect(pipe, config)`."""
-    return await Session.connect(await dial_http2(addr, **dial), config)
-
-
-async def connect_http3(
-    url: str, /, *, config: Config | None = None, **dial: Any
-) -> Session:
-    """A client session on an HTTP/3 carrier: `dial_http3(url, **dial)`,
-    then `Session.connect(pipe, config)`."""
-    return await Session.connect(await dial_http3(url, **dial), config)
-
-
-async def connect_webtransport(
-    url: str, /, *, config: Config | None = None, **dial: Any
-) -> Session:
-    """A client session on a WebTransport carrier: `dial_webtransport(url,
-    **dial)`, then `Session.connect(pipe, config)`."""
-    return await Session.connect(await dial_webtransport(url, **dial), config)
-
-
-async def connect_http(
-    addr: str, /, *, config: Config | None = None, **dial: Any
-) -> Session:
-    """A client session on an HTTP/1.1 streaming carrier: `dial_http(addr,
-    **dial)`, then `Session.connect(pipe, config)`."""
-    return await Session.connect(await dial_http(addr, **dial), config)
-
-
-async def connect_http_split(
-    addr: str, /, *, config: Config | None = None, **dial: Any
-) -> Session:
-    """A client session on a split bootstrap, an uplink `POST` and a
-    downlink `GET` paired by a fresh token (`dial_http_split(addr,
-    **dial)`); run it over TLS or a trusted TLS-terminating intermediary:
-    the token is a bearer secret until the session is up."""
-    return await Session.connect(await dial_http_split(addr, **dial), config)
-
-
-async def connect_exchange(
-    addr: str, /, *, config: Config | None = None, **dial: Any
-) -> Session:
-    """A client session on the exchange carrier: `dial_exchange(addr,
-    **dial)`, then `Session.connect(pipe, config)`."""
-    return await Session.connect(await dial_exchange(addr, **dial), config)

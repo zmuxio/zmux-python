@@ -18,7 +18,7 @@ by the extension; Python awaits the results on its asyncio loop.
 pip install zmuxio      # import zmux; Python 3.12+, also free-threaded 3.14t
 ```
 
-Prebuilt wheels: Linux (manylinux) x86_64, aarch64, armv7, i686, ppc64le,
+Prebuilt wheels: Linux (manylinux) x86_64, aarch64, armv7, ppc64le,
 s390x and riscv64; Linux (musllinux) x86_64, aarch64, armv7 and i686; macOS
 x86_64 and arm64; Windows x86_64 and x86. Other platforms (Windows on arm64,
 for example) install from the sdist, which needs a Rust toolchain.
@@ -35,7 +35,7 @@ import zmux
 
 async def main() -> None:
     async with zmux.Listener() as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+        host, port = await listener.serve_tcp("127.0.0.1", 0)
 
         async def serve() -> None:
             async for session in listener:
@@ -45,7 +45,7 @@ async def main() -> None:
                         await send.finish()
 
         server = asyncio.create_task(serve())
-        async with await zmux.connect_tcp(addr) as session:
+        async with await zmux.connect_tcp(host, port) as session:
             send, recv = await session.open_bi(info=b"echo")
             await send.write(b"hello")
             await send.finish()
@@ -59,6 +59,13 @@ asyncio.run(main())
 The other examples below are fragments: they assume a running event loop and
 the names they use.
 
+The root namespace holds what an application uses: sessions, listeners, pipes
+and streams, their configuration, options, events, statistics and errors, and
+the dial and serve entries. The rest has a namespace of its own: `zmux.adapter`
+(what only the author of a carrier adapter or of an accept loop needs),
+`zmux.sched` (the scheduler and redundancy settings), `zmux.shaping` and
+`zmux.helpers` (pipe pools, `splice`, limiters, duplicate sessions).
+
 ## Terms
 
 A **carrier** is one underlying connection that moves bytes or messages: a
@@ -70,12 +77,14 @@ by a `PipeId`. A **stream** belongs to the session, not to a pipe.
 
 ## Carriers
 
-`dial_x(target, *, ...)` opens a carrier and returns a `PipeIo`;
-`connect_x(target, *, config=None, **dial_kwargs)` takes the same keywords,
-dials, and returns a `Session`; `Listener.serve_x(addr, *, ...)` accepts.
-`Session.connect(pipe, config)`, `Session.accept(pipe, config)` and
-`Session.symmetric(pipe, config)` (roles negotiated) start a session on a
-pipe input of your own.
+`dial_x(host, port, *, ...)` (a URL for the WebSocket, HTTP/3 and WebTransport
+carriers) opens a carrier and returns a `PipeIo`; `connect_x` takes the same
+arguments and a `config=`, dials, and returns a `Session`;
+`Listener.serve_x(host, port, *, ...)` accepts and returns the bound
+`(host, port)`. An address reported to you (a peer, a source) is a `(host,
+port)` tuple too. `Session.connect(pipe, config=...)`,
+`Session.accept(pipe, config=...)` and `Session.symmetric(pipe, config=...)`
+(roles negotiated) start a session on a pipe input of your own.
 
 | Carrier kind (`CarrierKind`) | Dial | Connect | Serve | `Candidate` |
 |---|---|---|---|---|
@@ -83,8 +92,8 @@ pipe input of your own.
 | (none) | `dial_tls` | `connect_tls` | `serve_tls` | |
 | `QUIC` | `dial_quic`, `QuicClient.dial` | `connect_quic`, `QuicClient.connect` | `serve_quic` | `Candidate.quic` |
 | `WEBSOCKET` | `dial_websocket` | `connect_websocket` | `serve_websocket`, `serve_http(websocket=True)` | `Candidate.websocket` |
-| `STREAMING` | `dial_http`, `dial_http2`, `Http2Connection.dial` | `connect_http`, `connect_http2` | `serve_http` | `Candidate.http` |
-| `SPLIT` | `dial_http_split`, `Http2Connection.dial_split` | `connect_http_split` | `serve_http` | `Candidate.http_split` |
+| `STREAMING` | `dial_streaming`, `dial_http2`, `Http2Connection.dial` then `open_pipe()` | `connect_streaming`, `connect_http2` | `serve_http` | `Candidate.streaming` |
+| `SPLIT` | `dial_split`, `Http2Connection.open_split()` | `connect_split` | `serve_http` | `Candidate.split` |
 | `EXCHANGE` | `dial_exchange` | `connect_exchange` | `serve_http(exchange=...)` | `Candidate.exchange` |
 | `HTTP3` | `dial_http3` | `connect_http3` | `serve_http3` | `Candidate.http3` |
 | `WEBTRANSPORT` | `dial_webtransport` | `connect_webtransport` | `serve_webtransport` | `Candidate.webtransport` |
@@ -92,21 +101,24 @@ pipe input of your own.
 TLS settings come from `TlsConfig` (PEM paths or bytes; clients default to
 the bundled web roots). `pipe_from_streams(reader, writer)` runs a session
 over any asyncio stream pair (slower: bytes pass through Python), and
-`pipe_pair()` gives an in-memory pipe whose other end you drive.
+`zmux.adapter.pipe_pair()` gives an in-memory pipe whose other end you drive.
 
-A `PipeIo`'s settings are writable properties, changed in place until the
-input is given to a session: `carrier_kind`, `variant` (the host's name of
-the transform a carrier runs, reported in `PipeStats.variant`),
-`write_overhead`, `max_record`, `unsent` (a `zmux.UnsentCount` the
+A `PipeIo`'s settings are properties, changed in place until the input is
+given to a session: `carrier_kind`, `variant` (the host's name of the
+transform a carrier runs, reported in `PipeStats.variant`), `write_overhead`
+and `terminated_tls`; `declare_secure()` declares the carrier secure for the
+Bound record mode. What a carrier's author sets once is a parameter of the
+function that builds the input (`pipe_from_streams`, `zmux.adapter.pipe_pair`):
+`max_record`, the largest record plaintext, `exporter`, the exporter of an
+end-to-end handshake, and `unsent` (a `zmux.adapter.UnsentCount` the
 application keeps up to date, read by the session without the interpreter
-lock), `exporter` and `terminated_tls`; `declare_secure()` declares the
-carrier secure for the Bound record mode.
+lock).
 
 Fragment, a QUIC session with a priority:
 
 ```python
 session = await zmux.connect_quic(
-    "example.net:443", config=zmux.Config(max_idle_timeout=30.0)
+    "example.net", 443, config=zmux.Config(max_idle_timeout=30.0)
 )
 async with session:
     send, recv = await session.open_bi(info=b"route", priority=zmux.Priority(1))
@@ -117,19 +129,19 @@ async with session:
 ```
 
 HTTP: one endpoint serves every HTTP carrier on one path, each request told
-apart by its head. `serve_http(addr, exchange=..., websocket=True)` takes
-bidirectional POSTs (`dial_http`), uplink POSTs and downlink GETs
-(`dial_http(..., direction=zmux.Direction.OUT | IN)`), split bootstraps
-(`dial_http_split`: a POST and a GET paired by a token, for paths that stream
-each body but not both on one request; run them over TLS), exchange requests
+apart by its head. `serve_http(host, port, exchange=..., websocket=True)`
+takes bidirectional POSTs (`dial_streaming`), uplink POSTs and downlink GETs
+(`dial_streaming(..., direction=zmux.Direction.OUT)` or `Direction.IN`), split
+bootstraps (`dial_split`: a POST and a GET paired by a token, for paths that
+stream each body but not both on one request; run them over TLS), exchange requests
 and WebSocket upgrades. The exchange carrier is for paths that pass only
 plain request and response HTTP; both ends share `psk` and `encoding`.
 Fragment:
 
 ```python
 opts = zmux.ExchangeOptions(psk=b"shared secret", encoding="base64")
-await listener.serve_http("0.0.0.0:8080", exchange=opts)  # server
-session = await zmux.connect_exchange("example.net:8080", options=opts)  # client
+await listener.serve_http("0.0.0.0", 8080, exchange=opts)  # server
+session = await zmux.connect_exchange("example.net", 8080, options=opts)  # client
 ```
 
 ## Carrier choice
@@ -148,9 +160,9 @@ auth = zmux.PrefixAuth(b"shared secret", slot=30)
 choice = zmux.CarrierChoice.auto(
     [
         zmux.Candidate.websocket("wss://example.net/zmux", carrier_credential=auth),
-        zmux.Candidate.http("example.net:80", carrier_credential=auth),
-        zmux.Candidate.http_split("example.net:80", carrier_credential=auth),
-        zmux.Candidate.exchange("example.net:80", options=opts),
+        zmux.Candidate.streaming("example.net", 80, carrier_credential=auth),
+        zmux.Candidate.split("example.net", 80, carrier_credential=auth),
+        zmux.Candidate.exchange("example.net", 80, options=opts),
     ]
 )
 policy = zmux.CarrierChoicePolicy(cache=cache, key="example.net|office")
@@ -172,7 +184,8 @@ off, no-timeout or unlimited setting of a field that has one (and raises
 their own: `zmux.AUTO` (an automatic cap or a derived value, the default
 where a field has it), `zmux.STAGED` (staged unidirectional credit, the
 default), `zmux.INHERIT` (a pipe setting that follows the session's, the
-default of those) and `zmux.CLEAR` (`Pipe.update`). Durations are seconds
+default of those) and `zmux.CLEAR` (`Pipe.update` and the settings of
+`PipeOptions` that it changes). Durations are seconds
 (`float`). Fragment:
 
 ```python
@@ -181,17 +194,21 @@ config = zmux.Config(
     liveness=zmux.Liveness(keep_alive_period=10.0, probe_interval=None),
     memory_budget=None,  # unlimited
     max_stream_receive_window=zmux.AUTO,  # the default
-    scheduler=zmux.Scheduler.SPREAD_ETA,
+    scheduler=zmux.sched.Scheduler.SPREAD_ETA,
 )
 ```
 
 `Config(liveness=zmux.Liveness(...))` holds the keep-alive and probe
 settings; a running session replaces them with `session.liveness = ...`.
-Use `config.replace(...)` to derive a variant. The defaults are exported as
+The other runtime settings of a session are writable properties too, and read
+back as in force, whether the configuration or an assignment set them:
+`scheduler`, `quality_band`, `capacity_floor`, `shaper` (an opaque
+`zmux.shaping.InstalledShaper`) and `shaping_limits`; an invalid value raises `ValueError` and
+changes nothing. Use `config.replace(...)` to derive a variant. The defaults are exported as
 constants (`DEFAULT_KEEP_ALIVE_PERIOD`, `DEFAULT_IDLE_TIMEOUT`,
 `DEFAULT_PROBE_JITTER`, `DEFAULT_STANDBY_PROBE`, `DEFAULT_MAX_RECORD_SIZE`,
-`DEFAULT_MIN_BACKOFF`, `DEFAULT_MAX_BACKOFF`, `DEFAULT_JOIN_TIMEOUT`,
-`DEFAULT_MAX_DELAY`). `zmux.MAX_STREAM_CREDIT` (2**60) is the largest stream
+`DEFAULT_MIN_BACKOFF`, `DEFAULT_MAX_BACKOFF`, `DEFAULT_BACKOFF_JITTER`,
+`DEFAULT_LANES`, `DEFAULT_JOIN_TIMEOUT`). `zmux.MAX_STREAM_CREDIT` (2**60) is the largest stream
 count: pass it as `max_incoming_streams` or `max_incoming_uni_streams` to
 let the peer open as many streams as the protocol can count.
 
@@ -206,16 +223,23 @@ and the session queue by `datagram_receive_queue` and
 preamble before the first frame; `try_open_bi()` opens without waiting.
 `finish()` ends the sending part, `reset(code)` abandons it and
 `recv.stop(code)` asks the peer to stop sending; `reset` and `stop` return at
-once, like `asyncio.Transport.abort`. Every coroutine is cancellation-safe;
-use `asyncio.timeout()` for deadlines. `send.priority` is writable;
+once, like `asyncio.Transport.abort`; both always take the code. Every
+coroutine is cancellation-safe except the writes: a cancelled `write` or
+`write_chunk` may have sent a prefix of its data and says nothing about how
+much, so reset the stream rather than write to it again; a completed one
+returns the number of bytes taken. Use `asyncio.timeout()` for deadlines. `send.priority` is writable, and so are the runtime settings of a stream, which
+read back as in force: `send.send_buffer`, `send.scheduler`,
+`send.redundant`, `recv.receive_window` and `recv.peer_priority`;
 `await recv.read_chunk(n)` returns a `memoryview` of the received buffer and
 `await send.write_chunk(buf)` takes any buffer without copying it.
 
-`await session.open_stream_pair()` returns a `(StreamPairReader,
+`open_bi` and `accept_bi` give a `BiStream`, which unpacks as `send, recv`.
+`await session.open_stream_pair(limit=...)` returns a `(StreamPairReader,
 StreamPairWriter)` pair: the reader has the reads of `asyncio.StreamReader`
-(`read`, `readexactly`, `readline`, `readuntil`, `at_eof`), the writer the
-writes of `asyncio.StreamWriter` (`write`, `drain`, `close`,
-`wait_closed`); after a failed send every later write raises that error.
+(`read`, `readexactly`, `readline`, `readuntil`, `at_eof`; `limit` is its
+buffer limit), the writer the writes of `asyncio.StreamWriter` (`write`,
+`drain`, `close`, `abort(code)`, `wait_closed`); after a failed send every
+later write raises that error.
 Fragment:
 
 ```python
@@ -238,10 +262,10 @@ async for event in session.events():
             log.warning("suspended, and nothing redials")
 ```
 
-Relays and nested sessions: `await zmux.splice((send_a, recv_a), (send_b,
+Relays and nested sessions: `await zmux.helpers.splice((send_a, recv_a), (send_b,
 recv_b), a_to_b=limiter)` forwards two streams into each other;
 `await session.open_pipe_stream(info=..., tlvs=...)` opens a carrier stream
-and `zmux.stream_pipe(send, recv)` wraps an accepted one, either a `PipeIo`.
+and `zmux.adapter.stream_pipe(send, recv)` wraps an accepted one, either a `PipeIo`.
 
 ## Closing
 
@@ -256,7 +280,8 @@ and an `abort` while a close is still flushing ends it at once.
 `await session.shutdown(code, reason)` sends GOAWAY and closes once the open
 streams ended.
 
-`await session.wait_closed()` waits for the session's whole end: it returns
+`await session.wait_closed()` waits for the session's whole end and returns
+the `SessionClosedError` that describes it (it is not raised): it returns
 once every pipe's inbound side has ended (the peer read the close and ended
 its side) or the linger timeout has passed, so a return before the linger
 confirms that the peer read the close. An application that exits right after
@@ -267,13 +292,22 @@ own bound, not an option; the timeout changes nothing in the session:
 session.close(0x2A, b"replaced")
 try:
     async with asyncio.timeout(5):
-        info = await session.wait_closed()
+        end = await session.wait_closed()
+        print(end.code, end.reason, end.remote)
 except TimeoutError:
     ...  # not confirmed within 5 s; the linger goes on
 ```
 
-`async with session:` closes and waits on a normal exit and aborts with code
-0 on an exception.
+`async with session:` closes with code 0 and waits on a normal exit; an exit
+by an exception starts a close with `zmux.ApplicationErrorCode.ZMUX_CANCELLED`
+and an empty reason and returns at once, so the peer can tell it from a
+normal end. The same code is what leaving `async with stream:` by an
+exception resets a sending part with (a normal exit finishes it; both
+return at once); leaving `async with` on a receiving part stops it with code 0
+unless it ended (automatic release); a pipe left by an exception is aborted. `async for` over a session, a listener or its
+datagrams ends silently only on a clean end (a listener closed here, a
+session closed by either application with code 0) and raises the error
+otherwise.
 
 On the receiving side, a peer's close does not discard what it sent before:
 for up to the linger timeout, streams the application opened or accepted
@@ -281,7 +315,7 @@ still deliver the data received ahead of the close and then raise the close's
 code and reason, while new streams and writes fail at once. A reader that
 pauses longer than the linger loses what it has not read. Only a close the
 peer sent starts this read drain; a carrier that just ends gives none. During
-it `recv.stop()` and `send.reset()` raise the session's error (a `stop` still
+it `recv.stop(code)` and `send.reset(code)` raise the session's error (a `stop` still
 discards the unread data), and dropping or stopping the last stream with
 unread data ends the drain early. The cleanup of `async with` ignores that
 error.
@@ -298,7 +332,7 @@ needs no `pipe_auth`). Then, fragment:
 
 ```python
 pipe = await session.add_pipe(
-    await zmux.dial_tcp(addr),
+    await zmux.dial_tcp(host, port),
     options=zmux.PipeOptions(send_priority=1, receive_priority=1),
 )
 pipe.update(weight=2, send_priority=zmux.CLEAR)  # CLEAR: follow the peer again
@@ -306,25 +340,30 @@ pipe.update(weight=2, send_priority=zmux.CLEAR)  # CLEAR: follow the peer again
 
 `add_pipe` returns once the peer attached the pipe (`return_on_reply=True`:
 once the Reply is verified), within `Config(join_timeout=...)`, and raises
-`zmux.JoinRefusedError` when the peer refused the join. `PipeOptions` holds
-every option of a pipe; `pipe.update(**fields)` changes the settings of a
-live pipe together (a keyword left out keeps, `zmux.CLEAR` clears, a value
-sets), with the shorthands `set_send_priority`, `set_receive_priority`,
-`set_send_standby` and `set_receive_standby`. A pipe's own liveness is
-`PipeOptions(liveness=zmux.PipeLiveness(...))`.
+`zmux.JoinRefusedError` when the peer refused the join and
+`zmux.DeadlineExceededError` when the bound passed. `PipeOptions` holds every
+option of a pipe; `pipe.update(**fields)` is the one way to change the
+settings of a live pipe, together: `send_priority`, `receive_priority`,
+`send_standby`, `receive_standby`, `weight`, `probation`, `liveness` and
+`quality_band`, each left out (kept), `zmux.CLEAR` (cleared) or a value (set).
+`PipeOptions` takes the same fields in the same form, `zmux.CLEAR` being their
+default. A pipe's own liveness is `PipeOptions(liveness=zmux.PipeLiveness(...))`.
+`await pipe.wait_closed()` waits for a pipe's end.
 
-Pools: `handle = session.maintain_pipes(zmux.PipePool(count, dial))` keeps
+Pools: `handle = session.maintain_pipes(zmux.helpers.PipePool(count, dial))` keeps
 `count` usable pipes dialled by the async `dial()`, with backoff, rotation
 (`rotate_max_bytes`, `rotate_max_age`) and an optional `pool_policy`;
-`join=` takes groups of pipes such as `join_http_split`, `choice=` a carrier
-choice. `handle.stop()` ends it.
+`join=` takes groups of pipes such as `zmux.join_split`, `choice=` a carrier
+choice, and `backoff=` a `zmux.Backoff`. `handle.stop()` ends it.
 
 Resume: with `resume_timeout` set, a session whose pipes are lost waits that
-long for a pipe to join again; a `redial` hook dials it. Fragment:
+long for a pipe to join again; a `redial` hook dials it, waiting by
+`Config(redial_backoff=zmux.Backoff(1.0, 60.0, jitter=0.2))` between
+attempts (these are the defaults; `jitter=0` is the fixed schedule). Fragment:
 
 ```python
 async def redial(direction: zmux.Direction) -> zmux.PipeIo:
-    return await zmux.dial_tcp(addr)
+    return await zmux.dial_tcp(host, port)
 
 
 config = zmux.Config(
@@ -341,16 +380,20 @@ pipe through `redial`; bound it with `asyncio.timeout(seconds)`.
 
 ## Admission
 
-`Listener(admission=...)` decides on each new carrier at every entry before
-anything is answered, and `dial_x(..., carrier_credential=...)` presents
+`ListenerConfig(admission=...)` decides on each new carrier at every entry
+before anything is answered, and `dial_x(..., carrier_credential=...)` presents
 what it checks. `PrefixAuth` tokens are the shared mechanism: a token is the
 carrier's first bytes, or the `Zmux-Prefix-Auth` request header on WebSocket
 and WebTransport. Fragment:
 
 ```python
 auth = zmux.PrefixAuth(b"shared secret", slot=30, bind_tls=True)
-listener = zmux.Listener(admission=zmux.Admission.prefix_auth(auth, skew=1))
-await listener.serve_websocket("0.0.0.0:443", tls=server_tls)
+listener = zmux.Listener(
+    listener_config=zmux.ListenerConfig(
+        admission=zmux.Admission.prefix_auth(auth, skew=1)
+    )
+)
+await listener.serve_websocket("0.0.0.0", 443, tls=server_tls)
 pipe = await zmux.dial_websocket("wss://example.net/", carrier_credential=auth)
 ```
 
@@ -361,14 +404,15 @@ returns an `AdmissionVerdict` (`accept(skip, value=...)`, `FALLBACK`,
 `value` is the carrier's admitted value (`session.admitted`,
 `pipe.admitted`). A carrier credential of your own is any object with
 `prefix(info)` and `header(info)` (`zmux.CarrierCredential`).
-`Listener(max_pending=...)` (1024; `None`: unlimited) bounds every carrier
-before it enters a session. `max_pending_per_source` counts a source by its
-prefix, `source_prefix_v4=` (1 to 32, default 32) for IPv4 and
-`source_prefix_v6=` (1 to 128, default 64) for IPv6; a value outside its
-range raises `ValueError`.
+`Listener(config=..., listener_config=...)` takes the sessions' `Config` and
+the listener's own `ListenerConfig`, whose `max_pending` (1024; `None`:
+unlimited) bounds every carrier before it enters a session.
+`max_pending_per_source` counts a source by its prefix, `source_prefix_v4`
+(1 to 32, default 32) for IPv4 and `source_prefix_v6` (1 to 128, default 64)
+for IPv6; a value outside its range raises `ValueError`.
 
-`Listener(inbound_transform=f)` runs `f(pipe, hint)` for every carrier after
-its admission and goes on with the carrier it returns. Fragment:
+`ListenerConfig(inbound_transform=f)` runs `f(pipe, hint)` for every carrier
+after its admission and goes on with the carrier it returns. Fragment:
 
 ```python
 async def tls(reader, writer):
@@ -382,7 +426,9 @@ async def transform(pipe, hint):
     return pipe
 
 
-listener = zmux.Listener(inbound_transform=transform)
+listener = zmux.Listener(
+    listener_config=zmux.ListenerConfig(inbound_transform=transform)
+)
 ```
 
 ## Secure carrier
@@ -393,13 +439,21 @@ keys from it. Fragment:
 
 ```python
 config = zmux.Config(max_pipes=4)  # the secure carrier is the join source
-handle, psk = zmux.derive_handle_psk(secret, b"my-domain")
-listener = zmux.Listener(config, secure_server=zmux.SecureServer(gate, node_key))
+handle, psk = zmux.adapter.derive_handle_psk(secret, b"my-domain")
+listener = zmux.Listener(
+    config=config,
+    listener_config=zmux.ListenerConfig(
+        secure_server=zmux.SecureServer(gate, node_key)
+    ),
+)
 
 pipe, peer = await zmux.establish(
-    await zmux.dial_tcp(addr), verifier=zmux.PinVerifier(key_id), handle=handle, psk=psk
+    await zmux.dial_tcp(host, port),
+    verifier=zmux.PinVerifier(key_id),
+    handle=handle,
+    psk=psk,
 )
-session = await zmux.Session.connect(pipe, config)
+session = await zmux.Session.connect(pipe, config=config)
 ```
 
 `gate` is any object with `resolve(handle, source)`, `credential(handle,
@@ -413,16 +467,24 @@ be synchronous or `async`. `signer=` takes a `zmux.SigningKey` (of
 
 ## Errors
 
-Every error derives from `zmux.ZmuxError` (with `kind`, `retryable` and
-`code`) and, where one fits, from the built-in exception asyncio raises for
-the same condition: the end of a session (`SessionClosedError` and its
-subclasses `ApplicationClosedError`, `TransportClosedError`,
-`IdleTimeoutError`, `HandshakeTimeoutError`, `ResumeTimeoutError`,
-`PipesLostError`, `ResumeFailedError`, `EarlyDataRejectedError`),
-`StreamResetError` and `StreamStoppedError` are `ConnectionError`s; the three
-timeouts are also `TimeoutError`s; `IncompleteReadError` is an `EOFError`;
-`PreambleTooLargeError` and `LimitExceededError` are `ValueError`s.
-Configuration mistakes raise `ValueError`. Fragment:
+Every error class zmux defines derives from `zmux.ZmuxError` (with `kind`,
+`retryable` and `code`) and, where one fits, from the built-in exception for
+the same condition. The end of a session is `SessionClosedError` (a
+`ConnectionError`) with the subclasses `ApplicationClosedError`,
+`TransportClosedError`, `IdleTimeoutError`, `HandshakeTimeoutError`,
+`ResumeTimeoutError`, `PipesLostError`, `ResumeFailedError` and
+`EarlyDataRejectedError`: it is never a `TimeoutError`, so code that retries
+timed-out operations does not retry on it. `DeadlineExceededError` (a
+`TimeoutError`) is a bound the library applies, such as `join_timeout`, and
+the object stays usable; your own `asyncio.timeout` raises its own
+`TimeoutError`. `StreamResetError` and `StreamStoppedError` are
+`ConnectionError`s; `StreamClosedError` and `ListenerClosedError` say that
+this end closed the stream direction or listener; `IncompleteReadError` is an
+`asyncio.IncompleteReadError` (the one `StreamPairReader` raises too);
+`InvalidArgumentError` and `PreambleTooLargeError` are `ValueError`s, as are
+the mistakes the binding finds in an argument. Errors are classified by what
+happened, not by the call (`GoingAwayError` and `StreamRejectedError` are
+stream errors wherever they are raised). Fragment:
 
 ```python
 try:
@@ -435,11 +497,12 @@ except (zmux.ResumeTimeoutError, zmux.PipesLostError) as e:
 
 ## Shaping and early data
 
-`session.set_shaper(definition=...)`, `Config(shaping=..., shaping_limits=...,
-shaping_budget=...)` and `ShapingBundle` take JSON definitions run natively;
-no Python code runs per record. Bounds left unset keep the library's
-defaults (`ShapingLimits.max_delay`, `ShapingSizeLimits.max_slots`); `None`
-lifts a bound.
+`session.shaper = zmux.shaping.Shaper(definition=...)` (or a
+`zmux.shaping.ShapingBundle`; `None` removes it), `Config(shaping=...,
+shaping_limits=..., shaping_budget=...)` and `ShapingBundle` take JSON
+definitions run natively; no Python code runs per record. Bounds left unset
+keep the library's defaults (`ShapingLimits.max_delay`,
+`ShapingSizeLimits.max_slots`); `None` lifts a bound.
 
 `Config(early_data=True)` toward a zmux peer sends the first streams before
 the peer's parameters arrive. QUIC 0-RTT: keep one

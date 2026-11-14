@@ -22,7 +22,7 @@ from cryptography.x509.oid import NameOID
 
 SERVER_SECRET = b"\x5a" * 32
 CLIENT_SECRET = b"\x6b" * 32
-HANDLE, PSK = zmux.derive_handle_psk(
+HANDLE, PSK = zmux.adapter.derive_handle_psk(
     b"zmux interop pre-shared key 0123", b"interop", b""
 )
 PROFILE = {
@@ -50,8 +50,13 @@ class Failure(Exception):
 class ClosedBy(Exception):
     """The client's verdict on the end of a session the server closed."""
 
-    def __init__(self, info: zmux.CloseInfo):
+    def __init__(self, info: zmux.SessionClosedError):
         self.info = info
+
+
+def split_address(text: str) -> tuple[str, int]:
+    host, _, port = text.rpartition(":")
+    return host, int(port)
 
 
 def say(line: str) -> None:
@@ -187,14 +192,17 @@ async def server(scenario: str) -> int:
             else None
         ),
     )
-    async with zmux.Listener(config(scenario), secure_server=secure) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+    async with zmux.Listener(
+        config=config(scenario),
+        listener_config=zmux.ListenerConfig(secure_server=secure),
+    ) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         tls_addr = None
         if scenario == "join":
-            tls_addr = await listener.serve_tls("127.0.0.1:0", tls=self_signed())
-        say(f"LISTEN {addr}")
+            tls_addr = await listener.serve_tls("127.0.0.1", 0, tls=self_signed())
+        say(f"LISTEN {addr[0]}:{addr[1]}")
         if tls_addr is not None:
-            say(f"LISTENTLS {tls_addr}")
+            say(f"LISTENTLS {tls_addr[0]}:{tls_addr[1]}")
         session = await anext(aiter(listener))
         watch = Watch(session)
         if scenario == "appdata":
@@ -228,10 +236,10 @@ async def server(scenario: str) -> int:
 
 async def client(scenario: str, args: list[str]) -> int:
     profile = PROFILE[scenario]
-    addr = args[0]
+    host, port = split_address(args[0])
     proof_key = bytes.fromhex(args[1]) if scenario == "proof" else None
     pipe, peer = await zmux.establish(
-        await zmux.dial_tcp(addr),
+        await zmux.dial_tcp(host, port),
         verifier=zmux.PinVerifier(pin_of(SERVER_SECRET), proof_key=proof_key),
         handle=HANDLE if profile in (1, 3) else b"",
         psk=PSK if profile in (1, 3) else b"",
@@ -255,7 +263,7 @@ async def client(scenario: str, args: list[str]) -> int:
         )
         if not peer.pq_authenticated:
             raise Failure("server not post-quantum authenticated")
-    session = await zmux.Session.connect(pipe, config(scenario))
+    session = await zmux.Session.connect(pipe, config=config(scenario))
     if scenario == "close":
         send, _ = await session.open_bi()
         chunk = pattern(SIZE_B)
@@ -268,7 +276,9 @@ async def client(scenario: str, args: list[str]) -> int:
     watch = None
     if scenario == "join":
         extra = await session.add_pipe(
-            await zmux.dial_tls(args[1], tls=zmux.TlsConfig(verify=False)),
+            await zmux.dial_tls(
+                *split_address(args[1]), tls=zmux.TlsConfig(verify=False)
+            ),
             options=zmux.PipeOptions(record_mode="bound"),
         )
         await extra.attached()
@@ -281,7 +291,8 @@ async def client(scenario: str, args: list[str]) -> int:
         session.advance_epoch()
         await watch.committed.wait()
         extra = await session.add_pipe(
-            await zmux.dial_tcp(addr), options=zmux.PipeOptions(record_mode="sealed")
+            await zmux.dial_tcp(host, port),
+            options=zmux.PipeOptions(record_mode="sealed"),
         )
         await extra.attached()
     await send_and_check(session, SIZE_A, "A")
@@ -298,11 +309,11 @@ async def client(scenario: str, args: list[str]) -> int:
     return 0
 
 
-def judge_close(info: zmux.CloseInfo) -> int:
+def judge_close(info: zmux.SessionClosedError) -> int:
     if info.code == CLOSE_CODE and info.reason == CLOSE_REASON:
         say(f"CLOSE code={CLOSE_CODE} reason={CLOSE_REASON.decode()}")
         return 0
-    say(f"CLOSE lost {info.error!r} code={info.code} reason={info.reason!r}")
+    say(f"CLOSE lost {info!r} code={info.code} reason={info.reason!r}")
     return 3
 
 

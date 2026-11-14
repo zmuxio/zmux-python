@@ -24,7 +24,7 @@ def by_name(c: dict[str, Any]) -> str:
 @pytest.mark.parametrize("case", FORMAT["bundles"], ids=by_name)
 def test_bundle(case: dict[str, Any]) -> None:
     def load() -> Any:
-        return zmux.ShapingBundle.from_json(
+        return zmux.shaping.ShapingBundle.from_json(
             case["bundle"],
             features=case["features"],
             allow_unshaped=case["allow_unshaped"],
@@ -43,7 +43,7 @@ def test_bundle(case: dict[str, Any]) -> None:
 
 @pytest.mark.parametrize("case", FORMAT["handshake"], ids=by_name)
 def test_handshake_plans(case: dict[str, Any]) -> None:
-    b = zmux.ShapingBundle.from_json(case["bundle"])
+    b = zmux.shaping.ShapingBundle.from_json(case["bundle"])
     for call in case["calls"]:
         plan = b.plan(case["kind"], call["handshake"], call["message"])
         assert (plan is None) == (call["plan"] is None), call
@@ -54,18 +54,18 @@ def test_local_limits(case: dict[str, Any]) -> None:
     text = json.dumps(case["limits"])
     if "error" in case:
         with pytest.raises(ValueError) as e:
-            zmux.shaping_limits_from_json(text)
+            zmux.shaping.shaping_limits_from_json(text)
         assert str(e.value).split(":")[0] == case["error"]
         return
-    got = zmux.shaping_limits_from_json(text)
+    got = zmux.shaping.shaping_limits_from_json(text)
     want = case["want"]
     w = want["wire"]
-    assert got.wire == zmux.ShapingAccount(
+    assert got.wire == zmux.shaping.ShapingAccount(
         initial=w["initial"], per_mb=w["per_mb"], per_sec=w["per_sec"]
     )
     us = want["max_delay"]
     assert got.max_delay == (
-        zmux.DEFAULT_MAX_DELAY
+        zmux.shaping.DEFAULT_MAX_DELAY
         if us == 0
         else None
         if us < 0
@@ -78,11 +78,11 @@ def test_local_limits(case: dict[str, Any]) -> None:
 @pytest.mark.parametrize("case", FORMAT["budget"], ids=by_name)
 def test_budget(case: dict[str, Any]) -> None:
     doc = json.dumps({"kinds": {"default": [{"budget": case["budget"]}]}})
-    b = zmux.ShapingBundle.from_json(doc).budget("default")
+    b = zmux.shaping.ShapingBundle.from_json(doc).budget("default")
     assert b is not None
     if all(d["consumed"] == 0 for d in case["draws"]):
         d = case["draws"][0]
-        assert b.wire == zmux.ShapingAccount(**d["wire"])
+        assert b.wire == zmux.shaping.ShapingAccount(**d["wire"])
         assert b.no_injection == d["no_injection"]
 
 
@@ -92,7 +92,7 @@ def seconds(m: dict[str, int]) -> dict[str, float]:
 
 @pytest.mark.parametrize("case", POOL["decide"], ids=by_name)
 def test_pool_decide(case: dict[str, Any]) -> None:
-    p = zmux.PoolPolicy(case["policy"])
+    p = zmux.helpers.PoolPolicy(case["policy"])
     exact = (
         all(s["consumed"] == 0 for s in case["steps"])
         and not case["compile"]["consumed"]
@@ -118,7 +118,11 @@ def test_pool_decide(case: dict[str, Any]) -> None:
 def test_max_slots() -> None:
     doc = '{"kinds":{"default":[{"machines":[{"start":0,"counters":9000,"states":[{}]}]}]}}'
     with pytest.raises(ValueError, match="limit"):
-        zmux.ShapingBundle.from_json(doc)
-    zmux.ShapingBundle.from_json(doc, limits=zmux.ShapingSizeLimits(max_slots=None))
+        zmux.shaping.ShapingBundle.from_json(doc)
+    zmux.shaping.ShapingBundle.from_json(
+        doc, limits=zmux.shaping.ShapingSizeLimits(max_slots=None)
+    )
     with pytest.raises(ValueError, match="limit"):
-        zmux.ShapingBundle.from_json(doc, limits=zmux.ShapingSizeLimits(max_slots=8999))
+        zmux.shaping.ShapingBundle.from_json(
+            doc, limits=zmux.shaping.ShapingSizeLimits(max_slots=8999)
+        )

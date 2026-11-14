@@ -4,6 +4,7 @@ asyncio and the standard library raise for the same condition."""
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -14,12 +15,14 @@ __all__ = [
     "CarrierChoiceError",
     "ConnectError",
     "DatagramError",
+    "DeadlineExceededError",
     "EarlyDataRejectedError",
     "ExportError",
     "GoingAwayError",
     "HandshakeTimeoutError",
     "IdleTimeoutError",
     "IncompleteReadError",
+    "InvalidArgumentError",
     "JoinPendingError",
     "JoinRefusedError",
     "JoinSecretSetError",
@@ -27,16 +30,19 @@ __all__ = [
     "ListenerClosedError",
     "NoExporterError",
     "NoReplyError",
+    "NoRunningLoopError",
     "NotEstablishedError",
     "NotNegotiatedError",
-    "OpenError",
     "PipeError",
     "PipeGoneError",
+    "PipeUsedError",
     "PipesLostError",
     "PreambleTooLargeError",
     "ResumeFailedError",
     "ResumeTimeoutError",
     "SessionClosedError",
+    "StreamBusyError",
+    "StreamClosedError",
     "StreamError",
     "StreamRejectedError",
     "StreamResetError",
@@ -51,12 +57,31 @@ __all__ = [
 class ZmuxError(Exception):
     """Base of every zmux error. `kind` names the native error, `retryable`
     tells whether the operation may succeed if repeated (a rejected or going
-    away stream), and `code` is the application or transport error code
-    where one applies."""
+    away stream, a session lost to rejected early data), and `code` is the
+    application or transport error code where one applies."""
 
     kind: ErrorKind | str = ""
     retryable: bool = False
     code: int | None = None
+
+
+class InvalidArgumentError(ZmuxError, ValueError):
+    """A value the caller passed cannot be used: an invalid configuration or
+    option, an oversized or malformed preamble."""
+
+
+class DeadlineExceededError(ZmuxError, TimeoutError):
+    """A bound the library applies expired, such as `Config.join_timeout` for
+    `Session.add_pipe`; the object stays usable. It is never the end of a
+    session: a caller's own `asyncio.timeout` raises its own `TimeoutError`."""
+
+
+class NoRunningLoopError(ZmuxError, RuntimeError):
+    """The call needs a running asyncio event loop."""
+
+
+class PipeUsedError(ZmuxError):
+    """The pipe input was given to a session or a listener already."""
 
 
 class ConnectError(ZmuxError, ConnectionError):
@@ -89,15 +114,15 @@ class TransportClosedError(SessionClosedError):
     """A protocol error ended the session."""
 
 
-class IdleTimeoutError(SessionClosedError, TimeoutError):
+class IdleTimeoutError(SessionClosedError):
     """The idle timer ended the session."""
 
 
-class HandshakeTimeoutError(SessionClosedError, TimeoutError):
+class HandshakeTimeoutError(SessionClosedError):
     """No peer parameters arrived in time."""
 
 
-class ResumeTimeoutError(SessionClosedError, TimeoutError):
+class ResumeTimeoutError(SessionClosedError):
     """The resume grace period expired; `__cause__` is the last pipe's
     failure."""
 
@@ -124,16 +149,14 @@ class StreamStoppedError(StreamError, ConnectionError):
     """The peer stopped reading the stream; `code` is its error code."""
 
 
-class IncompleteReadError(StreamError, EOFError):
+class IncompleteReadError(StreamError, asyncio.IncompleteReadError):
     """The stream finished before the requested bytes arrived: `partial`
-    holds the bytes read, `expected` the count asked for (as
-    `asyncio.IncompleteReadError`)."""
-
-    partial: bytes = b""
-    expected: int | None = None
+    holds the bytes read, `expected` the count asked for. It is the one
+    `asyncio.IncompleteReadError` of this library, also raised by
+    `StreamPairReader`."""
 
 
-class LimitExceededError(StreamError, ValueError):
+class LimitExceededError(StreamError):
     """The stream is longer than the read limit."""
 
 
@@ -146,14 +169,29 @@ class GoingAwayError(StreamError):
     (retryable)."""
 
 
+class StreamClosedError(StreamError):
+    """The stream direction was closed by this endpoint already: finished,
+    reset, stopped or taken by another call."""
+
+
+class StreamBusyError(StreamError):
+    """Another operation on the stream part is in progress; a part takes one
+    operation at a time."""
+
+
 class PreambleTooLargeError(ZmuxError, ValueError):
     """A stream's preamble is larger than the limit known: the peer's
     Maximum Preamble Size (before its parameters the remembered one or 1024
     bytes), at most 4096."""
 
 
-class OpenError(ZmuxError):
-    """Opening a stream failed."""
+class NotNegotiatedError(ZmuxError):
+    """The peer did not negotiate what the operation needs: multipath, or a
+    preamble or priority extension it does not speak."""
+
+
+class NotEstablishedError(ZmuxError):
+    """The session is not established yet."""
 
 
 class DatagramError(ZmuxError):
@@ -166,14 +204,6 @@ class ListenerClosedError(ZmuxError):
 
 class PipeError(ZmuxError):
     """A pipe operation failed."""
-
-
-class NotNegotiatedError(PipeError):
-    """Multipath is not in use in this session."""
-
-
-class NotEstablishedError(PipeError):
-    """The session is not established yet."""
 
 
 class JoinPendingError(PipeError):

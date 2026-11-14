@@ -2637,9 +2637,9 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zmux"
-version = "1.2.6"
+version = "1.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "094fde878b81f952e8911deeccda3aa72a48c62dbd10f6919b0ee3f41dcd3fcf"
+checksum = "195d18f002dd4efd82203a5b797f84a47fba792543a5c7ce4891fe7d060c1c4c"
 dependencies = [
  "aes-gcm",
  "atomic-waker",
@@ -2656,9 +2656,9 @@ dependencies = [
 
 [[package]]
 name = "zmux-h3"
-version = "1.2.6"
+version = "1.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4be2a7368e3b924f0956160ca6bb098fe6545a2e55e269cbb7ef02a7db2381c2"
+checksum = "464a2a8b4a1cad7026e23cf0fc91a3205ed90c8cc6770ba2f40ed81e26375e08"
 dependencies = [
  "bytes",
  "h3",
@@ -2672,17 +2672,19 @@ dependencies = [
 
 [[package]]
 name = "zmux-http"
-version = "1.2.6"
+version = "1.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e205982c526bae618bcc060b66cdd2394b6a7eb456a6f062c2851752564ef542"
+checksum = "3fb48f652d8ab422e899c2a8b16b26f03a177506ab44c0b7041fb59afc490fe4"
 dependencies = [
  "base64 0.23.1",
  "bytes",
  "getrandom 0.4.3",
+ "hmac",
  "http",
  "http-body",
  "hyper",
  "hyper-util",
+ "sha2",
  "tokio",
  "zmux",
  "zmux-websocket",
@@ -2690,7 +2692,7 @@ dependencies = [
 
 [[package]]
 name = "zmux-python"
-version = "0.3.3"
+version = "0.3.4"
 dependencies = [
  "bytes",
  "http",
@@ -2715,9 +2717,9 @@ dependencies = [
 
 [[package]]
 name = "zmux-quinn"
-version = "1.2.6"
+version = "1.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33c6ccd38179e7568a02a1d477ee4e68b68dca65a870543226c686b82d92f333"
+checksum = "b696974c39d95430a5a977c8906e9e3b99b9d641065fac2fd4fbe0b984f251f0"
 dependencies = [
  "bytes",
  "quinn",
@@ -2727,9 +2729,9 @@ dependencies = [
 
 [[package]]
 name = "zmux-rustls"
-version = "1.2.6"
+version = "1.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f63dc4d482ee628c743ca333eb0a682fc9fd085cbfb3d92e610a82a64af6c58c"
+checksum = "12f17be2ba17a899079458163bebbe5c8a695638830dc840188f820d0102509b"
 dependencies = [
  "tokio",
  "tokio-rustls",
@@ -2738,9 +2740,9 @@ dependencies = [
 
 [[package]]
 name = "zmux-seal"
-version = "1.2.6"
+version = "1.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc857b91eb3534d93b7ee7cdb865035a35a006cdaf391db59659ed7babd0fae7"
+checksum = "c352b946fb2f0652def8e57851b9f6722ba0513749c3b045587aaf42fb9af250"
 dependencies = [
  "tokio",
  "zmux",
@@ -2749,9 +2751,9 @@ dependencies = [
 
 [[package]]
 name = "zmux-seal-proto"
-version = "1.2.6"
+version = "1.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8aff3828bc1e8168c3d86cf4397b203f26a6cef4488fafc2c39a457b7e317216"
+checksum = "246c6e4fc1ddf4f249a7cedd433898d7d9f09fdfc1dba48439eb49edf72ab043"
 dependencies = [
  "libcrux-ml-dsa",
  "zmux",
@@ -2759,9 +2761,9 @@ dependencies = [
 
 [[package]]
 name = "zmux-shaping"
-version = "1.2.6"
+version = "1.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7bc5c7062608158e170f24c02cde5888bd24d60e99b3fbe52579d412ae9251d3"
+checksum = "f265fc61af21697811741a906ea836e453a9ea11e90a92c44ae5336436f58a98"
 dependencies = [
  "getrandom 0.4.3",
  "rand_chacha",
@@ -2770,9 +2772,9 @@ dependencies = [
 
 [[package]]
 name = "zmux-websocket"
-version = "1.2.6"
+version = "1.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "506f008f346bd1687a56ab5fbfd9ca70f6bb0d6e5e769a25630db00118404ee5"
+checksum = "98aade408a4e4153531bfc6e8c59db1a36b8b5f4b7ea15b5bde0ac1be1680f95"
 dependencies = [
  "futures-util",
  "httparse",
@@ -2786,9 +2788,9 @@ dependencies = [
 
 [[package]]
 name = "zmux-webtransport"
-version = "1.2.6"
+version = "1.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff7dcacd0613c3dab353091901da49c54e463a25eb43429600d2a11c323b8d1f"
+checksum = "d40bc40a3e13ad65579773852572295467d03bf1a8f8b1534d9ef8906605a043"
 dependencies = [
  "bytes",
  "tokio",

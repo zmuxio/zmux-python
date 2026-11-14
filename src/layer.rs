@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3_async_runtimes::TaskLocals;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
@@ -65,7 +64,7 @@ impl CarrierStream {
 }
 
 fn released() -> PyErr {
-    PyRuntimeError::new_err("carrier released")
+    crate::new_err("ConnectError", "carrier released")
 }
 
 #[pymethods]
@@ -242,7 +241,7 @@ impl LayerEnd {
     fn write<'p>(&self, py: Python<'p>, data: Vec<u8>) -> PyResult<Bound<'p, PyAny>> {
         let tx = self.tx.lock().unwrap().clone();
         future_into_py(py, async move {
-            let tx = tx.ok_or_else(|| PyRuntimeError::new_err("layer end closed"))?;
+            let tx = tx.ok_or_else(|| crate::new_err("ConnectError", "layer end closed"))?;
             if !data.is_empty() {
                 // The carrier dropped its reader: nothing reads any more.
                 let _ = tx.send(Bytes::from(data)).await;

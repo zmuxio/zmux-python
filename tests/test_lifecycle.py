@@ -14,8 +14,8 @@ import zmux
 @contextlib.asynccontextmanager
 async def pair() -> AsyncIterator[tuple[zmux.Session, zmux.Session]]:
     async with zmux.Listener() as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
-        c = await zmux.Session.connect(await zmux.dial_tcp(addr))
+        addr = await listener.serve_tcp("127.0.0.1", 0)
+        c = await zmux.Session.connect(await zmux.dial_tcp(*addr))
         s = await listener.accept()
         try:
             yield c, s
@@ -52,12 +52,12 @@ def test_record_policy_may_ask_the_session() -> None:
             auth = zmux.PipeAuth.psk(b"k" * 32)
             server = zmux.Config(max_pipes=4, pipe_auth=auth.with_end_to_end())
             client = zmux.Config(max_pipes=4, pipe_auth=auth, record_policy=policy)
-            async with zmux.Listener(server) as l:
-                addr = await l.serve_tcp("127.0.0.1:0")
-                async with await zmux.Session.connect(await zmux.dial_tcp(addr), client) as s:
+            async with zmux.Listener(config=server) as l:
+                addr = await l.serve_tcp("127.0.0.1", 0)
+                async with await zmux.Session.connect(await zmux.dial_tcp(*addr), config=client) as s:
                     held["s"] = s
                     s.declare_end_to_end()
-                    await s.add_pipe(await zmux.dial_tcp(addr))
+                    await s.add_pipe(await zmux.dial_tcp(*addr))
         asyncio.run(main())
         """
     )
@@ -72,8 +72,8 @@ def test_a_lent_buffer_is_released_clear_of_the_session() -> None:
         import zmux
         async def main():
             async with zmux.Listener() as l:
-                addr = await l.serve_tcp("127.0.0.1:0")
-                c = await zmux.Session.connect(await zmux.dial_tcp(addr))
+                addr = await l.serve_tcp("127.0.0.1", 0)
+                c = await zmux.Session.connect(await zmux.dial_tcp(*addr))
                 s = await l.accept()
                 send, _ = await c.open_bi()
                 await send.flush()
@@ -106,7 +106,7 @@ def test_a_lent_buffer_is_released_clear_of_the_session() -> None:
 
 
 async def test_a_panic_reaches_the_awaiter() -> None:
-    _, end = zmux.pipe_pair()
+    _, end = zmux.adapter.pipe_pair()
     try:
         # A length no allocation takes panics in the future.
         await asyncio.wait_for(end.read(2**63 + 1), 10)
@@ -141,9 +141,9 @@ async def test_stopped_lets_a_write_go_on() -> None:
 
 async def test_read_datagram_lets_a_read_go_on() -> None:
     config = zmux.Config(enable_datagrams=True)
-    async with zmux.Listener(config) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
-        c = await zmux.Session.connect(await zmux.dial_tcp(addr), config)
+    async with zmux.Listener(config=config) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
+        c = await zmux.Session.connect(await zmux.dial_tcp(*addr), config=config)
         s = await listener.accept()
         send, _ = await c.open_bi()
         await send.flush()
@@ -182,9 +182,9 @@ async def test_a_cancelled_blocked_write_releases_the_part() -> None:
         send_buffer=4096,
         send_buffer_max=4096,
     )
-    async with zmux.Listener(config) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
-        c = await zmux.Session.connect(await zmux.dial_tcp(addr), config)
+    async with zmux.Listener(config=config) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
+        c = await zmux.Session.connect(await zmux.dial_tcp(*addr), config=config)
         s = await listener.accept()
         send, _ = await c.open_bi()
         blocked = asyncio.ensure_future(send.write(bytes(1 << 22)))
@@ -242,13 +242,13 @@ async def test_dropped_streams_are_released_after_pipe_0_went() -> None:
 
     key = b"lifecycle-drops-0123456789abcdef"
     c = zmux.Config(max_pipes=4, pipe_auth=zmux.PipeAuth.psk(key).with_end_to_end())
-    async with zmux.Listener(c) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+    async with zmux.Listener(config=c) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         async with await zmux.Session.connect(
-            await zmux.dial_tcp(addr), config=c
+            await zmux.dial_tcp(*addr), config=c
         ) as client:
             server = await asyncio.wait_for(listener.accept(), 5)
-            await asyncio.wait_for(client.add_pipe(await zmux.dial_tcp(addr)), 10)
+            await asyncio.wait_for(client.add_pipe(await zmux.dial_tcp(*addr)), 10)
             client.pipes()[0].abort()
             for _ in range(3):
                 send, recv = await client.open_bi()

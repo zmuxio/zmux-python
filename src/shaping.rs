@@ -1,4 +1,4 @@
-//! Shaping bounds, the seeded random source of `set_shaper` and the
+//! Shaping bounds, the seeded random source of `Session.shaper` and the
 //! factory that picks a definition by carrier variant and kind.
 
 use std::collections::HashMap;
@@ -299,6 +299,11 @@ pub(crate) fn hook_of(v: &Bound<'_, PyAny>) -> zmux::shaping::HandshakeShaper {
     }
     handshake_hook(v.clone().unbind())
 }
+
+/// The shaper in force on a session's outbound pipes, as `Session.shaper`
+/// reads it: opaque, and assignable to `Session.shaper` of another session.
+#[pyclass(frozen, module = "zmux")]
+pub(crate) struct InstalledShaper(pub(crate) Arc<dyn zmux::shaping::Factory>);
 
 /// A configuration bundle: per carrier kind, the machines, handshake plans, budget and pool.
 #[pyclass(frozen, module = "zmux")]

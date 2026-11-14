@@ -24,8 +24,8 @@ async def test_a_process_that_exits_after_wait_closed_reaches_the_peer() -> None
     # The peer holds a session whose carrier ended for its resume timeout:
     # only the CONNECTION_CLOSE that the exiting process handed off ends it.
     c = config(resume_timeout=60.0)
-    async with zmux.Listener(c) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
+    async with zmux.Listener(config=c) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
         for _ in range(3):
             script = textwrap.dedent(
                 f"""
@@ -33,7 +33,7 @@ async def test_a_process_that_exits_after_wait_closed_reaches_the_peer() -> None
                 async def main():
                     c = zmux.Config(max_pipes=6, resume_timeout=60.0,
                                     pipe_auth=zmux.PipeAuth.psk({KEY!r}).with_end_to_end())
-                    s = await zmux.connect_tcp({addr!r}, config=c)
+                    s = await zmux.connect_tcp(*{addr!r}, config=c)
                     send, _ = await s.open_bi()
                     await send.write(b"hello")
                     s.abort(7, b"bye")
@@ -49,9 +49,9 @@ async def test_a_process_that_exits_after_wait_closed_reaches_the_peer() -> None
 
 
 async def test_close_does_not_block_and_wait_closed_follows_the_hand_off() -> None:
-    async with zmux.Listener(config()) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
-        session = await zmux.connect_tcp(addr, config=config())
+    async with zmux.Listener(config=config()) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
+        session = await zmux.connect_tcp(*addr, config=config())
         server = await asyncio.wait_for(listener.accept(), 5)
         start = time.monotonic()
         session.abort(3, b"x")
@@ -71,9 +71,9 @@ async def test_close_does_not_block_and_wait_closed_follows_the_hand_off() -> No
 async def test_a_graceful_close_reaches_the_peer_and_async_with_aborts_on_error() -> (
     None
 ):
-    async with zmux.Listener(config()) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
-        session = await zmux.connect_tcp(addr, config=config())
+    async with zmux.Listener(config=config()) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
+        session = await zmux.connect_tcp(*addr, config=config())
         server = await asyncio.wait_for(listener.accept(), 5)
         session.close()
         session.close()
@@ -82,16 +82,19 @@ async def test_a_graceful_close_reaches_the_peer_and_async_with_aborts_on_error(
         peer = await asyncio.wait_for(server.wait_closed(), 3)
         assert peer.remote is True and peer.code == info.code
 
-        # A normal exit closes and waits; an exception exit aborts with 0.
-        async with await zmux.connect_tcp(addr, config=config()):
+        # A normal exit closes and waits; an exception exit closes with ZMUX_CANCELLED.
+        async with await zmux.connect_tcp(*addr, config=config()):
             ok_server = await asyncio.wait_for(listener.accept(), 5)
         await asyncio.wait_for(ok_server.wait_closed(), 3)
         with pytest.raises(RuntimeError):
-            async with await zmux.connect_tcp(addr, config=config()) as bad:
+            async with await zmux.connect_tcp(*addr, config=config()) as bad:
                 bad_server = await asyncio.wait_for(listener.accept(), 5)
                 raise RuntimeError("boom")
         peer = await asyncio.wait_for(bad_server.wait_closed(), 3)
-        assert peer.code == 0 and peer.remote is True
+        assert (
+            peer.code == zmux.ApplicationErrorCode.ZMUX_CANCELLED
+            and peer.remote is True
+        )
         await asyncio.wait_for(bad.wait_closed(), 3)
 
 
@@ -101,11 +104,11 @@ def test_return_on_reply_is_an_option_fixed_at_add() -> None:
 
 
 async def test_add_pipe_waits_for_the_attachment() -> None:
-    async with zmux.Listener(config()) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
-        async with await zmux.connect_tcp(addr, config=config()) as session:
+    async with zmux.Listener(config=config()) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
+        async with await zmux.connect_tcp(*addr, config=config()) as session:
             pipe = await asyncio.wait_for(
-                session.add_pipe(await zmux.dial_tcp(addr)), 10
+                session.add_pipe(await zmux.dial_tcp(*addr)), 10
             )
             # Attached at return.
             await asyncio.wait_for(pipe.attached(), 0.05)
@@ -113,7 +116,7 @@ async def test_add_pipe_waits_for_the_attachment() -> None:
             assert o is not None and o.return_on_reply is False
             options = zmux.PipeOptions(return_on_reply=True, label="n")
             quick = await asyncio.wait_for(
-                session.add_pipe(await zmux.dial_tcp(addr), options=options), 10
+                session.add_pipe(await zmux.dial_tcp(*addr), options=options), 10
             )
             o = quick.options
             assert o is not None and o.return_on_reply is True
@@ -134,13 +137,13 @@ async def test_add_pipe_times_out_and_leaves_no_pipe() -> None:
     silent = await asyncio.start_server(hold, "127.0.0.1", 0)
     host, port = silent.sockets[0].getsockname()[:2]
     try:
-        async with zmux.Listener(config()) as listener:
-            addr = await listener.serve_tcp("127.0.0.1:0")
+        async with zmux.Listener(config=config()) as listener:
+            addr = await listener.serve_tcp("127.0.0.1", 0)
             c = config(handshake_timeout=None, join_timeout=0.5)
-            async with await zmux.connect_tcp(addr, config=c) as session:
+            async with await zmux.connect_tcp(*addr, config=c) as session:
                 start = time.monotonic()
-                with pytest.raises(TimeoutError):
-                    await session.add_pipe(await zmux.dial_tcp(f"{host}:{port}"))
+                with pytest.raises(zmux.DeadlineExceededError):
+                    await session.add_pipe(await zmux.dial_tcp(host, port))
                 took = time.monotonic() - start
                 assert 0.45 <= took < 2, took
                 live = (zmux.OutboundState.JOINING, zmux.OutboundState.ACTIVE)
@@ -149,7 +152,7 @@ async def test_add_pipe_times_out_and_leaves_no_pipe() -> None:
                 )
                 # A cancelled call aborts its pipe too.
                 task = asyncio.create_task(
-                    session.add_pipe(await zmux.dial_tcp(f"{host}:{port}"))
+                    session.add_pipe(await zmux.dial_tcp(host, port))
                 )
                 await asyncio.sleep(0.1)
                 task.cancel()
@@ -164,9 +167,9 @@ async def test_add_pipe_times_out_and_leaves_no_pipe() -> None:
 
 
 async def test_close_takes_a_code_and_reason_and_the_first_call_decides() -> None:
-    async with zmux.Listener(config()) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
-        session = await zmux.connect_tcp(addr, config=config())
+    async with zmux.Listener(config=config()) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
+        session = await zmux.connect_tcp(*addr, config=config())
         server = await asyncio.wait_for(listener.accept(), 5)
         session.close(0x2A, b"replaced")
         session.close(5, b"later")  # the first call decides
@@ -177,7 +180,7 @@ async def test_close_takes_a_code_and_reason_and_the_first_call_decides() -> Non
         assert (peer.code, peer.reason, peer.remote) == (0x2A, b"replaced", True)
 
         # A plain close is the coded one with code 0 and an empty reason.
-        session = await zmux.connect_tcp(addr, config=config())
+        session = await zmux.connect_tcp(*addr, config=config())
         server = await asyncio.wait_for(listener.accept(), 5)
         session.close()
         peer = await asyncio.wait_for(server.wait_closed(), 3)
@@ -189,9 +192,9 @@ async def test_close_takes_a_code_and_reason_and_the_first_call_decides() -> Non
 
 
 async def test_wait_closed_is_bounded_by_the_callers_timeout() -> None:
-    async with zmux.Listener(config()) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
-        async with await zmux.connect_tcp(addr, config=config()) as session:
+    async with zmux.Listener(config=config()) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
+        async with await zmux.connect_tcp(*addr, config=config()) as session:
             server = await asyncio.wait_for(listener.accept(), 5)
             with pytest.raises(TimeoutError):
                 async with asyncio.timeout(0.05):
@@ -210,9 +213,9 @@ async def test_a_slow_reader_still_reads_everything_ahead_of_the_close() -> None
     # pauses (for less than the linger timeout) before it reads, and still
     # gets all the data and then the code.
     data = bytes(range(256)) * 1024  # 256 KiB
-    async with zmux.Listener(config()) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
-        session = await zmux.connect_tcp(addr, config=config())
+    async with zmux.Listener(config=config()) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
+        session = await zmux.connect_tcp(*addr, config=config())
         server = await asyncio.wait_for(listener.accept(), 5)
         send, _ = await session.open_bi()
         await send.write(b"x")
@@ -238,9 +241,9 @@ async def test_stop_and_reset_in_the_read_drain_raise_exits_stay_quiet() -> None
     # The peer closes with a code while two streams of this side hold unread
     # data: this side is in the read drain. An explicit stop/reset raises a
     # session error, while the automatic cleanup of `async with` swallows it.
-    async with zmux.Listener(config()) as listener:
-        addr = await listener.serve_tcp("127.0.0.1:0")
-        session = await zmux.connect_tcp(addr, config=config())
+    async with zmux.Listener(config=config()) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
+        session = await zmux.connect_tcp(*addr, config=config())
         server = await asyncio.wait_for(listener.accept(), 5)
         opened = []
         kept = []

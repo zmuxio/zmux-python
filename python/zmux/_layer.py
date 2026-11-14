@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any, Protocol, cast
 
 from ._errors import ZmuxError
-from ._zmux import CarrierStream, _LayerEnd
+from ._zmux import CarrierStream, PipeIo, _LayerEnd
 
 
 class LayerWriter(Protocol):
@@ -219,7 +219,7 @@ def _streams(
 
 
 async def open_carrier(
-    pipe: Any,
+    pipe: PipeIo,
     *,
     server_side: bool = False,
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
