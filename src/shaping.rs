@@ -127,7 +127,7 @@ fn size_limits(o: &Bound<'_, PyAny>) -> PyResult<SizeLimits> {
     Ok(l)
 }
 
-/// SplitMix64: a deterministic source for tests, not for traffic.
+/// `SplitMix64`: a deterministic source for tests, not for traffic.
 struct SplitMix(u64);
 
 impl Source for SplitMix {
@@ -140,7 +140,7 @@ impl Source for SplitMix {
     }
 }
 
-/// The state of `seed`: its bytes folded 8 at a time through SplitMix64.
+/// The state of `seed`: its bytes folded 8 at a time through `SplitMix64`.
 fn fold(seed: &[u8]) -> u64 {
     let mut m = SplitMix(seed.len() as u64);
     let mut s = m.next_u64();
@@ -303,7 +303,7 @@ pub(crate) fn hook_of(v: &Bound<'_, PyAny>) -> zmux::shaping::HandshakeShaper {
 /// The shaper in force on a session's outbound pipes, as `Session.shaper`
 /// reads it: opaque, and assignable to `Session.shaper` of another session.
 #[pyclass(frozen, module = "zmux")]
-pub(crate) struct InstalledShaper(pub(crate) Arc<dyn zmux::shaping::Factory>);
+pub(crate) struct InstalledShaper(pub(crate) Arc<dyn Factory>);
 
 /// A configuration bundle: per carrier kind, the machines, handshake plans, budget and pool.
 #[pyclass(frozen, module = "zmux")]
@@ -362,7 +362,7 @@ impl ShapingBundle {
     fn budget<'p>(&self, py: Python<'p>, kind: &str) -> PyResult<Option<Bound<'p, PyAny>>> {
         self.0
             .resolve(kind)
-            .and_then(|c| c.budget())
+            .and_then(zmux_shaping::Compiled::budget)
             .map(|b| budget_obj(py, &b.ask()))
             .transpose()
     }

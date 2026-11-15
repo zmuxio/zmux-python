@@ -28,11 +28,14 @@ __all__ = [
     "JoinSecretSetError",
     "LimitExceededError",
     "ListenerClosedError",
+    "MalformedPacketError",
     "NoExporterError",
     "NoReplyError",
     "NoRunningLoopError",
     "NotEstablishedError",
     "NotNegotiatedError",
+    "PacketError",
+    "PacketTooLargeError",
     "PipeError",
     "PipeGoneError",
     "PipeUsedError",
@@ -196,6 +199,26 @@ class NotEstablishedError(ZmuxError):
 
 class DatagramError(ZmuxError):
     """Sending a datagram failed."""
+
+
+class PacketError(ZmuxError):
+    """A packet stream operation failed. A Context ID out of range is an
+    `InvalidArgumentError`, `SendPolicy.DATAGRAM_ONLY` without datagrams a
+    `NotNegotiatedError`, and a failure of the stream or its datagram the
+    error of that stream or datagram."""
+
+
+class PacketTooLargeError(PacketError, ValueError):
+    """The payload is larger than `max`: the stream's packet bound or, for
+    `SendPolicy.DATAGRAM_ONLY`, the stream's largest datagram now."""
+
+    max: int = 0
+
+
+class MalformedPacketError(PacketError):
+    """The peer's bytes were malformed (a capsule above the bound, or the
+    stream ended inside one): the stream was reset and stopped with
+    `ZMUX_PACKET_ERROR`, its `code`, and later receives fail the same way."""
 
 
 class ListenerClosedError(ZmuxError):

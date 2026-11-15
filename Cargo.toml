@@ -1,6 +1,6 @@
 [package]
 name = "zmux-python"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
@@ -10,19 +10,19 @@ name = "_zmux"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3 = { version = "0.30", features = ["abi3-py312"] }
+pyo3 = { version = "0.30.1", features = ["abi3-py312"] }
 pyo3-async-runtimes = { version = "0.30", features = ["tokio-runtime"] }
-tokio = { version = "1.54", features = ["net", "rt-multi-thread", "sync", "io-util"] }
-bytes = "1"
-zmux = "1.2.7"
-zmux-shaping = { version = "1.2.7", features = ["tokio"] }
-zmux-rustls = "1.2.7"
-zmux-quinn = { version = "1.2.7", features = ["rustls-ring"] }
-zmux-websocket = "1.2.7"
-zmux-seal = "1.2.7"
-zmux-http = { version = "1.2.7", features = ["websocket"] }
-zmux-h3 = "1.2.7"
-zmux-webtransport = "1.2.7"
+tokio = { version = "1.54.1", features = ["net", "rt-multi-thread", "sync", "io-util"] }
+bytes = "1.12"
+zmux = "1.2.8"
+zmux-shaping = { version = "1.2.8", features = ["tokio"] }
+zmux-rustls = "1.2.8"
+zmux-quinn = { version = "1.2.8", features = ["rustls-ring"] }
+zmux-websocket = "1.2.8"
+zmux-seal = "1.2.8"
+zmux-http = { version = "1.2.8", features = ["websocket"] }
+zmux-h3 = "1.2.8"
+zmux-webtransport = "1.2.8"
 http = "1"
 tokio-tungstenite = { version = "0.30", default-features = false }
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
@@ -34,3 +34,18 @@ webpki-roots = "1"
 lto = "thin"
 codegen-units = 1
 
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# PyO3 signatures take arguments by value and return `PyResult` by contract,
+# and a binding module is long by nature.
+needless_pass_by_value = "allow"
+unnecessary_wraps = "allow"
+unused_self = "allow"
+too_many_lines = "allow"
+too_many_arguments = "allow"
+many_single_char_names = "allow"
+# Pool timings and rates are floats at the Python boundary; the casts clamp.
+cast_precision_loss = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"

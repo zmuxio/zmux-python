@@ -22,7 +22,7 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=9.2", "pytest-asyncio>=1.4.1", "cryptography>=50"]
+test = ["pytest>=9.2", "pytest-asyncio>=1.5", "cryptography>=50.0.2"]
 
 [project.urls]
 Repository = "https://github.com/zmuxio/zmux-python"

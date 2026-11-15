@@ -196,18 +196,18 @@ impl PoolPolicyDecision {
     }
 
     fn __repr__(&self) -> String {
-        fn opt<T: std::fmt::Display>(v: &Option<T>) -> String {
-            v.as_ref().map_or("None".into(), |v| v.to_string())
+        fn opt<T: std::fmt::Display>(v: Option<&T>) -> String {
+            v.map_or("None".into(), ToString::to_string)
         }
         format!(
             "PoolPolicyDecision(count={}, dial_after={}, retire={:?}, recheck={}, \
              probe_interval={}, probe_jitter={})",
-            opt(&self.count),
-            opt(&self.dial_after),
+            opt(self.count.as_ref()),
+            opt(self.dial_after.as_ref()),
             self.retire,
-            opt(&self.recheck),
-            opt(&self.probe_interval),
-            opt(&self.probe_jitter)
+            opt(self.recheck.as_ref()),
+            opt(self.probe_interval.as_ref()),
+            opt(self.probe_jitter.as_ref())
         )
     }
 }
@@ -217,7 +217,10 @@ struct Shared(Arc<StdMutex<MachinePoolPolicy>>);
 
 impl zmux::helpers::PoolPolicy for Shared {
     fn decide(&mut self, view: &PoolView<'_>, out: &mut PoolDecision) {
-        let mut p = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let mut p = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         zmux::helpers::PoolPolicy::decide(&mut *p, view, out);
     }
 }

@@ -197,6 +197,8 @@ class StreamPairWriter:
             await asyncio.wait({task})
         self._check()
 
+    # Part of the `asyncio.StreamWriter` interface: callers use an instance.
+    # noinspection PyMethodMayBeStatic
     def can_write_eof(self) -> bool:
         """Always true: a stream can be finished."""
         return True
@@ -297,6 +299,8 @@ def pipe_from_streams(
 
     def note() -> None:
         if count is not None and size is not None:
+            # The inspection does not narrow `size` inside the closure.
+            # noinspection PyCallingNonCallable
             count.set(size())
 
     async def inbound() -> None:

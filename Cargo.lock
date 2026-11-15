@@ -109,9 +109,9 @@ dependencies = [
 
 [[package]]
 name = "bumpalo"
-version = "3.20.3"
+version = "3.20.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
+checksum = "87a0cf66fd1eb2fb7b822cb78370d82303750809bc6ba855f3f58e517d3238db"
 
 [[package]]
 name = "bytes"
@@ -2637,9 +2637,9 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zmux"
-version = "1.2.7"
+version = "1.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "195d18f002dd4efd82203a5b797f84a47fba792543a5c7ce4891fe7d060c1c4c"
+checksum = "edbd0be37d19c999ed59d0e96c11bf9b4c9d1ba7a4618d4495cc0254329d6090"
 dependencies = [
  "aes-gcm",
  "atomic-waker",
@@ -2656,9 +2656,9 @@ dependencies = [
 
 [[package]]
 name = "zmux-h3"
-version = "1.2.7"
+version = "1.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "464a2a8b4a1cad7026e23cf0fc91a3205ed90c8cc6770ba2f40ed81e26375e08"
+checksum = "8b91d10a76034337300bda98ee089c1bd2f7e3c2f5dca57c164687e0c42bde09"
 dependencies = [
  "bytes",
  "h3",
@@ -2672,9 +2672,9 @@ dependencies = [
 
 [[package]]
 name = "zmux-http"
-version = "1.2.7"
+version = "1.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fb48f652d8ab422e899c2a8b16b26f03a177506ab44c0b7041fb59afc490fe4"
+checksum = "3a3436755d5e660dffef0f1b076b89bf73b3905932b728dbdfcefb9ba036a7e4"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -2687,12 +2687,13 @@ dependencies = [
  "sha2",
  "tokio",
  "zmux",
+ "zmux-rustls",
  "zmux-websocket",
 ]
 
 [[package]]
 name = "zmux-python"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "bytes",
  "http",
@@ -2717,9 +2718,9 @@ dependencies = [
 
 [[package]]
 name = "zmux-quinn"
-version = "1.2.7"
+version = "1.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b696974c39d95430a5a977c8906e9e3b99b9d641065fac2fd4fbe0b984f251f0"
+checksum = "1c4109616118a9dc519f1aae316618be8cae5dc9faf99ec82dbe25226ee63a2c"
 dependencies = [
  "bytes",
  "quinn",
@@ -2729,9 +2730,9 @@ dependencies = [
 
 [[package]]
 name = "zmux-rustls"
-version = "1.2.7"
+version = "1.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12f17be2ba17a899079458163bebbe5c8a695638830dc840188f820d0102509b"
+checksum = "33684e8043d94445a91ba2bd8024fba6147250827146c83b225aab614e824348"
 dependencies = [
  "tokio",
  "tokio-rustls",
@@ -2740,9 +2741,9 @@ dependencies = [
 
 [[package]]
 name = "zmux-seal"
-version = "1.2.7"
+version = "1.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c352b946fb2f0652def8e57851b9f6722ba0513749c3b045587aaf42fb9af250"
+checksum = "abf5c448ccb07681c5bbb0a4957124896a1203e7a8d682580221cc6419c6a80b"
 dependencies = [
  "tokio",
  "zmux",
@@ -2751,9 +2752,9 @@ dependencies = [
 
 [[package]]
 name = "zmux-seal-proto"
-version = "1.2.7"
+version = "1.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "246c6e4fc1ddf4f249a7cedd433898d7d9f09fdfc1dba48439eb49edf72ab043"
+checksum = "0b372df9221761503557c53fc62d4191de0330713d172305b0fd24b4d797303d"
 dependencies = [
  "libcrux-ml-dsa",
  "zmux",
@@ -2761,9 +2762,9 @@ dependencies = [
 
 [[package]]
 name = "zmux-shaping"
-version = "1.2.7"
+version = "1.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f265fc61af21697811741a906ea836e453a9ea11e90a92c44ae5336436f58a98"
+checksum = "4086e454f59b3af0661d3ddcddff140b3234a095d88f316aac5f481fb9bcb1a8"
 dependencies = [
  "getrandom 0.4.3",
  "rand_chacha",
@@ -2772,9 +2773,9 @@ dependencies = [
 
 [[package]]
 name = "zmux-websocket"
-version = "1.2.7"
+version = "1.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "98aade408a4e4153531bfc6e8c59db1a36b8b5f4b7ea15b5bde0ac1be1680f95"
+checksum = "dfaeda344895adb88af780fa0267935bebd971a2d0d6149d22a60cb8fd5811eb"
 dependencies = [
  "futures-util",
  "httparse",
@@ -2784,13 +2785,14 @@ dependencies = [
  "tokio-rustls",
  "tokio-tungstenite",
  "zmux",
+ "zmux-rustls",
 ]
 
 [[package]]
 name = "zmux-webtransport"
-version = "1.2.7"
+version = "1.2.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d40bc40a3e13ad65579773852572295467d03bf1a8f8b1534d9ef8906605a043"
+checksum = "b1c103c57796526a960182b77b9922bd877890bc51548714d5bedd5be92e0307"
 dependencies = [
  "bytes",
  "tokio",

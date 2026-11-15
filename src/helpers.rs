@@ -50,7 +50,10 @@ fn allowance(py: Python<'_>, r: PyResult<Py<PyAny>>) -> usize {
 
 impl zmux::Limiter for PyLimiter {
     fn poll_ready(&self, cx: &mut Context<'_>, min: usize, max: usize) -> Poll<usize> {
-        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if pending.is_none() {
             let started = crate::rt::attach(|py| {
                 let coro = self.obj.bind(py).call_method1("ready", (min, max))?;
@@ -87,8 +90,41 @@ impl zmux::Limiter for PyLimiter {
     }
 }
 
+/// Aborts the splices given it with a chosen application error code: the
+/// first `abort` decides the code and wakes every splice sharing the handle.
+#[pyclass(frozen, module = "zmux")]
+#[derive(Default)]
+pub(crate) struct SpliceAbort(zmux::helpers::SpliceAbort);
+
+#[pymethods]
+impl SpliceAbort {
+    #[new]
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Aborts with `code` (< 2**62, 0 included); later calls change nothing.
+    fn abort(&self, code: u64) -> PyResult<()> {
+        self.0.abort(crate::varint(code)?);
+        Ok(())
+    }
+
+    /// The code of the abort, or `None` while not aborted.
+    #[getter]
+    fn code(&self) -> Option<u64> {
+        self.0.code().map(zmux::VarInt::into_inner)
+    }
+
+    fn __repr__(&self) -> String {
+        match self.code() {
+            Some(c) => format!("SpliceAbort(code={c})"),
+            None => "SpliceAbort()".to_owned(),
+        }
+    }
+}
+
 /// The parts of a bidirectional stream, taken out of their handles.
-fn pair(
+pub(crate) fn pair(
     send: &Bound<'_, SendStream>,
     recv: &Bound<'_, RecvStream>,
 ) -> PyResult<(zmux::SendStream, zmux::RecvStream)> {
@@ -109,7 +145,7 @@ fn pair(
     Ok((sg.take().expect("checked"), rg.take().expect("checked")))
 }
 
-/// A bidirectional stream as a pipe input: one that carries PIPE_CARRIER,
+/// A bidirectional stream as a pipe input: one that carries `PIPE_CARRIER`,
 /// or any the application knows to be a carrier. The handles are used up.
 #[pyfunction]
 fn stream_pipe(send: &Bound<'_, SendStream>, recv: &Bound<'_, RecvStream>) -> PyResult<PipeIo> {
@@ -125,12 +161,16 @@ fn forwarded<'p>(py: Python<'p>, f: &zmux::helpers::Forwarded) -> PyResult<Bound
         E::Stopped(c) => ("stopped", Some(c.into_inner())),
         E::UpstreamLost => ("upstream_lost", None),
         E::DownstreamLost => ("downstream_lost", None),
+        E::Cancelled(c) => ("cancelled", Some(c.into_inner())),
         other => return Err(PyValueError::new_err(format!("{other:?}"))),
     };
     types(py)?.getattr("Forwarded")?.call1((
         f.bytes,
         f.datagram_bytes,
         f.datagrams_dropped,
+        f.datagrams_too_large,
+        f.datagrams_limited,
+        f.datagrams_as_capsules,
         end,
         code,
     ))
@@ -139,7 +179,7 @@ fn forwarded<'p>(py: Python<'p>, f: &zmux::helpers::Forwarded) -> PyResult<Bound
 /// Forwards two bidirectional streams into each other until both
 /// directions ended; the handles are used up.
 #[pyfunction]
-#[pyo3(signature = (a, b, *, chunk=65536, a_to_b=None, b_to_a=None))]
+#[pyo3(signature = (a, b, *, chunk=65536, a_to_b=None, b_to_a=None, abort=None))]
 fn splice<'p>(
     py: Python<'p>,
     a: (Bound<'p, SendStream>, Bound<'p, RecvStream>),
@@ -147,6 +187,36 @@ fn splice<'p>(
     chunk: usize,
     a_to_b: Option<Py<PyAny>>,
     b_to_a: Option<Py<PyAny>>,
+    abort: Option<&Bound<'p, SpliceAbort>>,
+) -> PyResult<Bound<'p, PyAny>> {
+    splice_with(py, a, b, chunk, a_to_b, b_to_a, abort, false)
+}
+
+/// Relays two packet streams: `splice`, where a stream datagram that does
+/// not fit the next hop goes on as a DATAGRAM capsule.
+#[pyfunction]
+#[pyo3(signature = (a, b, *, chunk=65536, a_to_b=None, b_to_a=None, abort=None))]
+fn splice_packets<'p>(
+    py: Python<'p>,
+    a: (Bound<'p, SendStream>, Bound<'p, RecvStream>),
+    b: (Bound<'p, SendStream>, Bound<'p, RecvStream>),
+    chunk: usize,
+    a_to_b: Option<Py<PyAny>>,
+    b_to_a: Option<Py<PyAny>>,
+    abort: Option<&Bound<'p, SpliceAbort>>,
+) -> PyResult<Bound<'p, PyAny>> {
+    splice_with(py, a, b, chunk, a_to_b, b_to_a, abort, true)
+}
+
+fn splice_with<'p>(
+    py: Python<'p>,
+    a: (Bound<'p, SendStream>, Bound<'p, RecvStream>),
+    b: (Bound<'p, SendStream>, Bound<'p, RecvStream>),
+    chunk: usize,
+    a_to_b: Option<Py<PyAny>>,
+    b_to_a: Option<Py<PyAny>>,
+    abort: Option<&Bound<'p, SpliceAbort>>,
+    packets: bool,
 ) -> PyResult<Bound<'p, PyAny>> {
     if chunk == 0 {
         return Err(PyValueError::new_err("chunk is at least 1"));
@@ -168,12 +238,16 @@ fn splice<'p>(
     opts.chunk = chunk;
     opts.a_to_b = lim(a_to_b);
     opts.b_to_a = lim(b_to_a);
+    opts.abort = abort.map(|a| a.get().0.clone());
     let sa = pair(&a.0, &a.1)?;
     let sb = pair(&b.0, &b.1)?;
     future_into_py(py, async move {
-        let r = zmux::helpers::splice(sa, sb, opts)
-            .await
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let r = if packets {
+            zmux::helpers::splice_packets(sa, sb, opts).await
+        } else {
+            zmux::helpers::splice(sa, sb, opts).await
+        }
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
         crate::rt::attach(|py| {
             Ok(types(py)?
                 .getattr("Spliced")?
@@ -268,7 +342,7 @@ fn resolve_duplicate<'p>(
 }
 
 /// `SessionNonce` as `session_nonce`.
-fn snake(name: &str) -> String {
+pub(crate) fn snake(name: &str) -> String {
     let mut out = String::new();
     for (i, c) in name.chars().enumerate() {
         if c.is_ascii_uppercase() && i > 0 {
@@ -291,8 +365,10 @@ impl CloneStatic for Py<PyAny> {
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<SpliceAbort>()?;
     m.add_function(wrap_pyfunction!(stream_pipe, m)?)?;
     m.add_function(wrap_pyfunction!(splice, m)?)?;
+    m.add_function(wrap_pyfunction!(splice_packets, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_duplicate, m)?)?;
     Ok(())
 }

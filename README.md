@@ -64,7 +64,7 @@ and streams, their configuration, options, events, statistics and errors, and
 the dial and serve entries. The rest has a namespace of its own: `zmux.adapter`
 (what only the author of a carrier adapter or of an accept loop needs),
 `zmux.sched` (the scheduler and redundancy settings), `zmux.shaping` and
-`zmux.helpers` (pipe pools, `splice`, limiters, duplicate sessions).
+`zmux.helpers` (pipe pools, `splice`, limiters, duplicate sessions, packet streams).
 
 ## Terms
 
@@ -263,9 +263,36 @@ async for event in session.events():
 ```
 
 Relays and nested sessions: `await zmux.helpers.splice((send_a, recv_a), (send_b,
-recv_b), a_to_b=limiter)` forwards two streams into each other;
+recv_b), a_to_b=limiter)` forwards two streams into each other.
+`zmux.helpers.SpliceAbort()` given as `abort=` ends the splices sharing it
+with a chosen code: `abort.abort(0x77)` resets the downstream parts and stops
+the upstream parts with it, and the directions still running report
+`SpliceEnd.CANCELLED` with `code` (an aborted handle at the start ends the
+splice at once); cancelling the task keeps resetting with `ZMUX_CANCELLED`.
 `await session.open_pipe_stream(info=..., tlvs=...)` opens a carrier stream
 and `zmux.adapter.stream_pipe(send, recv)` wraps an accepted one, either a `PipeIo`.
+
+Packet streams: `await session.open_packet_stream(info=..., policy=...)`
+opens a stream and `zmux.helpers.PacketStream(send, recv, policy=...)` wraps
+an accepted one; each packet goes as a datagram of the stream or as a
+DATAGRAM capsule in its bytes, by `zmux.helpers.SendPolicy`
+(`PREFER_DATAGRAM`, `STREAM_ONLY`, `DATAGRAM_ONLY`). `send(payload,
+context=0)` returns how it left (`zmux.helpers.Sent`), `recv()` a `Packet`
+or `None` once the peer called `close()`, and `async for` iterates the
+packets; `split()` gives a sender and a receiver for two tasks, `stats()` the
+counters. Its send and receive are cancellation-safe. Errors sit under
+`zmux.PacketError`: `PacketTooLargeError` above `max_packet` (65535 by
+default), and `MalformedPacketError` when the peer's bytes were malformed
+(the stream is then reset and stopped with `ZMUX_PACKET_ERROR`).
+`await zmux.helpers.splice_packets(a, b)` relays two packet streams, sending
+a datagram that does not fit the next hop as a capsule. Fragment:
+
+```python
+packets = await session.open_packet_stream()
+await packets.send(b"ping", context=1)
+async for packet in packets:
+    print(packet.context, packet.payload)
+```
 
 ## Closing
 

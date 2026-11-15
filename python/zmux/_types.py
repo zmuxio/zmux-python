@@ -22,8 +22,6 @@ from typing import (
 from . import _zmux
 
 if TYPE_CHECKING:
-    from typing import Self
-
     from ._zmux import (
         Admission,
         CarrierInfo,
@@ -37,12 +35,16 @@ if TYPE_CHECKING:
 
 
 class _Enum(enum.StrEnum):
-    @classmethod
-    def _of(cls, value: str) -> Self | str:
-        try:
-            return cls(value)
-        except ValueError:
-            return value
+    """Base of the string enums: members compare equal to their wire text."""
+
+
+def _enum_of[E: _Enum](cls: type[E], value: str) -> E | str:
+    """`cls(value)`, or `value` itself when it names no member (a value a
+    newer peer or native layer may send)."""
+    try:
+        return cls(value)
+    except ValueError:
+        return value
 
 
 class _Setting(enum.Enum):
@@ -243,6 +245,8 @@ class ErrorKind(_Enum):
     NO_EXPORTER = "NoExporter"
     RESERVED_LABEL = "ReservedLabel"
     UNAVAILABLE = "Unavailable"
+    INVALID_CONTEXT = "InvalidContext"
+    MALFORMED = "Malformed"
 
 
 class TransportErrorCode(enum.IntEnum):
@@ -288,6 +292,9 @@ class ApplicationErrorCode(enum.IntEnum):
     """The stream was not processed and may be retried."""
     ZMUX_CARRIER_FAILED = 0x5A4D0003
     """The stream carried something that failed; not safe to retry blindly."""
+    ZMUX_PACKET_ERROR = 0x5A4D0004
+    """The bytes of a packet stream were malformed: a capsule above the
+    receiver's bound, or the stream ended inside a capsule."""
     ZMUX_PROXY_GENERAL_FAILURE = 0x5A4D0101
     ZMUX_PROXY_NOT_ALLOWED = 0x5A4D0102
     ZMUX_PROXY_NETWORK_UNREACHABLE = 0x5A4D0103
@@ -779,8 +786,8 @@ class CandidateResult:
 
 def _candidate_result(fields: dict[str, Any]) -> CandidateResult:
     return CandidateResult(
-        CarrierKind._of(fields["carrier"]),
-        CandidateOutcome._of(fields["outcome"]),
+        _enum_of(CarrierKind, fields["carrier"]),
+        _enum_of(CandidateOutcome, fields["outcome"]),
         fields["joined"],
         fields["error"],
         fields["variant"],
@@ -849,7 +856,7 @@ class SessionStats:
 
     def __post_init__(self) -> None:
         if self.carrier is not None:
-            object.__setattr__(self, "carrier", CarrierKind._of(self.carrier))
+            object.__setattr__(self, "carrier", _enum_of(CarrierKind, self.carrier))
         object.__setattr__(self, "carrier_candidates", tuple(self.carrier_candidates))
 
 
@@ -1137,7 +1144,7 @@ def _event(kind: str, fields: dict[str, Any]) -> Event:
         return UnknownEvent(fields.get("detail", kind))
     for k, e in _ENUM_FIELDS.items():
         if fields.get(k) is not None:
-            fields[k] = e._of(fields[k])
+            fields[k] = _enum_of(e, fields[k])
     if "last" in fields:
         fields["last"] = tuple(fields["last"])
     return cls(**fields)
@@ -1145,15 +1152,15 @@ def _event(kind: str, fields: dict[str, Any]) -> Event:
 
 def _pipe_stats(fields: dict[str, Any]) -> PipeStats:
     if fields["inbound"] is not None:
-        fields["inbound"] = InboundState._of(fields["inbound"])
+        fields["inbound"] = _enum_of(InboundState, fields["inbound"])
     if fields["outbound"] is not None:
-        fields["outbound"] = OutboundState._of(fields["outbound"])
+        fields["outbound"] = _enum_of(OutboundState, fields["outbound"])
     if fields["carrier"] is not None:
-        fields["carrier"] = CarrierKind._of(fields["carrier"])
+        fields["carrier"] = _enum_of(CarrierKind, fields["carrier"])
     for k in ("send_priority_source", "standby_source"):
-        fields[k] = PrioritySource._of(fields[k])
+        fields[k] = _enum_of(PrioritySource, fields[k])
     if fields["rtt_source"] is not None:
-        fields["rtt_source"] = RttSource._of(fields["rtt_source"])
+        fields["rtt_source"] = _enum_of(RttSource, fields["rtt_source"])
     if fields["peer_request"] is not None:
         fields["peer_request"] = PipeRequest(*fields["peer_request"])
     fields["lanes"] = tuple(LaneStats(*lane) for lane in fields["lanes"])
@@ -1612,21 +1619,33 @@ class SpliceEnd(_Enum):
     STOPPED = "stopped"
     UPSTREAM_LOST = "upstream_lost"
     DOWNSTREAM_LOST = "downstream_lost"
+    CANCELLED = "cancelled"
+    """Aborted with `SpliceAbort`; `Forwarded.code` is its code."""
 
 
 @dataclass(frozen=True, slots=True)
 class Forwarded:
     """What one direction of a splice forwarded, and how it ended; `code` is
-    the reset or stop code with `SpliceEnd.RESET` and `SpliceEnd.STOPPED`."""
+    the reset, stop or abort code with `SpliceEnd.RESET`, `SpliceEnd.STOPPED`
+    and `SpliceEnd.CANCELLED`."""
 
     bytes: int
     datagram_bytes: int
     datagrams_dropped: int
+    """Stream datagrams not forwarded, for any cause."""
+    datagrams_too_large: int
+    """Not forwarded: too large for the downstream stream's datagrams (a
+    packet relay drops one only when its capsule queue is full)."""
+    datagrams_limited: int
+    """Not forwarded: refused by a limiter."""
+    datagrams_as_capsules: int
+    """Forwarded by a packet relay as DATAGRAM capsules (also counted in
+    `datagram_bytes`); always 0 for `splice`."""
     end: SpliceEnd | str
     code: int | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "end", SpliceEnd._of(str(self.end)))
+        object.__setattr__(self, "end", _enum_of(SpliceEnd, str(self.end)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1635,6 +1654,51 @@ class Spliced:
 
     a_to_b: Forwarded
     b_to_a: Forwarded
+
+
+class SendPolicy(_Enum):
+    """How a packet stream sends a packet."""
+
+    PREFER_DATAGRAM = "prefer_datagram"
+    """As a datagram when the session's datagrams are in use and the packet
+    fits the stream's largest datagram now, else as a capsule. A datagram a
+    limiter refuses is dropped, never sent as a capsule instead."""
+    STREAM_ONLY = "stream_only"
+    """Always as a capsule: in order and reliably."""
+    DATAGRAM_ONLY = "datagram_only"
+    """Always as a datagram: a packet that does not fit fails."""
+
+
+class Sent(_Enum):
+    """How a packet left."""
+
+    DATAGRAM = "datagram"
+    CAPSULE = "capsule"
+    DROPPED = "dropped"
+    """Not at all: a datagram limiter refused it."""
+
+
+class Packet(NamedTuple):
+    """A packet received: its Context ID and payload."""
+
+    context: int
+    payload: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class PacketStats:
+    """The counters of a packet stream or of one of its halves."""
+
+    sent_datagrams: int
+    sent_capsules: int
+    dropped_too_large: int
+    """Not sent: too large for a datagram (`SendPolicy.DATAGRAM_ONLY`)."""
+    dropped_limited: int
+    """Not sent: a datagram limiter refused them."""
+    received_datagrams: int
+    received_capsules: int
+    skipped_capsules: int
+    """Capsules of unknown types skipped."""
 
 
 class DuplicateRule(_Enum):
@@ -1656,7 +1720,7 @@ class Resolved:
     rejoin_started: bool
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "rule", DuplicateRule._of(str(self.rule)))
+        object.__setattr__(self, "rule", _enum_of(DuplicateRule, str(self.rule)))
 
 
 class Scheduler(_Enum):

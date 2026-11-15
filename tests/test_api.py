@@ -642,3 +642,86 @@ async def test_resolve_duplicate_returns_the_given_objects() -> None:
         for sess in (x1, x2, y1, y2):
             sess.abort(0)
         await asyncio.gather(*(x.wait_closed() for x in (x1, x2, y1, y2)))
+
+
+async def _abort_relay(
+    relay_in: zmux.Session,
+    relay_out: zmux.Session,
+    abort: zmux.helpers.SpliceAbort,
+    *,
+    packets: bool = False,
+) -> zmux.helpers.Spliced:
+    a = await relay_in.accept_bi()
+    b = await relay_out.open_bi()
+    run = zmux.helpers.splice_packets if packets else zmux.helpers.splice
+    return await run(a, b, abort=abort)
+
+
+@pytest.mark.parametrize("packets", [False, True])
+async def test_splice_abort_ends_with_the_code(packets: bool) -> None:
+    async with pair() as (c, relay_in, _l1), pair() as (relay_out, server, _l2):
+        abort = zmux.helpers.SpliceAbort()
+        assert abort.code is None
+        task = asyncio.ensure_future(
+            _abort_relay(relay_in, relay_out, abort, packets=packets)
+        )
+        send, recv = await c.open_bi()
+        await send.write(b"hello")
+        _s_send, s_recv = await server.accept_bi()
+        assert await s_recv.read_exact(5) == b"hello"
+        await asyncio.sleep(0.05)
+        abort.abort(0x77)
+        abort.abort(0x99)  # the first code stays
+        assert abort.code == 0x77
+        done = await asyncio.wait_for(task, 10)
+        for d in (done.a_to_b, done.b_to_a):
+            assert d.end is zmux.helpers.SpliceEnd.CANCELLED and d.code == 0x77
+        with pytest.raises(zmux.StreamResetError) as r:
+            await asyncio.wait_for(recv.read_to_end(), 5)
+        assert r.value.code == 0x77
+        with pytest.raises(zmux.StreamResetError) as r:
+            await asyncio.wait_for(s_recv.read_to_end(), 5)
+        assert r.value.code == 0x77
+        with pytest.raises(zmux.StreamStoppedError) as w:
+            await until_raises(send)
+        assert w.value.code == 0x77
+
+
+async def until_raises(*sends: zmux.SendStream) -> None:
+    async with asyncio.timeout(5):
+        while True:
+            for s in sends:
+                await s.write(b"x")
+            await asyncio.sleep(0.01)
+
+
+async def test_splice_abort_before_start_ends_at_once() -> None:
+    async with pair() as (c, relay_in, _l1), pair() as (relay_out, _server, _l2):
+        abort = zmux.helpers.SpliceAbort()
+        abort.abort(0)
+        assert abort.code == 0
+        task = asyncio.ensure_future(_abort_relay(relay_in, relay_out, abort))
+        send, _recv = await c.open_bi()
+        await send.flush()
+        done = await asyncio.wait_for(task, 5)
+        assert done.a_to_b.end is zmux.helpers.SpliceEnd.CANCELLED
+        assert done.b_to_a.code == 0
+        with pytest.raises(OverflowError):
+            abort.abort(-1)
+        with pytest.raises(ValueError):
+            abort.abort(2**62)
+
+
+async def test_flush_succeeds_once_data_left_and_the_stop_comes_after() -> None:
+    async with pair() as (c, s, _l):
+        send, _recv = await c.open_bi()
+        await send.write(b"data")
+        await asyncio.wait_for(send.flush(), 5)
+        _s_send, s_recv = await s.accept_bi()
+        assert await s_recv.read_exact(4) == b"data"
+        s_recv.stop(0x55)
+        assert await asyncio.wait_for(send.stopped(), 5) == 0x55
+        await asyncio.wait_for(send.flush(), 5)
+        with pytest.raises(zmux.StreamStoppedError) as w:
+            await send.write(b"more")
+        assert w.value.code == 0x55

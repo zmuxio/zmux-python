@@ -20,14 +20,13 @@ update the trusted publisher on PyPI in the same change.
 
 ## Version Rules
 
-These fields must hold the same version:
+The version is set in one place, the `Cargo.toml` package version. `pyproject.toml` takes it as a dynamic field and
+`zmux.__version__` reads the installed package metadata. The git tag must match it:
 
-- `pyproject.toml` project version: `X.Y.Z`
 - `Cargo.toml` package version: `X.Y.Z`
-- `python/zmux/__init__.py` `__version__`: `X.Y.Z`
 - Git tag: `vX.Y.Z`
 
-The release workflow compares the tag with these fields and fails on any mismatch.
+The release workflow compares the tag with `Cargo.toml` and fails on any mismatch.
 
 ## Release
 
@@ -57,7 +56,7 @@ crates.io registry as their source.
 Update the version fields above, then commit and push:
 
 ```bash
-git add pyproject.toml Cargo.toml Cargo.lock python/zmux/__init__.py
+git add Cargo.toml Cargo.lock
 git commit -m "release: prepare vX.Y.Z"
 git push origin main
 ```

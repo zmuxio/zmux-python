@@ -28,7 +28,7 @@ pub(crate) fn record_mode_of(v: &Bound<'_, PyAny>) -> PyResult<RecordMode> {
     }
 }
 
-pub(crate) fn record_mode_obj<'p>(py: Python<'p>, m: RecordMode) -> PyResult<Bound<'p, PyAny>> {
+pub(crate) fn record_mode_obj(py: Python<'_>, m: RecordMode) -> PyResult<Bound<'_, PyAny>> {
     let name = match m {
         RecordMode::Sealed => "SEALED",
         RecordMode::Bound => "BOUND",
@@ -66,7 +66,7 @@ async fn call_method(
     target: &Py<PyAny>,
     method: &str,
     locals: &TaskLocals,
-    args: impl for<'p> FnOnce(Python<'p>) -> PyResult<Bound<'p, pyo3::types::PyTuple>>,
+    args: impl for<'p> FnOnce(Python<'p>) -> PyResult<Bound<'p, PyTuple>>,
 ) -> PyResult<Py<PyAny>> {
     call(|py| target.bind(py).call_method1(method, args(py)?), locals).await
 }
@@ -286,7 +286,7 @@ fn derive_handle_psk<'p>(
     Ok((PyBytes::new(py, &k.handle), PyBytes::new(py, &k.psk)))
 }
 
-/// The KeyId of a static key, for `PinVerifier`.
+/// The `KeyId` of a static key, for `PinVerifier`.
 #[pyfunction]
 fn static_key_id<'p>(py: Python<'p>, key: &[u8]) -> Bound<'p, PyBytes> {
     PyBytes::new(py, &seal::static_key_id(key))
@@ -294,17 +294,17 @@ fn static_key_id<'p>(py: Python<'p>, key: &[u8]) -> Bound<'p, PyBytes> {
 
 /// The X25519 public key of a 32-byte static secret, as `static_key_id` names it.
 #[pyfunction]
-fn static_public<'p>(py: Python<'p>, secret: [u8; 32]) -> Bound<'p, PyBytes> {
+fn static_public(py: Python<'_>, secret: [u8; 32]) -> Bound<'_, PyBytes> {
     PyBytes::new(py, &seal::static_public(&secret))
 }
 
-/// The KeyId of a key of `key_alg`: what a pin and a verdict name it by.
+/// The `KeyId` of a key of `key_alg`: what a pin and a verdict name it by.
 #[pyfunction]
 fn key_id<'p>(py: Python<'p>, key_alg: u64, key: &[u8]) -> Bound<'p, PyBytes> {
     PyBytes::new(py, &seal::key_id(key_alg, key))
 }
 
-/// Trusts the one static key with this 32-byte KeyId; a credential is not looked at.
+/// Trusts the one static key with this 32-byte `KeyId`; a credential is not looked at.
 /// With `proof_key`, the peer must also prove the transcript with that key.
 #[pyclass(frozen, module = "zmux")]
 struct PinVerifier(Arc<dyn seal::Verifier>);

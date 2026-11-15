@@ -285,7 +285,7 @@ impl CarrierChoicePolicy {
     /// candidates one after another instead of establishing on the most
     /// robust and joining the preferred ones (it does not apply to a pool).
     #[new]
-    #[pyo3(signature = (*, cache=None, key="".to_owned(), timer_factor=3.0, timer_min=1.0,
+    #[pyo3(signature = (*, cache=None, key=String::new(), timer_factor=3.0, timer_min=1.0,
         timer_max=3.0, settle=1.0, drop_window=30.0, no_join=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(

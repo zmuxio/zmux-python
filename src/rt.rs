@@ -2,7 +2,7 @@
 //! exit.
 //!
 //! The Rust runtime's threads call into Python to complete awaited futures,
-//! to run callbacks and to build exceptions. CPython must not be entered
+//! to run callbacks and to build exceptions. `CPython` must not be entered
 //! from another thread once it is finalizing: before 3.14 such a thread is
 //! ended inside `PyGILState_Ensure` (with `pthread_exit`, which unwinds
 //! through Rust frames), and once finalization ended the attach would start
@@ -65,15 +65,15 @@ pub(crate) fn attach<F, R>(f: F) -> R
 where
     F: for<'py> FnOnce(Python<'py>) -> R,
 {
-    if !RUNTIME_THREAD.get() || DEPTH.get() > 0 {
-        return Python::attach(f);
-    }
     struct Leave;
     impl Drop for Leave {
         fn drop(&mut self) {
             DEPTH.set(DEPTH.get() - 1);
             INFLIGHT.fetch_sub(1, Ordering::SeqCst);
         }
+    }
+    if !RUNTIME_THREAD.get() || DEPTH.get() > 0 {
+        return Python::attach(f);
     }
     INFLIGHT.fetch_add(1, Ordering::SeqCst);
     DEPTH.set(1);
@@ -327,7 +327,7 @@ where
                     "call_soon_threadsafe",
                     (Complete(undo, StdMutex::new(held)), fut_py, method, value),
                 );
-            })
+            });
         });
     });
     Ok(target.unbind())

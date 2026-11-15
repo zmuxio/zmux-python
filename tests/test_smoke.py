@@ -122,6 +122,31 @@ async def test_carrier(carrier: str, tls: Tls) -> None:
         server.cancel()
 
 
+async def test_http2_over_tls_has_the_connection_exporter(tls: Tls) -> None:
+    """Every bidirectional request of an HTTP/2 connection on TLS both ends
+    terminate has that connection's exporter: the session's exporter is the
+    same at both ends, and over h2c there is none."""
+    server_tls, client_tls = tls
+    cfg = zmux.Config(max_pipes=2, pipe_auth=zmux.PipeAuth.exporter().with_end_to_end())
+    async with zmux.Listener(config=cfg) as listener:
+        addr = await listener.serve_http("127.0.0.1", 0, tls=server_tls)
+        conn = await zmux.Http2Connection.dial(
+            *addr, tls=client_tls, server_name="localhost"
+        )
+        pipe = await conn.open_pipe()
+        assert pipe.terminated_tls is not None
+        async with (
+            await zmux.Session.connect(pipe, config=cfg) as c,
+            await listener.accept() as s,
+        ):
+            got = c.export_keying_material("app", length=16)
+            assert got == s.export_keying_material("app", length=16)
+            assert (await conn.open_pipe()).terminated_tls is not None
+        plain = await listener.serve_http("127.0.0.1", 0)
+        pipe = await zmux.dial_http2(*plain)
+        assert pipe.terminated_tls is None
+
+
 def prefix_auth(
     psk: bytes = b"prefix secret", bind_tls: bool = False
 ) -> zmux.PrefixAuth:

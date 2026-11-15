@@ -3,8 +3,8 @@ cancelling the awaiting task drops the pending operation and leaves the
 session, stream or pipe usable. Use `asyncio.timeout()` for per-call
 deadlines; durations are seconds."""
 
+import os
 from collections.abc import Awaitable, Buffer, Callable, Iterable, Mapping
-from os import PathLike
 from typing import Any, ClassVar, Literal, Protocol, Self, final
 
 from . import _types as _t
@@ -20,6 +20,8 @@ from ._types import (
     Limiter,
     ListenerStats,
     OutboundState,
+    Packet,
+    PacketStats,
     PipeOptions,
     PipeStats,
     Preamble,
@@ -29,6 +31,8 @@ from ._types import (
     Resolved,
     Role,
     Scheduler,
+    SendPolicy,
+    Sent,
     SessionState,
     SessionStats,
     Spliced,
@@ -37,7 +41,7 @@ from ._types import (
     Tlv,
 )
 
-type _Pem = str | PathLike[str] | bytes
+type _Pem = str | os.PathLike[str] | bytes
 type _Prio = Priority | tuple[int, bool]
 type _Headers = Mapping[str, str] | Iterable[tuple[str, str]]
 
@@ -983,7 +987,8 @@ async def dial_webtransport(
 class Http2Connection:
     """An HTTP/2 connection whose requests carry pipes: prior knowledge
     without `tls`, ALPN `h2` with it. Dial several pipe inputs on one
-    connection."""
+    connection. Over TLS 1.3 its bidirectional requests are secure carriers
+    with the connection's exporter, the same for every request."""
 
     @staticmethod
     async def dial(
@@ -1102,7 +1107,9 @@ class SendStream:
         nothing written, for a protocol whose other side speaks first. Data
         written before goes in the opening frame. Before establishment the
         frame goes as soon as the stream may open. A cancelled call leaves the
-        frame owed."""
+        frame owed. Once the opening frame and all data left, a stop from the
+        peer no longer fails the flush: the next `write` or `finish` reports
+        it; a stop before that still fails the flush."""
     async def finish(self) -> None:
         """Ends the stream (FIN) after the written data."""
     def reset(self, code: int) -> None:
@@ -1376,6 +1383,17 @@ class Session:
     ) -> BiStream:
         """Opens a bidirectional stream if stream credit is available now;
         `StreamError` of kind `Blocked` (retryable) otherwise. Never waits."""
+    async def open_packet_stream(
+        self,
+        *,
+        info: bytes | None = None,
+        tlvs: list[Tlv] | list[tuple[int, bytes]] | None = None,
+        policy: SendPolicy | str = "prefer_datagram",
+        max_packet: int = 65535,
+    ) -> PacketStream:
+        """Opens a bidirectional stream with the preamble (`info`, `tlvs`),
+        waiting for stream credit as `open_bi` does, and wraps it as a
+        `PacketStream`. A cancelled open leaves no stream behind."""
     async def open_stream_pair(
         self,
         *,
@@ -1722,7 +1740,9 @@ class Listener:
         body, or on its head when it has none (a credential's header form);
         a new exchange carrier is decided on the first bytes of its uplink. A
         carrier request forwarded from TLS early data (`Early-Data: 1`) is
-        answered 425."""
+        answered 425. Under TLS 1.3 with `tls`, bidirectional requests and
+        WebSocket upgrades are secure carriers with their TLS connection's
+        exporter (split halves and exchange carriers are not)."""
     async def handle_pipe(
         self,
         pipe: PipeIo,
@@ -1766,10 +1786,110 @@ async def splice(
     chunk: int = 65536,
     a_to_b: Limiter | None = None,
     b_to_a: Limiter | None = None,
+    abort: SpliceAbort | None = None,
 ) -> Spliced:
     """Forwards two bidirectional streams into each other until both
     directions ended; the handles are used up. Splicing a stream into
-    itself raises `ValueError`; cancelling the task cancels the splice."""
+    itself raises `ValueError`; cancelling the task cancels the splice (the
+    streams are reset with `ZMUX_CANCELLED`, stopped with 0, and there is no
+    result). `abort.abort(code)` ends it with that code instead: both
+    downstream parts are reset and both upstream parts stopped with it, and
+    the directions still running report `SpliceEnd.CANCELLED` with `code`;
+    a handle aborted before the start ends the splice at once."""
+
+async def splice_packets(
+    a: tuple[SendStream, RecvStream],
+    b: tuple[SendStream, RecvStream],
+    *,
+    chunk: int = 65536,
+    a_to_b: Limiter | None = None,
+    b_to_a: Limiter | None = None,
+    abort: SpliceAbort | None = None,
+) -> Spliced:
+    """Relays two packet streams as `splice` does: stream bytes pass through
+    with only capsule headers parsed, and a stream datagram that does not fit
+    the next hop's datagrams goes on as a DATAGRAM capsule at the next
+    capsule boundary (`Forwarded.datagrams_as_capsules`). A capsule never
+    becomes a datagram."""
+
+@final
+class SpliceAbort:
+    """Aborts the splices (`splice`, `splice_packets`) given it as `abort=`
+    with an application error code. One handle may serve several splices;
+    the first `abort` decides the code and ends them all."""
+
+    def __init__(self) -> None: ...
+    def abort(self, code: int) -> None:
+        """Aborts with `code` (< 2**62, 0 included); a later call changes
+        nothing."""
+    @property
+    def code(self) -> int | None:
+        """The code of the abort, `None` while not aborted."""
+
+@final
+class PacketStream:
+    """Packets over a bidirectional stream, each as a datagram of the stream
+    or as a DATAGRAM capsule in its bytes, as `policy` says. Packets are
+    never fragmented and not ordered relative to each other; those in
+    capsules arrive in order and reliably. Both endpoints wrap the stream
+    once their application agreed it carries packets (by its preamble, for
+    example); the two handles are used up. `max_packet` bounds the payload
+    sent and accepted. `async for` yields packets until the peer closed its
+    direction. Every coroutine is cancellation-safe: a cancelled send is
+    completed by the next send or `close`, and a packet whose receive was
+    cancelled is returned by the next one."""
+
+    def __init__(
+        self,
+        send: SendStream,
+        recv: RecvStream,
+        *,
+        policy: SendPolicy | str = "prefer_datagram",
+        max_packet: int = 65535,
+    ) -> None: ...
+    async def send(self, payload: bytes, *, context: int = 0) -> Sent:
+        """Sends a packet with Context ID `context` (below 2**62). A datagram
+        never waits; a capsule waits for the stream's buffer.
+        `PacketTooLargeError` above the bound, `InvalidArgumentError` for a
+        Context ID out of range, `NotNegotiatedError` for
+        `SendPolicy.DATAGRAM_ONLY` without datagrams."""
+    async def recv(self) -> Packet | None:
+        """The next packet, whichever way it came; `None` once the peer
+        closed its direction at a capsule boundary. `MalformedPacketError`
+        when the peer's bytes were malformed: the stream was reset and
+        stopped with `ZMUX_PACKET_ERROR`."""
+    def __aiter__(self) -> Self: ...
+    async def __anext__(self) -> Packet: ...
+    async def close(self) -> None:
+        """Ends the sending direction once a capsule in progress was
+        written; the peer's `recv` then returns `None`."""
+    def stats(self) -> PacketStats:
+        """Both directions' counters."""
+    def split(self) -> tuple[PacketSender, PacketReceiver]:
+        """The sending and the receiving half, for two tasks; the stream is
+        used up."""
+
+@final
+class PacketSender:
+    """The sending half of a `PacketStream`."""
+
+    async def send(self, payload: bytes, *, context: int = 0) -> Sent:
+        """See `PacketStream.send`."""
+    async def close(self) -> None:
+        """See `PacketStream.close`."""
+    def stats(self) -> PacketStats:
+        """The counters of the sending direction."""
+
+@final
+class PacketReceiver:
+    """The receiving half of a `PacketStream`."""
+
+    async def recv(self) -> Packet | None:
+        """See `PacketStream.recv`."""
+    def __aiter__(self) -> Self: ...
+    async def __anext__(self) -> Packet: ...
+    def stats(self) -> PacketStats:
+        """The counters of the receiving direction."""
 
 @final
 class ReplayFilter:
@@ -1847,6 +1967,8 @@ def session_crypto(initiator: _t.SessionCrypto, responder: _t.SessionCrypto) -> 
     """`session_crypto`: both endpoints' `SessionCrypto`, encoded, as the join keys
     take it. A set breaking the parameter's rules raises `ValueError`."""
 
+# (the keyword is the public parameter name, shared with the function of that name)
+# noinspection PyShadowingNames
 def derive_join_psk(
     suite: int,
     epoch_secret: Buffer,
@@ -1858,6 +1980,8 @@ def derive_join_psk(
     `Role.SERVER`) from an epoch secret and `session_crypto`, to the Suite's
     hash length. An unknown Suite raises `ValueError`."""
 
+# (the keyword is the public parameter name, shared with the function of that name)
+# noinspection PyShadowingNames
 def expand_join_psk(
     suite: int,
     epoch_secret: Buffer,
@@ -1922,6 +2046,8 @@ class PinVerifier:
     itself; a credential is not looked at. With `proof_key` (a KeyId) the peer must
     also prove the transcript with that key."""
 
+    # (the keyword is the public parameter name, shared with the function `key_id`)
+    # noinspection PyShadowingNames
     def __new__(cls, key_id: Buffer, *, proof_key: Buffer | None = None) -> Self: ...
 
 @final
