@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 from collections.abc import Iterable, Mapping
 
 from ._types import CarrierCredential, Config, Direction
@@ -27,11 +28,12 @@ from ._zmux import (
 
 type _Credential = PrefixAuth | CarrierCredential
 type _Headers = Mapping[str, str] | Iterable[tuple[str, str]]
-type _Address = tuple[str, int]
+type _Host = str | ipaddress.IPv4Address | ipaddress.IPv6Address
+type _Address = tuple[_Host, int]
 
 
 async def dial_http2(
-    host: str,
+    host: _Host,
     port: int,
     *,
     path: str = "/zmux",
@@ -56,7 +58,7 @@ async def dial_http2(
 
 
 async def connect_tcp(
-    host: str,
+    host: _Host,
     port: int,
     *,
     config: Config | None = None,
@@ -69,7 +71,7 @@ async def connect_tcp(
 
 
 async def connect_tls(
-    host: str,
+    host: _Host,
     port: int,
     *,
     config: Config | None = None,
@@ -90,7 +92,7 @@ async def connect_tls(
 
 
 async def connect_quic(
-    host: str,
+    host: _Host,
     port: int,
     *,
     config: Config | None = None,
@@ -134,7 +136,7 @@ async def connect_websocket(
 
 
 async def connect_http2(
-    host: str,
+    host: _Host,
     port: int,
     *,
     config: Config | None = None,
@@ -196,7 +198,7 @@ async def connect_webtransport(
 
 
 async def connect_streaming(
-    host: str,
+    host: _Host,
     port: int,
     *,
     config: Config | None = None,
@@ -219,7 +221,7 @@ async def connect_streaming(
 
 
 async def connect_split(
-    host: str,
+    host: _Host,
     port: int,
     *,
     config: Config | None = None,
@@ -242,7 +244,7 @@ async def connect_split(
 
 
 async def connect_exchange(
-    host: str,
+    host: _Host,
     port: int,
     *,
     config: Config | None = None,

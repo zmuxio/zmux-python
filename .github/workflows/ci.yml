@@ -37,7 +37,7 @@ jobs:
   types:
     name: Type check
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -45,6 +45,25 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install "mypy>=2.4"
       - run: python -m mypy --strict python/zmux
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: types-${{ hashFiles('Cargo.lock') }}
+          restore-keys: types-
+      - name: Build and install the module
+        run: |
+          python -m pip install "maturin>=1.16,<2"
+          maturin build --locked --out dist
+          python -m pip install --find-links dist --no-index zmuxio
+      - name: Stubs match the module
+        run: python -m mypy.stubtest zmux --allowlist tests/stubtest-allowlist.txt
 
   test:
     name: Test (${{ matrix.os }}, Python ${{ matrix.python }})
@@ -54,8 +73,12 @@ jobs:
       fail-fast: false
       matrix:
         os: [ ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest ]
-        # 3.12 builds the abi3 wheel; 3.14t the free-threaded one.
+        # 3.12 builds the abi3 wheel; 3.14t the free-threaded one. The abi3
+        # wheel also runs on the newer CPython releases, checked on Linux.
         python: [ '3.12', '3.14t' ]
+        include:
+          - { os: ubuntu-latest, python: '3.13' }
+          - { os: ubuntu-latest, python: '3.14' }
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -86,3 +109,68 @@ jobs:
           python -m pip install --find-links dist --no-index zmuxio
           python -m pip install "pytest>=9.2" "pytest-asyncio>=1.5" "cryptography>=50.0.2"
           python -m pytest -q tests
+
+  interop:
+    name: Interop (Go zmux peers)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: zmux-python
+      - name: Checkout zmux-go
+        uses: actions/checkout@v7
+        with:
+          repository: zmuxio/zmux-go
+          path: zmux-go
+      - uses: actions/setup-python@v7
+        id: py
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 'stable'
+          cache-dependency-path: zmux-python/interop/shape-go-peer/go.sum
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            zmux-python/target
+          key: interop-${{ hashFiles('zmux-python/Cargo.lock') }}
+          restore-keys: interop-
+      - name: Build and install the module
+        working-directory: zmux-python
+        run: |
+          python -m pip install "maturin>=1.16,<2"
+          maturin build --release --locked --out dist -i "${{ steps.py.outputs.python-path }}"
+          python -m pip install --find-links dist --no-index zmuxio
+          python -m pip install "pytest>=9.2" "pytest-asyncio>=1.5" "cryptography>=50.0.2"
+      - name: Build the Go peers
+        run: |
+          out="$GITHUB_WORKSPACE/peers"
+          mkdir -p "$out"
+          "$GITHUB_WORKSPACE/zmux-go/interop/webpeer/build.sh" "$out/web-go"
+          # The shaping peer builds against the zmux-go checkout, through a workspace.
+          printf 'go 1.27\n\nuse (\n\t%s\n\t%s\n)\n' \
+            "$GITHUB_WORKSPACE/zmux-python/interop/shape-go-peer" "$GITHUB_WORKSPACE/zmux-go" > "$out/go.work"
+          (cd zmux-python/interop/shape-go-peer && GOWORK="$out/go.work" timeout 300 go build -o "$out/shape-go-peer" .)
+      - name: Run the interop tests
+        working-directory: zmux-python
+        env:
+          ZMUX_GO_HTTP_PEER: ${{ github.workspace }}/peers/web-go/httppeer
+          ZMUX_SHAPE_PEER: ${{ github.workspace }}/peers/shape-go-peer
+          ZMUX_SHAPE_DEF: ${{ github.workspace }}/zmux-python/tests/testdata/shaping/interop.json
+        run: |
+          timeout 600 python -m pytest -q -rs --junitxml=interop.xml tests/test_http_tls_interop.py tests/test_shaping_interop.py
+          # Every test ran: none may skip for a missing peer.
+          python - <<'CHECK'
+          import xml.etree.ElementTree as ET
+          s = ET.parse("interop.xml").getroot().find("testsuite")
+          counts = {k: int(s.attrib[k]) for k in ("tests", "failures", "errors", "skipped")}
+          assert counts == {"tests": 7, "failures": 0, "errors": 0, "skipped": 0}, counts
+          CHECK

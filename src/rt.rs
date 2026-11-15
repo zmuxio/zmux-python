@@ -153,10 +153,23 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 /// Completes an asyncio future on its loop, unless it is done already
 /// (cancelled).
 #[pyclass(frozen)]
-struct Complete(
-    Option<Py<PyAny>>,
-    StdMutex<Option<Box<dyn std::any::Any + Send>>>,
-);
+struct Complete(Option<Py<PyAny>>, Held);
+
+/// What an operation holds until its result is settled: taken by the awaiter
+/// once it resumed (returned, or undone after a cancellation), or here when
+/// nobody awaits the result any more.
+type Held = Arc<StdMutex<Option<Box<dyn std::any::Any + Send>>>>;
+
+/// Lets go of what an operation held, once its awaiter settled the result.
+#[pyclass(frozen)]
+struct Release(Held);
+
+#[pymethods]
+impl Release {
+    fn __call__(&self) {
+        drop(self.0.lock().unwrap().take());
+    }
+}
 
 #[pymethods]
 impl Complete {
@@ -167,8 +180,11 @@ impl Complete {
         value: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
         if !fut.call_method0("done")?.is_truthy()? {
-            fut.call_method1(method, (value,))?;
-        } else if method == "set_result"
+            // Held until the awaiter resumes: a cancellation that reaches it
+            // now still undoes the result before the next operation begins.
+            return fut.call_method1(method, (value,)).map(drop);
+        }
+        if method == "set_result"
             && let Some(undo) = &self.0
         {
             // Cancelled as it completed: what it read goes back.
@@ -238,7 +254,8 @@ impl Begin {
 static DRIVE: pyo3::sync::PyOnceLock<Py<PyAny>> = pyo3::sync::PyOnceLock::new();
 
 /// The coroutine function that awaits an operation. A cancellation that reaches its task
-/// after the result was set gives the result to `undo`.
+/// after the result was set gives the result to `undo`; what the operation held is let go
+/// after that.
 fn drive(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
     DRIVE
         .get_or_try_init(py, || {
@@ -246,13 +263,15 @@ fn drive(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
 import asyncio
 
 async def drive(start, undo):
-    fut = start()
+    fut, release = start()
     try:
         return await fut
     except asyncio.CancelledError:
         if undo is not None and fut.done() and not fut.cancelled() and fut.exception() is None:
             undo(fut.result())
         raise
+    finally:
+        release()
 ";
             let m = PyModule::from_code(py, code, c"zmux_drive", c"zmux_drive")?;
             Ok::<_, PyErr>(m.getattr("drive")?.unbind())
@@ -288,6 +307,7 @@ where
 }
 
 /// The asyncio future of `fut`, run on the runtime, on the running event loop.
+/// With the callable that lets go of what the operation held.
 fn start_future<F, T, G>(py: Python<'_>, fut: F, undo: Option<Py<PyAny>>) -> PyResult<Py<PyAny>>
 where
     F: Future<Output = PyResult<(T, G)>> + Send + 'static,
@@ -303,6 +323,8 @@ where
     )?;
     let lp = lp.unbind();
     let fut_py = target.clone().unbind();
+    let held = Held::default();
+    let release = Release(held.clone());
     get_runtime().spawn(async move {
         let r = tokio::select! {
             biased;
@@ -312,9 +334,12 @@ where
         };
         tokio::task::spawn_blocking(move || {
             attach(|py| {
-                let mut held: Option<Box<dyn std::any::Any + Send>> = None;
                 let converted = r.and_then(|(v, g)| {
-                    held = Some(Box::new(g));
+                    *held.lock().unwrap() = Some(Box::new(g));
+                    // `()` is `None` to Python, as for a function, not `()`.
+                    if std::any::TypeId::of::<T>() == std::any::TypeId::of::<()>() {
+                        return Ok(py.None());
+                    }
                     v.into_py_any(py)
                 });
                 let (method, value) = match converted {
@@ -325,12 +350,12 @@ where
                 let _ = lp.call_method1(
                     py,
                     "call_soon_threadsafe",
-                    (Complete(undo, StdMutex::new(held)), fut_py, method, value),
+                    (Complete(undo, held), fut_py, method, value),
                 );
             });
         });
     });
-    Ok(target.unbind())
+    Ok((target, release).into_pyobject(py)?.into_any().unbind())
 }
 
 /// The task of an awaitable given to [`into_future`], once the loop started

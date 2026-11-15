@@ -1471,7 +1471,7 @@ async fn lookup(addr: &str) -> std::io::Result<SocketAddr> {
 #[pyo3(signature = (host, port, *, carrier_credential=None))]
 fn dial_tcp<'p>(
     py: Python<'p>,
-    host: String,
+    host: Host,
     port: u16,
     carrier_credential: Option<Bound<'p, PyAny>>,
 ) -> PyResult<Bound<'p, PyAny>> {
@@ -1502,7 +1502,7 @@ fn client_tls(tls: Option<PyRef<'_, TlsConfig>>) -> TlsConfig {
 #[pyo3(signature = (host, port, *, tls=None, server_name=None, carrier_credential=None))]
 fn dial_tls<'p>(
     py: Python<'p>,
-    host: String,
+    host: Host,
     port: u16,
     tls: Option<PyRef<'_, TlsConfig>>,
     server_name: Option<String>,
@@ -1572,7 +1572,7 @@ impl QuicDial {
 #[pyo3(signature = (host, port, *, tls=None, server_name=None, lanes=zmux_quinn::LaneWindows::default().lanes, carrier_credential=None))]
 fn dial_quic<'p>(
     py: Python<'p>,
-    host: String,
+    host: Host,
     port: u16,
     tls: Option<PyRef<'_, TlsConfig>>,
     server_name: Option<String>,
@@ -1656,13 +1656,13 @@ struct Http2Connection(zmux_http::Http2Connection);
 #[pymethods]
 impl Http2Connection {
     #[staticmethod]
-    #[pyo3(signature = (host, port, *, path="/zmux".to_owned(), tls=None, server_name=None, carrier_credential=None, pair_field=None))]
+    #[pyo3(signature = (host, port, *, path="/zmux", tls=None, server_name=None, carrier_credential=None, pair_field=None))]
     #[allow(clippy::too_many_arguments)]
     fn dial<'p>(
         py: Python<'p>,
-        host: String,
+        host: Host,
         port: u16,
-        path: String,
+        path: &str,
         tls: Option<PyRef<'_, TlsConfig>>,
         server_name: Option<String>,
         carrier_credential: Option<Bound<'p, PyAny>>,
@@ -1696,9 +1696,9 @@ impl Http2Connection {
 
     /// A pipe input on a new request of the connection, of `direction`
     /// (`Direction`; see `dial_streaming`).
-    #[pyo3(signature = (*, direction="bidi".to_owned()))]
-    fn open_pipe<'p>(&self, py: Python<'p>, direction: String) -> PyResult<Bound<'p, PyAny>> {
-        let request = dial_request(&direction)?;
+    #[pyo3(signature = (*, direction="bidi"))]
+    fn open_pipe<'p>(&self, py: Python<'p>, direction: &str) -> PyResult<Bound<'p, PyAny>> {
+        let request = dial_request(direction)?;
         let c = self.0.clone();
         future_into_py(py, async move {
             Ok(PipeIo::wrap(
@@ -1731,6 +1731,36 @@ impl Http2Connection {
             let pipes = c.join_split(&s, po).await.map_err(io_err)?;
             Ok(pipes_of(pipes, &owner))
         })
+    }
+}
+
+/// A host parameter: a `str`, or an `ipaddress.IPv4Address` or
+/// `IPv6Address` taken as its text.
+pub(crate) struct Host(pub(crate) String);
+
+impl<'a, 'py> FromPyObject<'a, 'py> for Host {
+    type Error = PyErr;
+    fn extract(obj: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        if let Ok(s) = obj.cast::<pyo3::types::PyString>() {
+            return Ok(Host(s.to_str()?.to_owned()));
+        }
+        let py = obj.py();
+        let ip = py.import("ipaddress")?;
+        if obj.is_instance(&ip.getattr("IPv4Address")?)?
+            || obj.is_instance(&ip.getattr("IPv6Address")?)?
+        {
+            return Ok(Host(obj.str()?.to_str()?.to_owned()));
+        }
+        Err(pyo3::exceptions::PyTypeError::new_err(
+            "a host is a str, an IPv4Address or an IPv6Address",
+        ))
+    }
+}
+
+impl std::ops::Deref for Host {
+    type Target = String;
+    fn deref(&self) -> &String {
+        &self.0
     }
 }
 
@@ -1787,7 +1817,7 @@ impl H3Dial {
     pub(crate) fn new(
         url: String,
         tls: Option<PyRef<'_, TlsConfig>>,
-        addr: Option<(String, u16)>,
+        addr: Option<(Host, u16)>,
         lanes: u32,
         carrier_credential: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
@@ -1827,7 +1857,7 @@ fn dial_http3<'p>(
     py: Python<'p>,
     url: String,
     tls: Option<PyRef<'_, TlsConfig>>,
-    addr: Option<(String, u16)>,
+    addr: Option<(Host, u16)>,
     lanes: u32,
     carrier_credential: Option<Bound<'p, PyAny>>,
 ) -> PyResult<Bound<'p, PyAny>> {
@@ -1935,13 +1965,13 @@ struct QuicClient {
 #[pymethods]
 impl QuicClient {
     #[new]
-    #[pyo3(signature = (tls=None, *, lanes=zmux_quinn::LaneWindows::default().lanes, zero_rtt=false, memory_capacity=None, bind=("0.0.0.0".to_owned(), 0), carrier_credential=None))]
+    #[pyo3(signature = (tls=None, *, lanes=zmux_quinn::LaneWindows::default().lanes, zero_rtt=false, memory_capacity=None, bind=(Host("0.0.0.0".to_owned()), 0), carrier_credential=None))]
     fn new(
         tls: Option<PyRef<'_, TlsConfig>>,
         lanes: u32,
         zero_rtt: bool,
         memory_capacity: Option<usize>,
-        bind: (String, u16),
+        bind: (Host, u16),
         carrier_credential: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let memory = zero_rtt.then(|| match memory_capacity {
@@ -1969,7 +1999,7 @@ impl QuicClient {
     fn dial<'p>(
         &self,
         py: Python<'p>,
-        host: String,
+        host: Host,
         port: u16,
         server_name: Option<String>,
     ) -> PyResult<Bound<'p, PyAny>> {
@@ -1992,7 +2022,7 @@ impl QuicClient {
     fn connect<'p>(
         &self,
         py: Python<'p>,
-        host: String,
+        host: Host,
         port: u16,
         server_name: Option<String>,
         config: Option<Bound<'_, PyAny>>,
@@ -2064,11 +2094,11 @@ pub(crate) fn pair_field_of(name: Option<String>) -> PyResult<Option<zmux_http::
 /// first on each request body. The adapter does not see the TLS layer, so
 /// a credential bound to it is refused here.
 fn http_client_options(
-    path: String,
+    path: &str,
     carrier_credential: Option<Bound<'_, PyAny>>,
     pair_field: Option<String>,
 ) -> PyResult<zmux_http::Options> {
-    let mut opts = zmux_http::Options::new().with_path(path);
+    let mut opts = zmux_http::Options::new().with_path(path.to_owned());
     if let Some(f) = pair_field_of(pair_field)? {
         opts = opts.with_pair_field(f);
     }
@@ -2095,20 +2125,20 @@ fn dial_request(direction: &str) -> PyResult<zmux::DialRequest> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (host, port, *, path="/zmux".to_owned(), carrier_credential=None,
-    direction="bidi".to_owned(), pair_field=None))]
+#[pyo3(signature = (host, port, *, path="/zmux", carrier_credential=None,
+    direction="bidi", pair_field=None))]
 fn dial_streaming<'p>(
     py: Python<'p>,
-    host: String,
+    host: Host,
     port: u16,
-    path: String,
+    path: &str,
     carrier_credential: Option<Bound<'p, PyAny>>,
-    direction: String,
+    direction: &str,
     pair_field: Option<String>,
 ) -> PyResult<Bound<'p, PyAny>> {
     let addr = hostport(&host, port);
     let opts = http_client_options(path, carrier_credential, pair_field)?;
-    let request = dial_request(&direction)?;
+    let request = dial_request(direction)?;
     future_into_py(py, async move {
         let tcp = tokio::net::TcpStream::connect(&addr)
             .await
@@ -2125,12 +2155,12 @@ fn dial_streaming<'p>(
 /// A split bootstrap over two HTTP/1.1 connections: an uplink `POST` and
 /// a downlink `GET` paired by a fresh token.
 #[pyfunction]
-#[pyo3(signature = (host, port, *, path="/zmux".to_owned(), carrier_credential=None, pair_field=None))]
+#[pyo3(signature = (host, port, *, path="/zmux", carrier_credential=None, pair_field=None))]
 fn dial_split<'p>(
     py: Python<'p>,
-    host: String,
+    host: Host,
     port: u16,
-    path: String,
+    path: &str,
     carrier_credential: Option<Bound<'p, PyAny>>,
     pair_field: Option<String>,
 ) -> PyResult<Bound<'p, PyAny>> {
@@ -2150,15 +2180,15 @@ fn dial_split<'p>(
 /// the two directions, `options` choosing its direction; returns `[pipe]`
 /// as `add_pipe` does (a split bootstrap's carrier joins no session). A `PipePool(join=...)` keeps such pairs up.
 #[pyfunction]
-#[pyo3(signature = (session, host, port, *, path="/zmux".to_owned(), carrier_credential=None, pair_field=None,
+#[pyo3(signature = (session, host, port, *, path="/zmux", carrier_credential=None, pair_field=None,
     options=None))]
 #[allow(clippy::too_many_arguments)]
 fn join_split<'p>(
     py: Python<'p>,
     session: Bound<'p, Session>,
-    host: String,
+    host: Host,
     port: u16,
-    path: String,
+    path: &str,
     carrier_credential: Option<Bound<'p, PyAny>>,
     pair_field: Option<String>,
     options: Option<Bound<'p, PyAny>>,
@@ -2346,10 +2376,10 @@ fn exchange_endpoint(
 #[allow(clippy::too_many_arguments)]
 fn dial_exchange<'p>(
     py: Python<'p>,
-    host: String,
+    host: Host,
     port: u16,
     options: Option<PyRef<'_, ExchangeOptions>>,
-    down_addr: Option<(String, u16)>,
+    down_addr: Option<(Host, u16)>,
     tls: Option<PyRef<'_, TlsConfig>>,
     server_name: Option<String>,
     carrier_credential: Option<Bound<'_, PyAny>>,
@@ -2860,6 +2890,27 @@ impl Session {
         })
     }
 
+    /// Opens a unidirectional stream if stream credit is available now;
+    /// `OpenError` otherwise. Never waits.
+    #[pyo3(signature = (*, info=None, tlvs=None, priority=None))]
+    fn try_open_uni(
+        &self,
+        info: Option<Vec<u8>>,
+        tlvs: Option<Vec<(u64, Vec<u8>)>>,
+        priority: Option<(u8, bool)>,
+    ) -> PyResult<SendStream> {
+        let prio = priority.map(|(u, i)| self::priority(u, i)).transpose()?;
+        let send = match preamble(info, tlvs, false) {
+            Some(p) => self.0.try_open_uni_with(&p),
+            None => self.0.try_open_uni(),
+        }
+        .map_err(open_err)?;
+        if let Some(pr) = prio {
+            send.set_priority(pr).map_err(stream_err)?;
+        }
+        Ok(SendStream::wrap(send))
+    }
+
     fn accept_bi<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let s = self.0.clone();
         returned_first(py, &self.2.bi, async move {
@@ -2879,6 +2930,19 @@ impl Session {
         self.0
             .send_datagram(Bytes::from(data))
             .map_err(datagram_err)
+    }
+
+    /// Queues a datagram, waiting while the queue is full. Cancel-safe.
+    fn send_datagram_wait<'p>(
+        &self,
+        py: Python<'p>,
+        data: &Bound<'p, PyAny>,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        let s = self.0.clone();
+        let data = chunk_of(data)?;
+        future_into_py(py, async move {
+            s.send_datagram_wait(data).await.map_err(datagram_err)
+        })
     }
 
     fn read_datagram<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
@@ -3304,15 +3368,16 @@ impl Session {
     /// A normal exit closes and waits for the end (`close`, then
     /// `wait_closed`); an exit by an exception starts a close with
     /// `ZMUX_CANCELLED` and an empty reason and returns at once.
+    #[pyo3(signature = (exc_type, _exc, _tb, /))]
     fn __aexit__<'p>(
         &self,
         py: Python<'p>,
-        t: Bound<'p, PyAny>,
-        _v: Bound<'p, PyAny>,
+        exc_type: Bound<'p, PyAny>,
+        _exc: Bound<'p, PyAny>,
         _tb: Bound<'p, PyAny>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let s = self.0.clone();
-        if !t.is_none() {
+        if !exc_type.is_none() {
             // The close starts with the call; its future only waits.
             drop(s.close_with_error(zmux::VarInt::from_u32(ZMUX_CANCELLED), b""));
             return future_into_py(py, async move { Ok(false) });
@@ -3979,14 +4044,15 @@ impl Pipe {
     }
     /// A normal exit closes the pipe gracefully, an exit by an exception
     /// aborts it.
+    #[pyo3(signature = (exc_type, _exc, _tb, /))]
     fn __aexit__<'p>(
         &self,
         py: Python<'p>,
-        t: Bound<'p, PyAny>,
-        _v: Bound<'p, PyAny>,
+        exc_type: Bound<'p, PyAny>,
+        _exc: Bound<'p, PyAny>,
         _tb: Bound<'p, PyAny>,
     ) -> PyResult<Bound<'p, PyAny>> {
-        let _ = if t.is_none() {
+        let _ = if exc_type.is_none() {
             self.0.close()
         } else {
             self.0.abort()
@@ -4117,6 +4183,38 @@ impl Drop for Lent {
     }
 }
 
+/// `data` as a chunk without a copy: a `bytes` object is kept alive, any
+/// other buffer is lent.
+fn chunk_of(data: &Bound<'_, PyAny>) -> PyResult<Bytes> {
+    if let Ok(b) = data.cast::<PyBytes>() {
+        return Ok(Bytes::from_owner(pyo3::pybacked::PyBackedBytes::from(
+            b.clone(),
+        )));
+    }
+    lend(data)
+}
+
+/// Writes as many of `bufs` as the part takes now, after waiting until it
+/// takes some; the bytes taken. Cancel-safe.
+fn write_chunks<'p>(
+    py: Python<'p>,
+    s: &Part<zmux::SendStream>,
+    mut bufs: Vec<Bytes>,
+) -> PyResult<Bound<'p, PyAny>> {
+    let s = s.clone();
+    future_into_py(py, async move {
+        if bufs.iter().all(Bytes::is_empty) {
+            return Ok(0);
+        }
+        let w = held(&s)
+            .await?
+            .write_chunks(&mut bufs)
+            .await
+            .map_err(stream_err)?;
+        Ok(w.bytes)
+    })
+}
+
 fn lend(data: &Bound<'_, PyAny>) -> PyResult<Bytes> {
     let buf = pyo3::buffer::PyBuffer::<u8>::get(data)?;
     if !buf.is_c_contiguous() {
@@ -4161,42 +4259,33 @@ impl SendStream {
 
 #[pymethods]
 impl SendStream {
-    /// Writes all of `data`, waiting for flow control.
-    fn write<'p>(
-        &self,
-        py: Python<'p>,
-        data: pyo3::pybacked::PyBackedBytes,
-    ) -> PyResult<Bound<'p, PyAny>> {
+    /// Writes all of `data` (any buffer, without a copy), waiting for room.
+    /// Not cancel-safe: a cancelled call may have taken a prefix.
+    fn write<'p>(&self, py: Python<'p>, data: &Bound<'p, PyAny>) -> PyResult<Bound<'p, PyAny>> {
         let s = self.0.clone();
-        let n = data.len();
-        // Zero-copy for `bytes`: the chunk keeps the Python object alive.
+        let data = chunk_of(data)?;
         future_into_py(py, async move {
-            held(&s)
-                .await?
-                .write_chunk(Bytes::from_owner(data))
-                .await
-                .map_err(stream_err)?;
-            Ok(n)
+            held(&s).await?.write_chunk(data).await.map_err(stream_err)
         })
     }
-    /// Writes the buffer without copying it; the caller does not modify it
-    /// afterwards.
-    fn write_chunk<'p>(
+    /// Writes a prefix of `data` without a copy, waiting until some can be
+    /// written; how many bytes it took. Cancel-safe.
+    fn write_some<'p>(
         &self,
         py: Python<'p>,
-        buffer: &Bound<'p, PyAny>,
+        data: &Bound<'p, PyAny>,
     ) -> PyResult<Bound<'p, PyAny>> {
-        let s = self.0.clone();
-        let data = lend(buffer)?;
-        let n = data.len();
-        future_into_py(py, async move {
-            held(&s)
-                .await?
-                .write_chunk(data)
-                .await
-                .map_err(stream_err)?;
-            Ok(n)
-        })
+        let bufs = vec![chunk_of(data)?];
+        write_chunks(py, &self.0, bufs)
+    }
+    /// Writes a prefix of the buffers in order without copying them, waiting
+    /// until some can be written; how many bytes it took. Cancel-safe.
+    fn writev<'p>(&self, py: Python<'p>, buffers: &Bound<'p, PyAny>) -> PyResult<Bound<'p, PyAny>> {
+        let bufs = buffers
+            .try_iter()?
+            .map(|b| chunk_of(&b?))
+            .collect::<PyResult<Vec<_>>>()?;
+        write_chunks(py, &self.0, bufs)
     }
     /// Opens the stream now and waits until the opening frame and the data
     /// written so far left for a carrier: the peer sees the stream even with
@@ -4324,14 +4413,15 @@ impl SendStream {
     }
     /// Finishes on a normal exit (unless already ended), resets with
     /// `ZMUX_CANCELLED` on an exception.
+    #[pyo3(signature = (exc_type, _exc, _tb, /))]
     fn __aexit__<'p>(
         &self,
         py: Python<'p>,
-        t: Bound<'p, PyAny>,
-        _v: Bound<'p, PyAny>,
+        exc_type: Bound<'p, PyAny>,
+        _exc: Bound<'p, PyAny>,
         _tb: Bound<'p, PyAny>,
     ) -> PyResult<Bound<'p, PyAny>> {
-        let ok = t.is_none();
+        let ok = exc_type.is_none();
         let s = self.0.clone();
         future_into_py(py, async move {
             if !ok {
@@ -4380,6 +4470,8 @@ pub(crate) struct PutBack(Unread);
 /// takes them back is made once, on the first call.
 pub(crate) struct Returned<T> {
     q: Arc<StdMutex<VecDeque<T>>>,
+    /// Woken when a result is taken back, for calls already waiting.
+    wake: Arc<tokio::sync::Notify>,
     undo: PyOnceLock<Py<PyAny>>,
 }
 
@@ -4387,6 +4479,7 @@ impl<T> Default for Returned<T> {
     fn default() -> Self {
         Returned {
             q: Arc::default(),
+            wake: Arc::default(),
             undo: PyOnceLock::new(),
         }
     }
@@ -4401,7 +4494,7 @@ impl<T> Returned<T> {
 impl Returned<Py<PyAny>> {
     pub(crate) fn undo(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
         let u = self.undo.get_or_try_init(py, || {
-            Ok::<_, PyErr>(Py::new(py, Requeue(self.q.clone()))?.into_any())
+            Ok::<_, PyErr>(Py::new(py, Requeue(self.q.clone(), self.wake.clone()))?.into_any())
         })?;
         Ok(Some(u.clone_ref(py)))
     }
@@ -4416,14 +4509,18 @@ impl Returned<Bytes> {
     }
 }
 
-/// Takes a result back for the next call.
+/// Takes a result back for the next call, waking the calls already waiting.
 #[pyclass(frozen)]
-pub(crate) struct Requeue(pub(crate) Arc<StdMutex<VecDeque<Py<PyAny>>>>);
+pub(crate) struct Requeue(
+    pub(crate) Arc<StdMutex<VecDeque<Py<PyAny>>>>,
+    Arc<tokio::sync::Notify>,
+);
 
 #[pymethods]
 impl Requeue {
     fn __call__(&self, value: Bound<'_, PyAny>) {
         self.0.lock().unwrap().push_back(value.unbind());
+        self.1.notify_waiters();
     }
 }
 
@@ -4446,7 +4543,9 @@ impl<'py, T: IntoPyObject<'py>> IntoPyObject<'py> for Next<T> {
 }
 
 /// `fut`'s result, unless a result of the same kind was taken back: that
-/// one first. A result cancelled as it completed is taken back.
+/// one first, also while `fut` is pending. A result cancelled as it
+/// completed is taken back. `fut` must be cancel-safe: it is dropped when a
+/// taken-back result arrives first.
 fn returned_first<'p, F, T>(
     py: Python<'p>,
     r: &Returned<Py<PyAny>>,
@@ -4457,14 +4556,26 @@ where
     T: for<'py> IntoPyObject<'py> + Send + 'static,
 {
     let q = r.queue();
+    let wake = r.wake.clone();
     let undo = r.undo(py)?;
     rt::undoable_future_into_py(
         py,
         async move {
-            let again = q.lock().unwrap().pop_front();
-            match again {
-                Some(o) => Ok((Next::Again(o), ())),
-                None => Ok((Next::New(fut.await?), ())),
+            let mut fut = std::pin::pin!(fut);
+            loop {
+                // Registered before the queue is checked: a result taken back
+                // after the check wakes this call.
+                let mut woken = std::pin::pin!(wake.notified());
+                woken.as_mut().enable();
+                let again = q.lock().unwrap().pop_front();
+                if let Some(o) = again {
+                    return Ok((Next::Again(o), ()));
+                }
+                tokio::select! {
+                    biased;
+                    r = &mut fut => return Ok((Next::New(r?), ())),
+                    () = woken => {}
+                }
             }
         },
         undo,
@@ -4735,14 +4846,15 @@ impl RecvStream {
     /// Releases the stream with `stop(0)` on exit, an exception or not
     /// (automatic release): it returns at once, and is a no-op once the
     /// stream ended.
+    #[pyo3(signature = (exc_type, _exc, _tb, /))]
     fn __aexit__<'p>(
         &self,
         py: Python<'p>,
-        t: Bound<'p, PyAny>,
-        _v: Bound<'p, PyAny>,
+        exc_type: Bound<'p, PyAny>,
+        _exc: Bound<'p, PyAny>,
         _tb: Bound<'p, PyAny>,
     ) -> PyResult<Bound<'p, PyAny>> {
-        let _ = t;
+        let _ = exc_type;
         let s = self.0.clone();
         future_into_py(py, async move {
             let _ = later(&s, |r| r.stop(zmux::VarInt::from_u32(0)));
@@ -5071,14 +5183,14 @@ impl Listener {
     /// Serves plain TCP on `addr`; returns the bound address. With the
     /// listener's `admission`, a connection reaches it only once admitted.
     #[pyo3(signature = (host, port))]
-    fn serve_tcp<'p>(&self, py: Python<'p>, host: String, port: u16) -> PyResult<Bound<'p, PyAny>> {
+    fn serve_tcp<'p>(&self, py: Python<'p>, host: Host, port: u16) -> PyResult<Bound<'p, PyAny>> {
         self.serve(py, hostport(&host, port), zmux::Listener::serve)
     }
     #[pyo3(signature = (host, port, *, tls))]
     fn serve_tls<'p>(
         &self,
         py: Python<'p>,
-        host: String,
+        host: Host,
         port: u16,
         tls: PyRef<'_, TlsConfig>,
     ) -> PyResult<Bound<'p, PyAny>> {
@@ -5095,15 +5207,15 @@ impl Listener {
     /// upgrades (with `websocket`). A connection from a trusted
     /// intermediary configured for the PROXY protocol reads its header
     /// first.
-    #[pyo3(signature = (host, port, *, path="/zmux".to_owned(), tls=None, exchange=None,
+    #[pyo3(signature = (host, port, *, path="/zmux", tls=None, exchange=None,
         websocket=false, websocket_no_subprotocol=false, pair_field=None))]
     #[allow(clippy::too_many_arguments)]
     fn serve_http<'p>(
         &self,
         py: Python<'p>,
-        host: String,
+        host: Host,
         port: u16,
-        path: String,
+        path: &str,
         tls: Option<PyRef<'_, TlsConfig>>,
         exchange: Option<PyRef<'_, ExchangeOptions>>,
         websocket: bool,
@@ -5111,7 +5223,7 @@ impl Listener {
         pair_field: Option<String>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let addr = hostport(&host, port);
-        let mut opts = zmux_http::Options::new().with_path(path);
+        let mut opts = zmux_http::Options::new().with_path(path.to_owned());
         if let Some(f) = pair_field_of(pair_field)? {
             opts = opts.with_pair_field(f);
         }
@@ -5157,7 +5269,7 @@ impl Listener {
     fn serve_websocket<'p>(
         &self,
         py: Python<'p>,
-        host: String,
+        host: Host,
         port: u16,
         tls: Option<PyRef<'_, TlsConfig>>,
     ) -> PyResult<Bound<'p, PyAny>> {
@@ -5177,7 +5289,7 @@ impl Listener {
     fn serve_http3<'p>(
         &self,
         py: Python<'p>,
-        host: String,
+        host: Host,
         port: u16,
         tls: PyRef<'_, TlsConfig>,
         lanes: u32,
@@ -5203,7 +5315,7 @@ impl Listener {
     fn serve_webtransport<'p>(
         &self,
         py: Python<'p>,
-        host: String,
+        host: Host,
         port: u16,
         tls: PyRef<'_, TlsConfig>,
         lanes: u32,
@@ -5235,7 +5347,7 @@ impl Listener {
     fn serve_quic<'p>(
         &self,
         py: Python<'p>,
-        host: String,
+        host: Host,
         port: u16,
         tls: PyRef<'_, TlsConfig>,
         lanes: u32,
@@ -5275,11 +5387,11 @@ impl Listener {
         &self,
         py: Python<'p>,
         pipe: &PipeIo,
-        peer: Option<(String, u16)>,
-        source: Option<(String, u16)>,
+        peer: Option<(Host, u16)>,
+        source: Option<(Host, u16)>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let l = self.inner.clone();
-        let addr = |a: Option<(String, u16)>| -> PyResult<Option<SocketAddr>> {
+        let addr = |a: Option<(Host, u16)>| -> PyResult<Option<SocketAddr>> {
             a.map(|(h, p)| {
                 h.parse::<std::net::IpAddr>()
                     .map(|ip| SocketAddr::new(ip, p))
@@ -5391,11 +5503,12 @@ impl Listener {
         let o = slf.unbind();
         future_into_py(py, async move { Ok(o) })
     }
+    #[pyo3(signature = (_exc_type, _exc, _tb, /))]
     fn __aexit__<'p>(
         &self,
         py: Python<'p>,
-        _t: Bound<'p, PyAny>,
-        _v: Bound<'p, PyAny>,
+        _exc_type: Bound<'p, PyAny>,
+        _exc: Bound<'p, PyAny>,
         _tb: Bound<'p, PyAny>,
     ) -> PyResult<Bound<'p, PyAny>> {
         self.close();

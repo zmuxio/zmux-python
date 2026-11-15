@@ -81,8 +81,10 @@ by a `PipeId`. A **stream** belongs to the session, not to a pipe.
 carriers) opens a carrier and returns a `PipeIo`; `connect_x` takes the same
 arguments and a `config=`, dials, and returns a `Session`;
 `Listener.serve_x(host, port, *, ...)` accepts and returns the bound
-`(host, port)`. An address reported to you (a peer, a source) is a `(host,
-port)` tuple too. `Session.connect(pipe, config=...)`,
+`(host, port)`. A host you pass, alone or in a `(host, port)` address, is a
+`str` (a name or an IP literal) or an `ipaddress.IPv4Address` /
+`IPv6Address`. An address reported to you (a peer, a source) is a `(host,
+port)` tuple of `str` and `int`. `Session.connect(pipe, config=...)`,
 `Session.accept(pipe, config=...)` and `Session.symmetric(pipe, config=...)`
 (roles negotiated) start a session on a pipe input of your own.
 
@@ -216,22 +218,31 @@ Datagram queues are bounded per stream by `datagram_stream_queue` (32
 datagrams) and `datagram_stream_bytes` (512 KiB; `None`: the count alone),
 and the session queue by `datagram_receive_queue` and
 `datagram_receive_bytes` (1 MiB), which does not count the stream queues.
+`session.send_datagram(data)` never waits and drops the oldest queued
+datagram when the send queue is full; `await session.send_datagram_wait(data)`
+waits for room instead and is cancellation-safe.
 
 ## Streams
 
 `open_bi(info=, tlvs=, pipe_carrier=, priority=, peer_priority=)` fixes the
-preamble before the first frame; `try_open_bi()` opens without waiting.
+preamble before the first frame; `try_open_bi()` and `try_open_uni()` open
+without waiting.
 `finish()` ends the sending part, `reset(code)` abandons it and
 `recv.stop(code)` asks the peer to stop sending; `reset` and `stop` return at
 once, like `asyncio.Transport.abort`; both always take the code. Every
-coroutine is cancellation-safe except the writes: a cancelled `write` or
-`write_chunk` may have sent a prefix of its data and says nothing about how
-much, so reset the stream rather than write to it again; a completed one
-returns the number of bytes taken. Use `asyncio.timeout()` for deadlines. `send.priority` is writable, and so are the runtime settings of a stream, which
+coroutine is cancellation-safe except `write`: a cancelled `write` may have
+sent a prefix of its data and says nothing about how much, so reset the
+stream rather than write to it again. `await send.write_some(data)` and
+`await send.writev(buffers)` are the cancellation-safe writes: they take a
+prefix once the stream has room and return its length; cancelled while they
+wait, they took nothing (a cancellation that lands just as one completes
+cannot take the bytes back; `stats().bytes_written` tells). Use
+`asyncio.timeout()` for deadlines. `send.priority` is writable, and so are the runtime settings of a stream, which
 read back as in force: `send.send_buffer`, `send.scheduler`,
 `send.redundant`, `recv.receive_window` and `recv.peer_priority`;
-`await recv.read_chunk(n)` returns a `memoryview` of the received buffer and
-`await send.write_chunk(buf)` takes any buffer without copying it.
+`await recv.read_chunk(n)` returns a `memoryview` of the received buffer, and
+every write takes any buffer-protocol object without copying it (the caller
+leaves a mutable buffer unchanged until the write returned).
 
 `open_bi` and `accept_bi` give a `BiStream`, which unpacks as `send, recv`.
 `await session.open_stream_pair(limit=...)` returns a `(StreamPairReader,

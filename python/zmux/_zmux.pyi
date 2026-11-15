@@ -3,7 +3,9 @@ cancelling the awaiting task drops the pending operation and leaves the
 session, stream or pipe usable. Use `asyncio.timeout()` for per-call
 deadlines; durations are seconds."""
 
+import ipaddress
 import os
+from types import TracebackType
 from collections.abc import Awaitable, Buffer, Callable, Iterable, Mapping
 from typing import Any, ClassVar, Literal, Protocol, Self, final
 
@@ -44,6 +46,8 @@ from ._types import (
 type _Pem = str | os.PathLike[str] | bytes
 type _Prio = Priority | tuple[int, bool]
 type _Headers = Mapping[str, str] | Iterable[tuple[str, str]]
+type _Host = str | ipaddress.IPv4Address | ipaddress.IPv6Address
+type _HostPort = tuple[_Host, int]
 
 DEFAULT_KEEP_ALIVE_PERIOD: float
 """Default keep-alive period, seconds (15)."""
@@ -384,7 +388,7 @@ class Admission:
     when larger; a longer message closes the carrier).
     `peek_timeout` (seconds, from the end of the outer handshake) bounds the
     reading of the prefix and the decision; `stall` is the `(min, max)`
-    seconds a stalled carrier is held open; `AUTO` (the default) draws them
+    seconds a stalled carrier is held open; `AUTO` or `None` (the default) draws them
     at random. Within the interval, every carrier
     from one source is held open for the same duration during the listener's
     lifetime, and a held carrier counts against the listener's
@@ -404,8 +408,8 @@ class Admission:
         *,
         peek: int = 0,
         max_peek: int = 0,
-        peek_timeout: float | _t.Auto = _t.AUTO,
-        stall: tuple[float, float] | _t.Auto = _t.AUTO,
+        peek_timeout: float | _t.Auto | None = None,
+        stall: tuple[float, float] | _t.Auto | None = None,
         fallback_on_peek_timeout: bool = False,
     ) -> None: ...
     @staticmethod
@@ -414,8 +418,8 @@ class Admission:
         *,
         skew: int,
         max_nonces: int = 65536,
-        peek_timeout: float | _t.Auto = _t.AUTO,
-        stall: tuple[float, float] | _t.Auto = _t.AUTO,
+        peek_timeout: float | _t.Auto | None = None,
+        stall: tuple[float, float] | _t.Auto | None = None,
         fallback_on_peek_timeout: bool = False,
     ) -> Admission:
         """Admission by `auth`'s tokens: `skew` slots of clock difference
@@ -460,13 +464,13 @@ class PrefixAuth:
 type _CarrierCredential = PrefixAuth | _t.CarrierCredential
 
 async def dial_tcp(
-    host: str, port: int, *, carrier_credential: _CarrierCredential | None = None
+    host: _Host, port: int, *, carrier_credential: _CarrierCredential | None = None
 ) -> PipeIo:
     """A pipe input on a new TCP connection to `host` and `port`; with
     `carrier_credential`, its prefix is sent first (given no exporter)."""
 
 async def dial_tls(
-    host: str,
+    host: _Host,
     port: int,
     *,
     tls: TlsConfig | None = None,
@@ -478,7 +482,7 @@ async def dial_tls(
     identifiers in `tls`, zmux's are offered."""
 
 async def dial_quic(
-    host: str,
+    host: _Host,
     port: int,
     *,
     tls: TlsConfig | None = None,
@@ -505,7 +509,7 @@ async def dial_websocket(
     (`serve_http(websocket_no_subprotocol=True)`)."""
 
 async def dial_streaming(
-    host: str,
+    host: _Host,
     port: int,
     *,
     path: str = "/zmux",
@@ -522,7 +526,7 @@ async def dial_streaming(
     header form."""
 
 async def dial_split(
-    host: str,
+    host: _Host,
     port: int,
     *,
     path: str = "/zmux",
@@ -537,7 +541,7 @@ async def dial_split(
 
 async def join_split(
     session: Session,
-    host: str,
+    host: _Host,
     port: int,
     *,
     path: str = "/zmux",
@@ -685,7 +689,7 @@ class Candidate:
 
     @staticmethod
     def streaming(
-        host: str,
+        host: _Host,
         port: int,
         *,
         path: str = "/zmux",
@@ -696,7 +700,7 @@ class Candidate:
         `dial_streaming`)."""
     @staticmethod
     def split(
-        host: str,
+        host: _Host,
         port: int,
         *,
         path: str = "/zmux",
@@ -708,7 +712,7 @@ class Candidate:
         request field `pair_field` (default `Zmux-Pipe-Pair`)."""
     @staticmethod
     def exchange(
-        host: str, port: int, *, options: ExchangeOptions | None = None
+        host: _Host, port: int, *, options: ExchangeOptions | None = None
     ) -> Candidate:
         """The exchange carrier, for paths that buffer whole bodies (kind
         `exchange`, as `dial_exchange`)."""
@@ -724,7 +728,7 @@ class Candidate:
         `dial_websocket`)."""
     @staticmethod
     def quic(
-        host: str,
+        host: _Host,
         port: int,
         *,
         tls: TlsConfig | None = None,
@@ -739,7 +743,7 @@ class Candidate:
         url: str,
         *,
         tls: TlsConfig | None = None,
-        addr: tuple[str, int] | None = None,
+        addr: _HostPort | None = None,
         lanes: int = DEFAULT_LANES,
         carrier_credential: _CarrierCredential | None = None,
     ) -> Candidate:
@@ -945,11 +949,11 @@ class ExchangeOptions:
         """The fixed DOWN path, or `AUTO`."""
 
 async def dial_exchange(
-    host: str,
+    host: _Host,
     port: int,
     *,
     options: ExchangeOptions | None = None,
-    down_addr: tuple[str, int] | None = None,
+    down_addr: _HostPort | None = None,
     tls: TlsConfig | None = None,
     server_name: str | None = None,
     carrier_credential: _CarrierCredential | None = None,
@@ -964,7 +968,7 @@ async def dial_http3(
     url: str,
     *,
     tls: TlsConfig | None = None,
-    addr: tuple[str, int] | None = None,
+    addr: _HostPort | None = None,
     lanes: int = DEFAULT_LANES,
     carrier_credential: _CarrierCredential | None = None,
 ) -> PipeIo:
@@ -992,7 +996,7 @@ class Http2Connection:
 
     @staticmethod
     async def dial(
-        host: str,
+        host: _Host,
         port: int,
         *,
         path: str = "/zmux",
@@ -1046,19 +1050,19 @@ class QuicClient:
         lanes: int = DEFAULT_LANES,
         zero_rtt: bool = False,
         memory_capacity: int | None = None,
-        bind: tuple[str, int] = ("0.0.0.0", 0),
+        bind: _HostPort = ("0.0.0.0", 0),
         carrier_credential: _CarrierCredential | None = None,
     ) -> None:
         """`memory_capacity` bounds the servers remembered (`None`: no
         bound); `bind` is the local `(host, port)`. With `carrier_credential`, its prefix is the first stream's
         first bytes and no 0-RTT data is sent."""
     async def dial(
-        self, host: str, port: int, *, server_name: str | None = None
+        self, host: _Host, port: int, *, server_name: str | None = None
     ) -> PipeIo:
         """A pipe input on a new connection."""
     async def connect(
         self,
-        host: str,
+        host: _Host,
         port: int,
         *,
         server_name: str | None = None,
@@ -1095,12 +1099,28 @@ class SendStream:
         assigning a `Priority` or `(urgency, incremental)` changes it."""
     @priority.setter
     def priority(self, priority: _Prio) -> None: ...
-    async def write(self, data: bytes) -> int:
-        """Writes all of `data`, waiting for flow control, and returns the
-        number of bytes taken (`len(data)`). Not cancellation-safe in the
-        sense of leaving the stream unchanged: if cancelled, a prefix of
-        `data` may have been sent and nothing says how much, so a stream
-        whose write was cancelled is to be reset, not written to again."""
+    async def write(self, data: Buffer) -> None:
+        """Writes all of `data`, any buffer-protocol object, without copying
+        it, waiting for room; the caller does not modify a mutable buffer
+        until the call returned. Not cancellation-safe: a cancelled call may
+        have taken a prefix of `data` and does not say how much, so a stream
+        whose `write` was cancelled is to be reset, not written to again
+        (`write_some` is the cancellation-safe write)."""
+    async def write_some(self, data: Buffer) -> int:
+        """Writes a prefix of `data` without copying it, waiting until the
+        stream takes some, and returns the number of bytes taken (0 only for
+        empty `data`); the caller does not modify the taken bytes of a
+        mutable buffer afterwards. Cancellation-safe: when the call raises
+        `CancelledError` while it waits, nothing of `data` was taken. A
+        cancellation that lands as the call completes, after the stream took
+        the bytes and before the result reached the awaiter, cannot take
+        them back: compare the stream's `stats().bytes_written` before and
+        after to tell (just after a cancellation `stats()` may still raise
+        `StreamBusyError` until the native side let go of the stream)."""
+    async def writev(self, buffers: Iterable[Buffer]) -> int:
+        """`write_some` over several buffers: writes a prefix of their
+        concatenation without copying them and returns the number of bytes
+        taken; the same cancellation semantics."""
     async def flush(self) -> None:
         """Opens the stream now and waits until the opening frame and the data
         written so far left for a carrier: the peer sees the stream even with
@@ -1118,10 +1138,6 @@ class SendStream:
         progress the reset follows once that write returns or is
         cancelled. During the read drain after the peer's close it raises
         the session's error; the exit of `async with` ignores it."""
-    async def write_chunk(self, buffer: Buffer) -> int:
-        """Writes any buffer-protocol object without copying it, and returns
-        the number of bytes taken; the caller does not modify it afterwards.
-        Cancelled, it may have sent a prefix, as `write`."""
     def set_reliable_boundary(self) -> None:
         """Marks the bytes written so far as delivered even if the stream is
         reset later (RESET_STREAM_AT Reliable Size)."""
@@ -1161,7 +1177,13 @@ class SendStream:
     async def stopped(self) -> int | None:
         """Waits until the peer stops the stream (returns its code) or acknowledged all data (`None`)."""
     async def __aenter__(self) -> Self: ...
-    async def __aexit__(self, *exc: object) -> Literal[False]: ...
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+        /,
+    ) -> Literal[False]: ...
 
 @final
 class RecvStream:
@@ -1236,7 +1258,13 @@ class RecvStream:
     def __aiter__(self) -> Self: ...
     async def __anext__(self) -> bytes: ...
     async def __aenter__(self) -> Self: ...
-    async def __aexit__(self, *exc: object) -> Literal[False]: ...
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+        /,
+    ) -> Literal[False]: ...
 
 @final
 class Pipe:
@@ -1309,7 +1337,13 @@ class Pipe:
         """A snapshot; `None` once the pipe is retired or the session
         released it (reads never raise; operations then raise `PipeError`)."""
     async def __aenter__(self) -> Self: ...
-    async def __aexit__(self, *exc: object) -> Literal[False]: ...
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+        /,
+    ) -> Literal[False]: ...
 
 @final
 class EventStream:
@@ -1444,6 +1478,15 @@ class Session:
         priority: _Prio | None = None,
     ) -> SendStream:
         """Opens a unidirectional stream."""
+    def try_open_uni(
+        self,
+        *,
+        info: bytes | None = None,
+        tlvs: list[Tlv] | list[tuple[int, bytes]] | None = None,
+        priority: _Prio | None = None,
+    ) -> SendStream:
+        """Opens a unidirectional stream if stream credit is available now;
+        `StreamError` of kind `Blocked` (retryable) otherwise. Never waits."""
     async def accept_bi(self) -> BiStream:
         """The next bidirectional stream the peer opened;
         `SessionClosedError` once the session ended."""
@@ -1453,6 +1496,12 @@ class Session:
         """Queues an unreliable datagram; never waits. When the queue is full
         the oldest datagram is dropped. `DatagramError` if datagrams are not
         negotiated or `data` exceeds `max_datagram_size`."""
+    async def send_datagram_wait(self, data: Buffer) -> None:
+        """Queues a datagram, any buffer-protocol object without a copy,
+        waiting while the queue is full instead of dropping the oldest; the
+        same errors as `send_datagram`. Cancellation-safe: cancelled while
+        it waits, it queued nothing (a cancellation that lands as it
+        completes cannot take the datagram back)."""
     async def read_datagram(self) -> bytes:
         """The next received datagram; `SessionClosedError` once the session
         ended."""
@@ -1661,7 +1710,13 @@ class Session:
         """Ends `Config(hold_first_flight=True)`: what is queued goes in one
         carrier write, as far as one batch holds it. Never blocks."""
     async def __aenter__(self) -> Self: ...
-    async def __aexit__(self, *exc: object) -> Literal[False]: ...
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+        /,
+    ) -> Literal[False]: ...
     def __aiter__(self) -> Self: ...
     async def __anext__(self) -> BiStream: ...
 
@@ -1680,18 +1735,18 @@ class Listener:
         config: _t.Config | None = None,
         listener_config: _t.ListenerConfig | None = None,
     ) -> None: ...
-    async def serve_tcp(self, host: str, port: int) -> tuple[str, int]:
+    async def serve_tcp(self, host: _Host, port: int) -> tuple[str, int]:
         """Serves plain TCP on `host` and `port`; returns the bound address.
         With the listener's `admission`, a connection reaches it only once
         admitted."""
     async def serve_tls(
-        self, host: str, port: int, *, tls: TlsConfig
+        self, host: _Host, port: int, *, tls: TlsConfig
     ) -> tuple[str, int]:
         """Without ALPN identifiers in `tls`, zmux's are accepted. The
         admission decides after the handshake, with its exporter."""
     async def serve_quic(
         self,
-        host: str,
+        host: _Host,
         port: int,
         *,
         tls: TlsConfig,
@@ -1702,23 +1757,23 @@ class Listener:
         With the listener's `admission`, the prefix is the first stream's
         first bytes; it excludes `zero_rtt` (ValueError)."""
     async def serve_http3(
-        self, host: str, port: int, *, tls: TlsConfig, lanes: int = DEFAULT_LANES
+        self, host: _Host, port: int, *, tls: TlsConfig, lanes: int = DEFAULT_LANES
     ) -> tuple[str, int]:
         """With the listener's `admission`, each request is decided on the
         first bytes of its body."""
     async def serve_webtransport(
-        self, host: str, port: int, *, tls: TlsConfig, lanes: int = DEFAULT_LANES
+        self, host: _Host, port: int, *, tls: TlsConfig, lanes: int = DEFAULT_LANES
     ) -> tuple[str, int]:
         """With the listener's `admission`, each session request is decided
         on its request head (no prefix), with the QUIC connection's exporter."""
     async def serve_websocket(
-        self, host: str, port: int, *, tls: TlsConfig | None = None
+        self, host: _Host, port: int, *, tls: TlsConfig | None = None
     ) -> tuple[str, int]:
         """With the listener's `admission`, each upgrade is decided on its
         request head (no prefix), with the TLS exporter under `tls`."""
     async def serve_http(
         self,
-        host: str,
+        host: _Host,
         port: int,
         *,
         path: str = "/zmux",
@@ -1747,8 +1802,8 @@ class Listener:
         self,
         pipe: PipeIo,
         *,
-        peer: tuple[str, int] | None = None,
-        source: tuple[str, int] | None = None,
+        peer: _HostPort | None = None,
+        source: _HostPort | None = None,
     ) -> None:
         """Hands over a carrier the application accepted itself: `peer` is its
         directly connected peer, `source` the client the application resolved
@@ -1770,7 +1825,13 @@ class Listener:
     def stats(self) -> ListenerStats:
         """What happened to the carriers handed to the listener: counts since it was made."""
     async def __aenter__(self) -> Self: ...
-    async def __aexit__(self, *exc: object) -> Literal[False]: ...
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+        /,
+    ) -> Literal[False]: ...
     def __aiter__(self) -> Self: ...
     async def __anext__(self) -> Session: ...
 
@@ -2116,9 +2177,9 @@ async def establish(
     allow_psk_only: bool = False,
     handle: Buffer = b"",
     psk: Buffer = b"",
-    static_secret: Buffer | _t.Auto = _t.AUTO,
+    static_secret: Buffer | _t.Auto | None = None,
     allowed_profiles: Iterable[int] | None = None,
-    record_mode: _t.RecordMode | str = _t.RecordMode.SEALED,
+    record_mode: _t.RecordMode | str | None = None,
     credential: tuple[int, bytes] | None = None,
     local_context: Buffer = b"",
     app_data: AppDataSource | None = None,
@@ -2134,9 +2195,9 @@ async def establish(
     carrier is closed; nothing is retried. A server that ends or stays silent until
     `reply_timeout` (`None`: none) raises `NoReplyError`; a rejected server raises
     `ZmuxError`; a configuration mistake raises `ValueError` naming it.
-    `static_secret` is the client's 32-byte X25519 static secret (`AUTO`: a key
-    generated once per process); `record_mode` the record mode of the session's
-    first pipe.
+    `static_secret` is the client's 32-byte X25519 static secret (`AUTO` or
+    `None`, the default: a key generated once per process); `record_mode` the
+    record mode of the session's first pipe (`None`: `RecordMode.SEALED`).
     `allowed_profiles` `None` is both ciphers, AES-GCM first with AES hardware: 1 or
     3 with a pre-shared key, 4 or 5 without; an empty list raises `ValueError`. `credential` is sent in message 3;
     `local_context` is this dial's label for the verifier; `app_data` supplies the

@@ -1,0 +1,5 @@
+{"machines": [
+ {"start": 0, "states": [{"record": {"pad": {"t": [[1, 0, 64]]}}}]},
+ {"start": 0, "states": [{"enter": [{"op": "inject", "after": 10000, "len": {"t": [[1, 50, 300]]}}],
+   "next": [{"on": "injected", "to": 0}, {"on": "inject_dropped", "to": 0}]}]}
+]}

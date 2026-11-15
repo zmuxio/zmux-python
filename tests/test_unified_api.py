@@ -40,11 +40,15 @@ async def test_streams_unpack_and_name_their_parts() -> None:
         assert isinstance(opened, zmux.BiStream)
         send, recv = opened
         assert opened.send is send and opened.recv is recv
-        assert await send.write(b"abc") == 3
-        assert await send.write_chunk(memoryview(b"de")) == 2
+        await send.write(b"abc")
+        await send.write(memoryview(b"de"))
+        assert await send.write_some(bytearray(b"fg")) == 2
+        assert await send.writev([b"h", memoryview(b"xijx")[1:3], b""]) == 3
+        assert await send.write_some(b"") == 0
+        assert await send.writev([]) == 0
         await send.finish()
         accepted = await s.accept_bi()
-        assert await accepted.recv.read_to_end() == b"abcde"
+        assert await accepted.recv.read_to_end() == b"abcdefghij"
 
 
 async def test_a_stream_exit_by_an_exception_resets_with_cancelled() -> None:
@@ -383,3 +387,26 @@ def test_carrier_kinds_name_their_dial_and_candidate_functions() -> None:
     assert hasattr(zmux.Http2Connection, "dial") and hasattr(
         zmux.Http2Connection, "open_pipe"
     )
+
+
+async def test_try_open_uni_and_send_datagram_wait() -> None:
+    async with pair(zmux.Config(enable_datagrams=True)) as (c, s):
+        send = c.try_open_uni(priority=(2, False))
+        assert send.priority.urgency == 2
+        await send.write(b"uni")
+        await send.finish()
+        recv = await s.accept_uni()
+        assert await recv.read_to_end() == b"uni"
+        await c.send_datagram_wait(memoryview(b"xdgx")[1:3])
+        assert await asyncio.wait_for(s.read_datagram(), 5) == b"dg"
+
+
+async def test_hosts_take_ip_addresses() -> None:
+    import ipaddress
+
+    async with zmux.Listener() as listener:
+        _, port = await listener.serve_tcp(ipaddress.IPv4Address("127.0.0.1"), 0)
+        async with await zmux.connect_tcp(ipaddress.ip_address("127.0.0.1"), port):
+            (await asyncio.wait_for(listener.accept(), 5)).close()
+    with pytest.raises(TypeError):
+        await zmux.dial_tcp(1, 1)  # type: ignore[arg-type]

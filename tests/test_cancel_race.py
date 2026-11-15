@@ -16,11 +16,16 @@ ORDERS = ("cancel-first", "complete-first")
 
 
 async def cancelled_as_it_completes(
-    start: Callable[[], Awaitable[Any]], order: str
+    start: Callable[[], Awaitable[Any]],
+    order: str,
+    waiter: Callable[[], Awaitable[Any]] | None = None,
 ) -> Any:
     """Runs `start()` as a task and cancels it at the moment its result is
-    handed to the loop; the result it would have returned."""
+    handed to the loop; the result it would have returned. With `waiter`, a
+    call of the same kind is started once the result exists and given time
+    to block before the cancellation: it is returned too, as a task."""
     loop = asyncio.get_running_loop()
+    blocked: list[asyncio.Task[Any]] = []
     original = loop.call_soon_threadsafe
     seen: list[Any] = []
     task: asyncio.Task[Any] | None = None
@@ -39,7 +44,15 @@ async def cancelled_as_it_completes(
                 cb(*a)
                 task.cancel()
 
-        return original(run, *args, **kw)
+        if waiter is None:
+            return original(run, *args, **kw)
+
+        def block_first(*a: Any) -> None:
+            assert waiter is not None
+            blocked.append(asyncio.ensure_future(waiter()))
+            loop.call_later(0.05, run, *a)
+
+        return original(block_first, *args, **kw)
 
     async def call() -> Any:
         return await start()
@@ -52,6 +65,9 @@ async def cancelled_as_it_completes(
     finally:
         delattr(loop, "call_soon_threadsafe")
     assert task.cancelled() and len(seen) == 1
+    if waiter is not None:
+        assert len(blocked) == 1
+        return seen[0], blocked[0]
     return seen[0]
 
 
@@ -214,22 +230,21 @@ async def test_send_exit_by_exception_does_not_wait_for_a_blocked_write() -> Non
         initial_stream_receive_window=4096, max_stream_receive_window=4096
     ) as (c, _s):
         send, _ = await c.open_bi()
-        # The peer reads nothing: writes pile up until flow control holds one.
-        for _ in range(100):
-            blocked = asyncio.ensure_future(send.write(b"x" * 65536))
-            await asyncio.sleep(0.05)
-            if not blocked.done():
-                break
-        else:
-            pytest.fail("no write was held by flow control")
+        # The peer reads nothing and the part may hold one byte: a write of
+        # more than the peer's window can never finish by itself, however
+        # slowly the loop runs (a deterministic block, not a timing guess).
+        send.send_buffer = 1
+        blocked = asyncio.ensure_future(send.write(b"x" * 65536))
+        await asyncio.sleep(0.05)  # the write holds the part
         with pytest.raises(RuntimeError):
             async with asyncio.timeout(2):  # not held by the blocked write
                 async with send:
                     raise RuntimeError
-        # The reset follows once that write is cancelled.
-        assert not blocked.done()
+        # The reset follows once that write is cancelled; a write that had
+        # not yet started meets the reset at once. It never succeeds.
         blocked.cancel()
-        await asyncio.gather(blocked, return_exceptions=True)
+        (outcome,) = await asyncio.gather(blocked, return_exceptions=True)
+        assert isinstance(outcome, Exception | asyncio.CancelledError)
 
 
 async def test_recv_exit_stops_the_stream() -> None:
@@ -240,3 +255,113 @@ async def test_recv_exit_stops_the_stream() -> None:
         async with recv:
             pass  # normal exit, not read to the end
         assert await asyncio.wait_for(send.stopped(), 5) == 0
+
+
+# A call already blocked when the cancelled call's result is taken back
+# gets it: the result was the last one, nothing else would wake the call.
+
+
+@pytest.mark.parametrize("order", ORDERS)
+async def test_blocked_accept_bi_gets_the_result(order: str) -> None:
+    async with sessions() as (c, s):
+        send, _ = await c.open_bi()
+        await send.write(b"x")
+        lost, blocked = await cancelled_as_it_completes(s.accept_bi, order, s.accept_bi)
+        _, recv = await asyncio.wait_for(blocked, 5)
+        assert recv is lost[1]
+
+
+@pytest.mark.parametrize("order", ORDERS)
+async def test_blocked_accept_uni_gets_the_result(order: str) -> None:
+    async with sessions() as (c, s):
+        send = await c.open_uni()
+        await send.write(b"x")
+        lost, blocked = await cancelled_as_it_completes(
+            s.accept_uni, order, s.accept_uni
+        )
+        assert await asyncio.wait_for(blocked, 5) is lost
+
+
+@pytest.mark.parametrize("order", ORDERS)
+async def test_blocked_read_datagram_gets_the_result(order: str) -> None:
+    async with sessions(enable_datagrams=True) as (c, s):
+        c.send_datagram(b"only")
+        lost, blocked = await cancelled_as_it_completes(
+            s.read_datagram, order, s.datagrams().__anext__
+        )
+        assert lost == b"only"
+        assert await asyncio.wait_for(blocked, 5) == b"only"
+
+
+@pytest.mark.parametrize("order", ORDERS)
+async def test_blocked_read_chunk_gets_the_result(order: str) -> None:
+    async with sessions() as (c, s):
+        send, _ = await c.open_bi()
+        await send.write(b"chunk")
+        _, recv = await asyncio.wait_for(s.accept_bi(), 5)
+        await asyncio.sleep(0.05)  # the bytes have arrived
+        lost, blocked = await cancelled_as_it_completes(
+            recv.read_chunk, order, recv.read_chunk
+        )
+        assert bytes(lost) == b"chunk"
+        assert bytes(await asyncio.wait_for(blocked, 5)) == b"chunk"
+
+
+@pytest.mark.parametrize("order", ORDERS)
+async def test_blocked_next_event_gets_the_result(order: str) -> None:
+    config = zmux.Config(
+        max_pipes=8, pipe_auth=zmux.PipeAuth.psk(b"k" * 32).with_end_to_end()
+    )
+    async with zmux.Listener(
+        config=config,
+        listener_config=zmux.ListenerConfig(instance_id=b"instance", max_suspended=16),
+    ) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
+        async with (
+            await zmux.connect_tcp(*addr, config=config) as c,
+            await asyncio.wait_for(listener.accept(), 5),
+        ):
+            await c.add_pipe(await zmux.dial_tcp(*addr))
+            await asyncio.sleep(0.2)  # the events are queued
+            # Added, joined, committed: the commit is the last one.
+            for _ in range(2):
+                await asyncio.wait_for(c.next_event(), 5)
+            lost, blocked = await cancelled_as_it_completes(
+                c.next_event, order, c.events().__anext__
+            )
+            assert type(lost).__name__ == "EpochCommitted"
+            assert await asyncio.wait_for(blocked, 5) is lost
+
+
+async def bytes_written(send: zmux.SendStream) -> int:
+    """The part's `bytes_written`, once a cancelled write let go of it: the
+    native side does so just after the cancellation."""
+    async with asyncio.timeout(5):
+        while True:
+            try:
+                return send.stats().bytes_written
+            except zmux.StreamBusyError:
+                await asyncio.sleep(0.001)
+
+
+async def test_write_some_cancelled_while_waiting_takes_nothing() -> None:
+    async with sessions(
+        initial_stream_receive_window=4096, max_stream_receive_window=4096
+    ) as (c, _s):
+        send, _ = await c.open_bi()
+        send.send_buffer = 1
+        # Fill the part until it takes nothing more.
+        while True:
+            try:
+                async with asyncio.timeout(0.2):
+                    await send.write_some(b"x" * 65536)
+            except TimeoutError:
+                break
+        before = await bytes_written(send)
+        blocked = asyncio.ensure_future(send.write_some(b"y" * 100))
+        await asyncio.sleep(0.05)
+        assert not blocked.done()
+        blocked.cancel()
+        (outcome,) = await asyncio.gather(blocked, return_exceptions=True)
+        assert isinstance(outcome, asyncio.CancelledError)
+        assert await bytes_written(send) == before

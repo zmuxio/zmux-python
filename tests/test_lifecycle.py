@@ -84,7 +84,7 @@ def test_a_lent_buffer_is_released_clear_of_the_session() -> None:
                 d = asyncio.create_task(drain())
                 buffer = bytearray(1 << 16)
                 for _ in range(200):
-                    await send.write_chunk(buffer)
+                    await send.write(buffer)
                     for _ in range(20):
                         c.stats()
                 await send.finish()

@@ -166,8 +166,9 @@ class StreamPairWriter:
 
     async def _flush(self) -> None:
         while self._buf:
-            data = bytes(self._buf)
-            self._buf.clear()
+            # The queued bytes go as they are, without a copy: new writes
+            # queue in a fresh buffer meanwhile.
+            data, self._buf = self._buf, bytearray()
             try:
                 await self.stream.write(data)
             except BaseException as e:

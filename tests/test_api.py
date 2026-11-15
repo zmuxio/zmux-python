@@ -191,8 +191,8 @@ async def test_try_open_bi_without_credit_raises() -> None:
 async def test_chunks_without_copying() -> None:
     async with pair() as (c, s, _l):
         send, _recv = await c.open_bi()
-        await send.write_chunk(bytearray(b"ab"))
-        await send.write_chunk(memoryview(b"xcdx")[1:3])
+        await send.write(bytearray(b"ab"))
+        await send.write(memoryview(b"xcdx")[1:3])
         await send.finish()
         _ss, recv = await s.accept_bi()
         got = b""

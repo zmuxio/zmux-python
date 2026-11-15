@@ -1,0 +1,43 @@
+# Allowlist for `python -m mypy.stubtest zmux --allowlist tests/stubtest-allowlist.txt`.
+# Only differences stubtest cannot judge belong here; a real mismatch is fixed
+# in the stub or the binding instead.
+
+# PyO3 classes are built by __new__ and have no __init__ of their own, while
+# the stubs document the constructor as __init__.
+zmux\._zmux\.\w+\.__init__
+zmux\._zmux\.\w+\.__new__
+
+# PyO3 renders a default it cannot spell as a Python literal (b"", a constant,
+# a computed value) as `...` in __text_signature__; the stub has the real one.
+zmux\._zmux\.CarrierInfo\.export
+zmux\._zmux\.Listener\.shutdown
+zmux\._zmux\.PoolPolicy\.decide
+zmux\._zmux\.RecvStream\.read_to_end
+zmux\._zmux\.Session\.abort
+zmux\._zmux\.Session\.close
+zmux\._zmux\.Session\.shutdown
+zmux\._zmux\.Session\.export_keying_material
+zmux\._zmux\.Session\.open_packet_stream
+zmux\._zmux\.derive_handle_psk
+
+# Protocols the stub declares for callbacks the host implements; nothing
+# exists at runtime.
+zmux\._zmux\.AppDataSource
+zmux\._zmux\.Gate
+zmux\._zmux\.Signer
+zmux\._zmux\.Verifier
+
+# Native internals that are not API: the module's export list, the atexit
+# hook and the buffer exporter behind read_chunk's memoryview.
+zmux\._zmux\.__all__
+zmux\._zmux\._shutdown
+zmux\._zmux\.Chunk
+
+# PEP 695 `type` aliases and the NewType are TypeAliasType / callables at
+# runtime, which stubtest does not recognise as aliases.
+zmux\._connect\._\w+
+zmux\._types\.Auto
+zmux\._types\.Clear
+zmux\._types\.Inherit
+zmux\._types\.Staged
+zmux\._types\.PipeId

@@ -7,6 +7,8 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+use crate::Host;
+
 use crate::rt::future_into_py;
 use crate::{
     ExchangeOptions, H3Dial, QuicDial, Session, TlsConfig, WebTransportDial, admission, hostport,
@@ -57,11 +59,11 @@ impl Candidate {
     /// A bidirectional streaming `POST` over HTTP/1.1 to `addr` (kind
     /// `streaming`, as `dial_streaming`).
     #[staticmethod]
-    #[pyo3(signature = (host, port, *, path="/zmux".to_owned(), carrier_credential=None, pair_field=None))]
+    #[pyo3(signature = (host, port, *, path="/zmux", carrier_credential=None, pair_field=None))]
     fn streaming(
-        host: String,
+        host: Host,
         port: u16,
-        path: String,
+        path: &str,
         carrier_credential: Option<Bound<'_, PyAny>>,
         pair_field: Option<String>,
     ) -> PyResult<Self> {
@@ -74,11 +76,11 @@ impl Candidate {
     /// HTTP/1.1 to `addr` (kind `split`, as `dial_split`); as a
     /// further pipe it joins as a downlink and an uplink.
     #[staticmethod]
-    #[pyo3(signature = (host, port, *, path="/zmux".to_owned(), carrier_credential=None, pair_field=None))]
+    #[pyo3(signature = (host, port, *, path="/zmux", carrier_credential=None, pair_field=None))]
     fn split(
-        host: String,
+        host: Host,
         port: u16,
-        path: String,
+        path: &str,
         carrier_credential: Option<Bound<'_, PyAny>>,
         pair_field: Option<String>,
     ) -> PyResult<Self> {
@@ -95,7 +97,7 @@ impl Candidate {
     /// `dial_exchange`); it authenticates with the options' PSK.
     #[staticmethod]
     #[pyo3(signature = (host, port, *, options=None))]
-    fn exchange(host: String, port: u16, options: Option<PyRef<'_, ExchangeOptions>>) -> Self {
+    fn exchange(host: Host, port: u16, options: Option<PyRef<'_, ExchangeOptions>>) -> Self {
         let o = options.map_or_else(Default::default, |o| o.0.clone());
         let addr = hostport(&host, port);
         Self(zmux_http::candidate_exchange(connect(&addr), &addr, &o))
@@ -138,7 +140,7 @@ impl Candidate {
     #[staticmethod]
     #[pyo3(signature = (host, port, *, tls=None, server_name=None, lanes=zmux_quinn::LaneWindows::default().lanes, carrier_credential=None))]
     fn quic(
-        host: String,
+        host: Host,
         port: u16,
         tls: Option<PyRef<'_, TlsConfig>>,
         server_name: Option<String>,
@@ -163,7 +165,7 @@ impl Candidate {
     fn http3(
         url: String,
         tls: Option<PyRef<'_, TlsConfig>>,
-        addr: Option<(String, u16)>,
+        addr: Option<(Host, u16)>,
         lanes: u32,
         carrier_credential: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {

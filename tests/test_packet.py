@@ -201,3 +201,142 @@ async def test_splice_counts_dropped_datagrams() -> None:
         f = done.a_to_b
         assert f.datagrams_too_large == 2 == f.datagrams_dropped
         assert f.datagrams_as_capsules == 0
+
+
+def capsule(payload: bytes) -> bytes:
+    """A DATAGRAM capsule of Context ID 0 (one-byte varints)."""
+    body = b"\x00" + payload
+    assert len(body) < 64
+    return b"\x00" + bytes([len(body)]) + body
+
+
+async def relayed(
+    upstream: zmux.Session, downstream: zmux.Session, chunk: int = 1024
+) -> tuple[asyncio.Future[zmux.helpers.Spliced], int]:
+    """A packet relay of the next stream `upstream` accepts onto a stream of
+    `downstream` whose ID takes a two-byte Flow (ID 64), and the largest
+    datagram payload with Context ID 0 there: one byte less than on a stream
+    with a one-byte Flow, so that the largest datagram of the upstream's
+    first stream does not fit."""
+    for _ in range(16):
+        burnt, _ = await downstream.open_bi()
+        await burnt.flush()
+    send, recv = await downstream.open_bi()
+    await send.flush()
+    assert send.id == 64
+    down = send.max_datagram_size(0)
+    assert down is not None
+
+    async def relay() -> zmux.helpers.Spliced:
+        a = await upstream.accept_bi()
+        return await zmux.helpers.splice_packets(a, (send, recv), chunk=chunk)
+
+    return asyncio.ensure_future(relay()), down
+
+
+async def accept_relayed(s: zmux.Session) -> PacketStream:
+    """The stream of `relayed` on the far side, after the 16 before it."""
+    for _ in range(16):
+        await asyncio.wait_for(s.accept_bi(), 5)
+    return await asyncio.wait_for(accept_packets(s), 5)
+
+
+async def upstream_stream(c: zmux.Session) -> tuple[zmux.BiStream, int]:
+    """The session's first stream, opened, and its largest datagram payload
+    with Context ID 0."""
+    stream = await c.open_bi()
+    await stream.send.flush()
+    assert stream.send.id == 0
+    up = stream.send.max_datagram_size(0)
+    assert up is not None
+    return stream, up
+
+
+async def test_relay_sends_what_is_too_large_downstream_as_capsules() -> None:
+    # Datagrams on both hops, the second one's smaller: only the datagram
+    # too large there goes on as a capsule.
+    async with (
+        pair(DGRAM, DGRAM) as (c, relay_in, _l1),
+        pair(DGRAM, DGRAM) as (relay_out, server, _l2),
+    ):
+        task, down = await relayed(relay_in, relay_out)
+        (send, recv), up = await upstream_stream(c)
+        assert down < up
+        q = await accept_relayed(server)
+        send.send_datagram(b"s" * 100, 1)
+        send.send_datagram(b"L" * up, 0)
+        got = {await asyncio.wait_for(q.recv(), 5) for _ in range(2)}
+        assert got == {Packet(1, b"s" * 100), Packet(0, b"L" * up)}
+        st = q.stats()
+        assert (st.received_datagrams, st.received_capsules) == (1, 1)
+        await send.finish()
+        assert await asyncio.wait_for(q.recv(), 5) is None
+        await q.close()
+        assert await asyncio.wait_for(recv.read_to_end(), 5) == b""
+        f = (await asyncio.wait_for(task, 10)).a_to_b
+        assert f.datagrams_as_capsules == 1 and f.datagram_bytes == 100 + up
+        assert (f.datagrams_dropped, f.datagrams_too_large) == (0, 0)
+        assert f.end is zmux.helpers.SpliceEnd.FINISHED
+
+
+async def test_relay_fin_inside_a_capsule() -> None:
+    # The upstream ends inside a capsule: the receiver refuses the cut
+    # capsule with ZMUX_PACKET_ERROR, and the datagram that waited for the
+    # capsule's end is dropped as too large.
+    async with (
+        pair(DGRAM, DGRAM) as (c, relay_in, _l1),
+        pair(DGRAM, DGRAM) as (relay_out, server, _l2),
+    ):
+        task, _ = await relayed(relay_in, relay_out)
+        (send, recv), up = await upstream_stream(c)
+        await send.write(capsule(b"x" * 40)[:10])
+        q = await accept_relayed(server)
+        await asyncio.sleep(0.1)  # the relay is inside the capsule
+        send.send_datagram(b"L" * up)
+        await asyncio.sleep(0.1)  # and holds the datagram
+        await send.finish()
+        with pytest.raises(zmux.MalformedPacketError) as m:
+            await asyncio.wait_for(q.recv(), 5)
+        assert m.value.code == zmux.ApplicationErrorCode.ZMUX_PACKET_ERROR
+        # The receiver's reset goes back to the sender, code unchanged.
+        with pytest.raises(zmux.StreamResetError) as r:
+            await asyncio.wait_for(recv.read_to_end(), 5)
+        assert r.value.code == zmux.ApplicationErrorCode.ZMUX_PACKET_ERROR
+        done = await asyncio.wait_for(task, 10)
+        assert done.b_to_a.end is zmux.helpers.SpliceEnd.RESET
+        assert done.b_to_a.code == zmux.ApplicationErrorCode.ZMUX_PACKET_ERROR
+        f = done.a_to_b
+        assert f.datagrams_too_large == 1 and f.datagrams_dropped == 1
+        assert f.datagrams_as_capsules == 0 and f.datagram_bytes == 0
+        assert f.end is zmux.helpers.SpliceEnd.FINISHED
+
+
+async def test_relay_capsule_queue_full() -> None:
+    # Inside a capsule the datagrams that need a capsule wait for its end,
+    # a bounded number of them: the rest are dropped as too large.
+    async with (
+        pair(DGRAM, DGRAM) as (c, relay_in, _l1),
+        pair(DGRAM, DGRAM) as (relay_out, server, _l2),
+    ):
+        task, _ = await relayed(relay_in, relay_out)
+        (send, recv), up = await upstream_stream(c)
+        whole = capsule(b"x" * 40)
+        await send.write(whole[:10])
+        q = await accept_relayed(server)
+        await asyncio.sleep(0.1)  # the relay is inside the capsule
+        sent = 4
+        for i in range(sent):
+            send.send_datagram(bytes([i]) * up)
+        await asyncio.sleep(0.2)  # all of them reached the relay
+        await send.write(whole[10:])
+        await send.finish()
+        got = [p async for p in q]
+        await q.close()
+        assert await asyncio.wait_for(recv.read_to_end(), 5) == b""
+        f = (await asyncio.wait_for(task, 10)).a_to_b
+        assert got[0] == Packet(0, b"x" * 40)
+        assert len(got) - 1 == f.datagrams_as_capsules >= 1
+        assert f.datagrams_too_large >= 1
+        assert f.datagrams_as_capsules + f.datagrams_too_large == sent
+        assert f.datagrams_dropped == f.datagrams_too_large
+        assert f.end is zmux.helpers.SpliceEnd.FINISHED

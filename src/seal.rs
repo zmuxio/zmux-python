@@ -487,7 +487,11 @@ fn static_secret(v: &Bound<'_, PyAny>) -> PyResult<seal::StaticSecret> {
     static_secret=None, allowed_profiles=None, record_mode=None, credential=None,
     local_context=b"".to_vec(), app_data=None, max_app_data=Some(seal::DEFAULT_MAX_APP_DATA),
     require_pq_auth=false, signer=None, shaper=None,
-    shaping_limits=None, reply_timeout=Some(10.0)))]
+    shaping_limits=None, reply_timeout=Some(10.0)),
+    text_signature = "(pipe, *, verifier=None, allow_psk_only=False, handle=b'', psk=b'', \
+        static_secret=None, allowed_profiles=None, record_mode=None, credential=None, \
+        local_context=b'', app_data=None, max_app_data=256, require_pq_auth=False, \
+        signer=None, shaper=None, shaping_limits=None, reply_timeout=10.0)")]
 #[allow(clippy::too_many_arguments)]
 fn establish<'p>(
     py: Python<'p>,

@@ -1,6 +1,7 @@
 """Shaping against another implementation's echo peer (tests/shape_peer.py
-contract). Set ZMUX_SHAPE_PEER to the peer executable and ZMUX_SHAPE_DEF to
-a shaping definition (JSON); skipped otherwise."""
+contract; interop/shape-go-peer is the Go one). Set ZMUX_SHAPE_PEER to the
+peer executable and ZMUX_SHAPE_DEF to a shaping definition (JSON, such as
+tests/testdata/shaping/interop.json); skipped otherwise."""
 
 import os
 import subprocess
