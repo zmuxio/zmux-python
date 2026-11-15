@@ -286,7 +286,7 @@ impl PipePool {
         }
         let choice = match choice {
             Some(c) => {
-                let policy = choice_policy.map(|p| p.0.clone()).unwrap_or_default();
+                let policy = choice_policy.map_or_else(Default::default, |p| p.0.clone());
                 // Rejected now rather than when maintained.
                 zmux::helpers::PipePool::choice(&c.0, &policy)
                     .map_err(|e| PyValueError::new_err(e.to_string()))?;

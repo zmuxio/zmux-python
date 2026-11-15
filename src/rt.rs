@@ -91,8 +91,8 @@ where
 
 /// The `atexit` hook: closes the gate, then waits, detached, for the
 /// runtime threads attaching or attached now.
-#[pyfunction]
-fn _shutdown(py: Python<'_>) {
+#[pyfunction(name = "_shutdown")]
+fn shutdown(py: Python<'_>) {
     EXITING.store(true, Ordering::SeqCst);
     py.detach(|| {
         let end = Instant::now() + EXIT_WAIT;
@@ -144,7 +144,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
         .thread_name("zmux")
         .on_thread_start(mark_runtime_thread);
     pyo3_async_runtimes::tokio::init(b);
-    m.add_function(wrap_pyfunction!(_shutdown, m)?)?;
+    m.add_function(wrap_pyfunction!(shutdown, m)?)?;
     let hook = m.getattr("_shutdown")?;
     m.py().import("atexit")?.call_method1("register", (hook,))?;
     Ok(())

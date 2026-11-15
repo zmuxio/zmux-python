@@ -96,7 +96,7 @@ impl Candidate {
     #[staticmethod]
     #[pyo3(signature = (host, port, *, options=None))]
     fn exchange(host: String, port: u16, options: Option<PyRef<'_, ExchangeOptions>>) -> Self {
-        let o = options.map(|o| o.0.clone()).unwrap_or_default();
+        let o = options.map_or_else(Default::default, |o| o.0.clone());
         let addr = hostport(&host, port);
         Self(zmux_http::candidate_exchange(connect(&addr), &addr, &o))
     }
@@ -434,7 +434,7 @@ fn connect_choice<'p>(
     choice_policy: Option<PyRef<'_, CarrierChoicePolicy>>,
 ) -> PyResult<Bound<'p, PyAny>> {
     let config = crate::cfg(config)?;
-    let policy = choice_policy.map(|p| p.0.clone()).unwrap_or_default();
+    let policy = choice_policy.map_or_else(Default::default, |p| p.0.clone());
     let choice = choice.0.clone();
     future_into_py(py, async move {
         match zmux::dial_choice(&choice, config, &policy).await {

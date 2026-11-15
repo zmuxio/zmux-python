@@ -637,8 +637,8 @@ fn pipe_liveness_obj<'p>(py: Python<'p>, l: &zmux::PipeLiveness) -> PyResult<Bou
 /// The library's defaults of the `zmux.Config` fields that hold values,
 /// the one source of the Python defaults; `liveness` the defaults of
 /// `zmux.Liveness`.
-#[pyfunction]
-fn _config_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
+#[pyfunction(name = "_config_defaults")]
+fn config_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     let c = zmux::Config::default();
     let d = PyDict::new(py);
     d.set_item("handshake_timeout", dur(c.handshake_timeout))?;
@@ -723,8 +723,8 @@ fn _config_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
 
 /// The library's defaults of the `zmux.ListenerConfig` fields that hold
 /// values, the one source of the Python defaults.
-#[pyfunction]
-fn _listener_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
+#[pyfunction(name = "_listener_defaults")]
+fn listener_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     let l = zmux::ListenerConfig::default();
     let d = PyDict::new(py);
     d.set_item("max_pending", l.max_pending)?;
@@ -2355,7 +2355,7 @@ fn dial_exchange<'p>(
     carrier_credential: Option<Bound<'_, PyAny>>,
 ) -> PyResult<Bound<'p, PyAny>> {
     let addr = hostport(&host, port);
-    let mut opts = options.map(|o| o.0.clone()).unwrap_or_default();
+    let mut opts = options.map_or_else(Default::default, |o| o.0.clone());
     if let Some(c) = admission::carrier_credential(carrier_credential)? {
         opts = opts.with_carrier_credential(c);
     }
@@ -5422,11 +5422,11 @@ impl Drop for Listener {
     }
 }
 
-#[pymodule(gil_used = false)]
-fn _zmux(m: &Bound<'_, PyModule>) -> PyResult<()> {
+#[pymodule(name = "_zmux", gil_used = false)]
+fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     rt::register(m)?;
     m.add_class::<Config>()?;
-    m.add_function(wrap_pyfunction!(_config_defaults, m)?)?;
+    m.add_function(wrap_pyfunction!(config_defaults, m)?)?;
     m.add_class::<shaping::ShapingBundle>()?;
     m.add_class::<shaping::InstalledShaper>()?;
     m.add_class::<TlsConfig>()?;
@@ -5445,7 +5445,7 @@ fn _zmux(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(classify_first_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(join_prefix, m)?)?;
     m.add_function(wrap_pyfunction!(join_ready, m)?)?;
-    m.add_function(wrap_pyfunction!(_listener_defaults, m)?)?;
+    m.add_function(wrap_pyfunction!(listener_defaults, m)?)?;
     m.add_class::<Http2Connection>()?;
     m.add_class::<ExchangeOptions>()?;
     admission::register(m)?;
