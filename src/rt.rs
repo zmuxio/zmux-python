@@ -414,25 +414,25 @@ fn sock_of(s: &Bound<'_, PyAny>) -> PyResult<Sock> {
     }
     #[cfg(windows)]
     {
-        use std::os::windows::io::FromRawSocket;
-        let fd: u64 = s.call_method0("detach")?.extract()?;
+        use std::os::windows::io::{FromRawSocket, RawSocket};
+        let fd: RawSocket = s.call_method0("detach")?.extract()?;
         // SAFETY: `detach` hands over the socket, open and owned by nobody else.
         Ok(unsafe { Sock::from_raw_socket(fd) })
     }
 }
 
 /// The descriptor of a socket.
-fn sock_fd(rx: &Sock) -> u64 {
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        u64::try_from(rx.as_raw_fd()).expect("an open descriptor")
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::AsRawSocket;
-        rx.as_raw_socket()
-    }
+#[cfg(unix)]
+fn sock_fd(rx: &Sock) -> i32 {
+    use std::os::fd::AsRawFd;
+    rx.as_raw_fd()
+}
+
+/// The descriptor of a socket.
+#[cfg(windows)]
+fn sock_fd(rx: &Sock) -> std::os::windows::io::RawSocket {
+    use std::os::windows::io::AsRawSocket;
+    rx.as_raw_socket()
 }
 
 /// `asyncio.get_running_loop()`.
