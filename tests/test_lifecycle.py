@@ -210,10 +210,28 @@ async def test_a_read_cancelled_as_it_completes_loses_nothing() -> None:
         assert got == sent
 
 
+def release_while_loop_is_blocked(held: list[object]) -> None:
+    """Drops `held` and collects on another thread while this one, the
+    event loop's, blocks and cannot run a callback. A finalizer that waited
+    for the loop (or for the session to answer through it) would never
+    return, so the join times out: a deterministic failure, and no pass
+    depends on how fast the collection is."""
+    import gc
+    import threading
+
+    def work() -> None:
+        held.clear()
+        gc.collect()
+
+    t = threading.Thread(target=work)
+    t.start()
+    t.join(30)
+    assert not t.is_alive(), "a finalizer waits for the event loop"
+
+
 async def test_dropped_streams_are_released_after_pipe_0_went() -> None:
     # A finalizer only lets go of the handle: the session collects the stream, promptly,
     # whatever pipe carries it.
-    import gc
     import time
 
     key = b"lifecycle-drops-0123456789abcdef"
@@ -231,12 +249,9 @@ async def test_dropped_streams_are_released_after_pipe_0_went() -> None:
                 await send.write(b"unfinished")
                 ssend, srecv = await asyncio.wait_for(server.accept_bi(), 5)
                 assert await asyncio.wait_for(srecv.read(10), 5) == b"unfinished"
-                begun = time.monotonic()
+                held = [send, recv, ssend, srecv]
                 del send, recv, ssend, srecv
-                gc.collect()
-                # A finalizer that waited would take seconds; a full collection
-                # on a slow free-threaded runner alone takes a few hundred ms.
-                assert time.monotonic() - begun < 1.0
+                release_while_loop_is_blocked(held)
                 deadline = time.monotonic() + 3
                 while client.stats().streams_active + server.stats().streams_active:
                     assert time.monotonic() < deadline, "streams still active"
