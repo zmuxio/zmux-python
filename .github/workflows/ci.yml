@@ -66,7 +66,7 @@ jobs:
         run: python -m mypy.stubtest zmux --allowlist tests/stubtest-allowlist.txt
 
   test:
-    name: Test (${{ matrix.os }}, Python ${{ matrix.python }})
+    name: Test (${{ matrix.os }}, Python ${{ matrix.python }}${{ matrix.arch && format(', {0}', matrix.arch) || '' }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -79,30 +79,35 @@ jobs:
         include:
           - { os: ubuntu-latest, python: '3.13' }
           - { os: ubuntu-latest, python: '3.14' }
+          # 32-bit Windows, as the release builds it; the x64 runner runs the
+          # x86 interpreter, so the wheel is tested natively.
+          - { os: windows-latest, python: '3.12', arch: x86, target: i686-pc-windows-msvc }
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
         id: py
         with:
           python-version: ${{ matrix.python }}
+          architecture: ${{ matrix.arch || '' }}
       - name: Install Rust
         shell: bash
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
+          if [[ -n "${{ matrix.target }}" ]]; then rustup target add "${{ matrix.target }}"; fi
       - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: test-${{ runner.os }}-${{ matrix.python }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: test-${{ runner.os }}-${{ matrix.python }}-
+          key: test-${{ runner.os }}-${{ matrix.arch }}-${{ matrix.python }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: test-${{ runner.os }}-${{ matrix.arch }}-${{ matrix.python }}-
       - name: Build the wheel
         shell: bash
         run: |
           python -m pip install "maturin>=1.16,<2"
-          maturin build --release --locked --out dist -i "${{ steps.py.outputs.python-path }}"
+          maturin build --release --locked --out dist -i "${{ steps.py.outputs.python-path }}" ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
       - name: Install and test
         shell: bash
         run: |
