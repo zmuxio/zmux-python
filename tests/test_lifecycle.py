@@ -234,7 +234,9 @@ async def test_dropped_streams_are_released_after_pipe_0_went() -> None:
                 begun = time.monotonic()
                 del send, recv, ssend, srecv
                 gc.collect()
-                assert time.monotonic() - begun < 0.1
+                # A finalizer that waited would take seconds; a full collection
+                # on a slow free-threaded runner alone takes a few hundred ms.
+                assert time.monotonic() - begun < 1.0
                 deadline = time.monotonic() + 3
                 while client.stats().streams_active + server.stats().streams_active:
                     assert time.monotonic() < deadline, "streams still active"
