@@ -1284,7 +1284,7 @@ fn exporter_of(
     lp: rt::LoopRef,
 ) -> impl Fn(
     zmux::ExportRequest,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<Vec<u8>>> + Send>>
+) -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<Vec<u8>>> + Send>>
 + Send
 + Sync
 + 'static {
@@ -2147,7 +2147,7 @@ impl QuicClient {
         let qc =
             zmux_quinn::client_config(client_tls(tls).client_zmux()?, &opts).map_err(value_err)?;
         let bind: SocketAddr = hostport(&bind.0, bind.1).parse().map_err(value_err)?;
-        let _g = crate::rt::runtime()?.enter();
+        let _g = rt::runtime()?.enter();
         let mut ep = quinn::Endpoint::client(bind).map_err(io_err)?;
         ep.set_default_client_config(qc);
         Ok(QuicClient { ep, opts, memory })
@@ -5156,9 +5156,7 @@ fn join_prefix<'p>(
         J::NotJoin => ("not_join", 0),
         J::Need(n) => ("need_more", n),
         other => {
-            return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                "{other:?}"
-            )));
+            return Err(PyValueError::new_err(format!("{other:?}")));
         }
     };
     Ok((typed(py, "JoinPrefix", name.to_owned()), need))
@@ -5340,7 +5338,7 @@ impl Listener {
             l.session_config = Some(session_config_fn(f, lp.clone()));
         }
         let config = cfg(config)?;
-        let _g = crate::rt::runtime()?.enter();
+        let _g = rt::runtime()?.enter();
         Ok(Listener {
             inner: zmux::Listener::new(config, l).map_err(connect_err)?,
             tasks: Arc::new(StdMutex::new(Some(Vec::new()))),

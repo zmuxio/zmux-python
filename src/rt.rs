@@ -468,7 +468,7 @@ impl<'py> IntoPyObject<'py> for Deferred {
     type Output = Bound<'py, PyAny>;
     type Error = PyErr;
     fn into_pyobject(self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        (self.0)(py).map(|o| o.into_bound(py))
+        self.0(py).map(|o| o.into_bound(py))
     }
 }
 
@@ -498,7 +498,7 @@ where
     F: FnOnce(Python<'_>) -> PyErr + Send + Sync,
 {
     fn arguments(self, py: Python<'_>) -> Py<PyAny> {
-        (self.0)(py).into_value(py).into_any()
+        self.0(py).into_value(py).into_any()
     }
 }
 
@@ -709,7 +709,7 @@ impl Begin {
     }
 }
 
-static DRIVE: pyo3::sync::PyOnceLock<Py<PyAny>> = pyo3::sync::PyOnceLock::new();
+static DRIVE: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
 
 /// The coroutine function that awaits an operation. A cancellation that reaches its task
 /// after the result was set gives the result to `undo`; what the operation held is let go

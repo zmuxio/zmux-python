@@ -440,7 +440,7 @@ impl MaintainHandle {
 /// Keeps `pool`'s pipes of `session` up; called with a running event loop,
 /// on which the pool's `dial` runs.
 pub(crate) fn maintain(py: Python<'_>, s: &Session, pool: &PipePool) -> PyResult<MaintainHandle> {
-    let lp = crate::rt::LoopRef::current(py).map_err(|_| {
+    let lp = LoopRef::current(py).map_err(|_| {
         crate::new_err(
             "NoRunningLoopError",
             "maintain_pipes needs a running event loop",
