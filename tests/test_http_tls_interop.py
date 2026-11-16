@@ -4,7 +4,6 @@ Bound at both ends. Skipped when the peer is not set."""
 
 import asyncio
 import os
-import socket
 
 import pytest
 import zmux
@@ -21,16 +20,17 @@ async def ping(session: zmux.Session) -> bytes:
 
 @pytest.mark.skipif(not PEER, reason="ZMUX_GO_HTTP_PEER not set")
 async def test_bound_join_with_go_over_http2_tls() -> None:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
     proc = await asyncio.create_subprocess_exec(
-        PEER, "server", "tls2", f"127.0.0.1:{port}", stdout=asyncio.subprocess.PIPE
+        PEER, "server", "tls2", "127.0.0.1:0", stdout=asyncio.subprocess.PIPE
     )
     assert proc.stdout is not None
     try:
         async with asyncio.timeout(20):
-            assert (await proc.stdout.readline()).strip() == b"READY"
+            # The peer binds a free port and prints `READY <address>`.
+            ready = (await proc.stdout.readline()).split()
+            assert len(ready) == 2
+            assert ready[0] == b"READY"
+            port = int(ready[1].rsplit(b":", 1)[1])
             cfg = zmux.Config(
                 max_pipes=4, pipe_auth=zmux.PipeAuth.psk(b"\x07" * 32).with_end_to_end()
             )

@@ -5,10 +5,17 @@ pipe input (`pipe_from_streams`)."""
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from typing import Any
 
-from ._errors import IncompleteReadError, StreamClosedError, ZmuxError
+from ._errors import (
+    IncompleteReadError,
+    LimitExceededError,
+    StreamBusyError,
+    StreamClosedError,
+    ZmuxError,
+)
+from ._types import ErrorKind
 from ._zmux import PipeIo, RecvStream, SendStream, UnsentCount, pipe_pair
 
 _DEFAULT_LIMIT = 1 << 16
@@ -166,8 +173,8 @@ class StreamPairWriter:
 
     async def _flush(self) -> None:
         while self._buf:
-            # The queued bytes go as they are, without a copy: new writes
-            # queue in a fresh buffer meanwhile.
+            # The write copies the queued bytes once: new writes queue in a
+            # fresh buffer meanwhile.
             data, self._buf = self._buf, bytearray()
             try:
                 await self.stream.write(data)
@@ -259,6 +266,98 @@ class StreamPairWriter:
         return default
 
 
+async def _read(recv: RecvStream, n: int, view: bool) -> bytes | memoryview:
+    """`RecvStream.read` and `read_chunk`: the only await waits for
+    readiness and takes nothing, and the take is synchronous, so a
+    cancellation never lands after bytes were taken."""
+    while True:
+        b = recv._take(n, view)
+        if b is not None:
+            return b
+        await recv._readable()
+
+
+async def _collect(recv: RecvStream, want: int) -> list[bytes]:
+    """Chunks until they hold `want` bytes or the stream ends. On a
+    cancellation or an error what they took goes back to the stream."""
+    parts: list[bytes] = []
+    have = 0
+    try:
+        while have < want:
+            b = recv._take(want - have, False)
+            if b is None:
+                await recv._readable()
+                continue
+            if not b:
+                break
+            parts.append(bytes(b))
+            have += len(b)
+    except BaseException:
+        recv._put_back(parts)
+        raise
+    return parts
+
+
+async def _read_exact(recv: RecvStream, n: int) -> bytes:
+    """`RecvStream.read_exact`."""
+    data = b"".join(await _collect(recv, n))
+    if len(data) < n:
+        e = IncompleteReadError(data, n)
+        e.kind = ErrorKind.FINISHED_EARLY
+        raise e
+    return data
+
+
+async def _read_to_end(recv: RecvStream, limit: int) -> bytes:
+    """`RecvStream.read_to_end`; what it read stays in the stream when the
+    stream is longer than `limit`."""
+    parts = await _collect(recv, limit + 1)
+    if sum(map(len, parts)) > limit:
+        recv._put_back(parts)
+        e = LimitExceededError("stream longer than the limit")
+        e.kind = ErrorKind.TOO_LONG
+        raise e
+    return b"".join(parts)
+
+
+async def _anext(recv: RecvStream) -> bytes:
+    """`RecvStream.__anext__`."""
+    b = await _read(recv, 65536, False)
+    if not b:
+        raise StopAsyncIteration
+    return bytes(b)
+
+
+async def _write_some(send: SendStream, data: Any) -> int:
+    """`SendStream.write_some`: the only await waits for write readiness and
+    takes nothing, and the write itself is synchronous, so a cancellation never
+    lands after bytes were taken."""
+    if not memoryview(data).nbytes:
+        return 0
+    while True:
+        try:
+            n = send.try_write(data)
+        except StreamBusyError:
+            n = 0
+        if n:
+            return n
+        await send.writable()
+
+
+async def _writev(send: SendStream, buffers: list[Any]) -> int:
+    """`SendStream.writev`, as `_write_some`."""
+    if not any(memoryview(b).nbytes for b in buffers):
+        return 0
+    while True:
+        try:
+            n = send.try_writev(buffers)
+        except StreamBusyError:
+            n = 0
+        if n:
+            return n
+        await send.writable()
+
+
 def _retrieve(task: asyncio.Future[None]) -> None:
     # The writer keeps a failed send's error and raises it itself.
     if not task.cancelled():
@@ -281,7 +380,8 @@ def pipe_from_streams(
     writer: asyncio.StreamWriter,
     *,
     max_record: int | None = None,
-    exporter: Callable[[str, bytes, int], bytes | None] | None = None,
+    exporter: Callable[[str, bytes, int], Awaitable[bytes | None] | bytes | None]
+    | None = None,
 ) -> PipeIo:
     """A pipe input over an asyncio stream pair. Bytes cross into Python and
     back, so this is slower than the built-in carriers; use it for
@@ -290,8 +390,8 @@ def pipe_from_streams(
     go; the end of `reader` ends only the inbound direction. The
     transport's `get_write_buffer_size()`, where it has one, is the
     carrier's unsent count, taken at each write and drain. `max_record` is
-    the largest record plaintext the carrier takes (at least 1), applied
-    beside the peer's `max_record_size`; `exporter(label, context, length)`
+    the largest record plaintext the carrier takes (`PipeIo.set_max_record`:
+    at least 8192, no upper bound); `exporter(label, context, length)`
     is the exporter of the carrier's innermost end-to-end handshake (see
     `pipe_pair`)."""
     size = getattr(writer.transport, "get_write_buffer_size", None)

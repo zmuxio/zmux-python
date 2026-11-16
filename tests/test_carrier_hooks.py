@@ -151,9 +151,11 @@ async def test_python_exporter_on_both_sides() -> None:
             await zmux.Session.connect(pipe, config=cfg) as c,
             await listener.accept() as s,
         ):
-            got = c.export_keying_material("app", context=b"c", length=8)
-            assert got == s.export_keying_material("app", context=b"c", length=8)
-            assert got == b"appc" + bytes(4)
+            # An exporter answering later holds zmux's own labels only.
+            with pytest.raises(zmux.ExportError):
+                c.export_keying_material("app", context=b"c", length=8)
+            with pytest.raises(zmux.ExportError):
+                s.export_keying_material("app", context=b"c", length=8)
             with pytest.raises(zmux.ExportError) as e:
                 c.export_keying_material(zmux.adapter.RESERVED_EXPORTER_PREFIX + "x")
             assert e.value.kind == zmux.ErrorKind.RESERVED_LABEL

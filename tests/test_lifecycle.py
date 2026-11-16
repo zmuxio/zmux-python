@@ -39,30 +39,6 @@ def run_bounded(body: str) -> None:
     assert r.returncode == 0, r.stderr[-2000:]
 
 
-def test_record_policy_may_ask_the_session() -> None:
-    run_bounded(
-        """
-        import asyncio
-        import zmux
-        held = {}
-        def policy(carrier):
-            held["s"].stats()
-            return zmux.RecordMode.SEALED
-        async def main():
-            auth = zmux.PipeAuth.psk(b"k" * 32)
-            server = zmux.Config(max_pipes=4, pipe_auth=auth.with_end_to_end())
-            client = zmux.Config(max_pipes=4, pipe_auth=auth, record_policy=policy)
-            async with zmux.Listener(config=server) as l:
-                addr = await l.serve_tcp("127.0.0.1", 0)
-                async with await zmux.Session.connect(await zmux.dial_tcp(*addr), config=client) as s:
-                    held["s"] = s
-                    s.declare_end_to_end()
-                    await s.add_pipe(await zmux.dial_tcp(*addr))
-        asyncio.run(main())
-        """
-    )
-
-
 def test_a_lent_buffer_is_released_clear_of_the_session() -> None:
     # The peer's acknowledgements free chunks under the session's lock while this thread,
     # holding the interpreter, asks the session again and again.

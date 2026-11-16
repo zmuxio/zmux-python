@@ -2,7 +2,6 @@
 //! carried over a bidirectional stream as stream datagrams or DATAGRAM
 //! capsules.
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use bytes::Bytes;
@@ -13,8 +12,9 @@ use pyo3::types::{PyBytes, PyDict};
 use tokio::sync::Mutex;
 use zmux::helpers as h;
 
-use crate::rt::{attach, future_into_py, undoable_future_into_py};
-use crate::{Part, RecvStream, SendStream, held, raise, typed, types};
+use crate::helpers::lock;
+use crate::rt::{deferred, future_into_py, undoable_future_into_py};
+use crate::{Part, RecvStream, Returned, SendStream, held, raise, typed, types};
 
 /// `SendPolicy` by value.
 fn policy_of(s: &str) -> PyResult<h::SendPolicy> {
@@ -39,13 +39,12 @@ fn packet_err(e: h::PacketError) -> PyErr {
     match e {
         E::Stream(s) => crate::stream_err(s),
         E::Datagram(d) => crate::datagram_err(d),
-        E::TooLarge { max } => {
-            let err = raise("PacketTooLargeError", &e, false, None);
-            attach(|py| {
-                let _ = err.value(py).setattr("max", max);
-            });
-            err
-        }
+        E::TooLarge { max } => crate::rt::decorate(
+            raise("PacketTooLargeError", &e, false, None),
+            move |_, v| {
+                let _ = v.setattr("max", max);
+            },
+        ),
         E::InvalidContext => raise("InvalidArgumentError", &e, false, None),
         E::NotNegotiated => raise("NotNegotiatedError", &e, false, None),
         E::Malformed => raise(
@@ -142,12 +141,7 @@ impl<T: Counted> Half<T> {
     }
 
     fn stats(&self) -> h::PacketStats {
-        let last = || {
-            *self
-                .last
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        };
+        let last = || *lock(&self.last);
         match self.part.try_lock() {
             Ok(g) => g.as_ref().map_or_else(last, Counted::counters),
             Err(_) => last(),
@@ -155,10 +149,7 @@ impl<T: Counted> Half<T> {
     }
 
     fn record(&self, v: &T) {
-        *self
-            .last
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = v.counters();
+        *lock(&self.last) = v.counters();
     }
 }
 
@@ -178,7 +169,7 @@ fn send<'p>(
         tx.record(&g);
         drop(g);
         let s = r.map_err(packet_err)?;
-        Ok(attach(|py| sent_obj(py, s)))
+        Ok(deferred(move |py| Ok(sent_obj(py, s))))
     })
 }
 
@@ -192,45 +183,12 @@ fn close<'p>(py: Python<'p>, tx: &Half<h::PacketSender>) -> PyResult<Bound<'p, P
     })
 }
 
-/// Packets taken back from cancelled receives, for the next receive; one
-/// waiting for a new packet is woken to take them.
-#[derive(Default)]
-struct Back {
-    q: StdMutex<VecDeque<Py<PyAny>>>,
-    wake: tokio::sync::Notify,
-}
-
-impl Back {
-    fn pop(&self) -> Option<Py<PyAny>> {
-        self.q
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop_front()
-    }
-}
-
-/// Takes a packet back for the next receive.
-#[pyclass(frozen)]
-struct PacketRequeue(Arc<Back>);
-
-#[pymethods]
-impl PacketRequeue {
-    fn __call__(&self, value: Bound<'_, PyAny>) {
-        self.0
-            .q
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push_back(value.unbind());
-        self.0.wake.notify_one();
-    }
-}
-
 /// The receiving half and the packets taken back from cancelled receives,
 /// one queue for the stream and the receiver split from it.
 #[derive(Clone)]
 struct Rx {
     half: Half<h::PacketReceiver>,
-    back: Arc<Back>,
+    back: Arc<Returned<Py<PyAny>>>,
 }
 
 impl Rx {
@@ -246,7 +204,8 @@ impl Rx {
     /// arrived is returned again by the next call.
     fn recv<'p>(&self, py: Python<'p>, iter: bool) -> PyResult<Bound<'p, PyAny>> {
         let rx = self.clone();
-        let undo = Py::new(py, PacketRequeue(self.back.clone()))?.into_any();
+        let undo = self.back.undo(py)?;
+        let (back, wake) = (self.back.queue(), self.back.woken());
         undoable_future_into_py(
             py,
             async move {
@@ -254,39 +213,36 @@ impl Rx {
                 // A packet taken back while this waits is taken instead:
                 // the receive is cancel-safe and packets are unordered.
                 let got = loop {
-                    if let Some(v) = rx.back.pop() {
+                    if let Some(v) = lock(&back).pop_front() {
                         break Ok(v);
                     }
                     tokio::select! {
                         r = g.recv() => break Err(r),
-                        () = rx.back.wake.notified() => {}
+                        () = wake.notified() => {}
                     }
                 };
-                let r = match got {
-                    Ok(v) => Ok(Some(v)),
+                let got = match got {
+                    Ok(v) => Ok(v),
                     Err(r) => {
                         rx.half.record(&g);
-                        r.map_err(packet_err).and_then(|p| {
-                            attach(|py| match p {
-                                None => Ok(None),
-                                Some(p) => Ok(Some(
-                                    types(py)?
-                                        .getattr("Packet")?
-                                        .call1((p.context, PyBytes::new(py, &p.payload)))?
-                                        .unbind(),
-                                )),
-                            })
-                        })
+                        Err(r.map_err(packet_err)?)
                     }
                 };
                 drop(g);
-                attach(|py| match r? {
-                    Some(v) if !(iter && v.is_none(py)) => Ok((v, ())),
-                    _ if iter => Err(PyStopAsyncIteration::new_err(())),
-                    _ => Ok((py.None(), ())),
-                })
+                let v = deferred(move |py| match got {
+                    // Taken back: the end too, when its awaiter was cancelled.
+                    Ok(v) if iter && v.is_none(py) => Err(PyStopAsyncIteration::new_err(())),
+                    Ok(v) => Ok(v),
+                    Err(Some(p)) => Ok(types(py)?
+                        .getattr("Packet")?
+                        .call1((p.context, PyBytes::new(py, &p.payload)))?
+                        .unbind()),
+                    Err(None) if iter => Err(PyStopAsyncIteration::new_err(())),
+                    Err(None) => Ok(py.None()),
+                });
+                Ok((v, ()))
             },
-            Some(undo),
+            undo,
         )
     }
 }
@@ -356,8 +312,8 @@ impl PacketStream {
 
     fn split(&self) -> PyResult<(PacketSender, PacketReceiver)> {
         let (s, r) = (&self.tx.part, &self.rx.half.part);
-        let mut sg = s.try_lock().map_err(|_| crate::busy())?;
-        let mut rg = r.try_lock().map_err(|_| crate::busy())?;
+        let mut sg = crate::rt::when_free(|| s.try_lock()).map_err(|_| crate::busy())?;
+        let mut rg = crate::rt::when_free(|| r.try_lock()).map_err(|_| crate::busy())?;
         match (sg.take(), rg.take()) {
             (Some(s), Some(r)) => {
                 // The same queue of packets taken back: a receive started

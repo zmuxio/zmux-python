@@ -184,17 +184,17 @@ async def test_a_websocket_join_takes_over_from_the_first_pipe(
     assert listener.stats().joins == 1
 
 
-# The hook that fails is reported as unraisable, on purpose: the handshake goes on.
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
 async def test_a_server_credential_and_the_shaper() -> None:
     probe = Trusting()
-    calls: list[tuple[str, str]] = []
-
-    def shaper(v: zmux.shaping.HandshakeView) -> zmux.shaping.UnitPlan | None:
-        calls.append((v.handshake, v.message))
-        if v.message == "finish":
-            raise ValueError("no plan from a hook that fails")
-        return zmux.shaping.UnitPlan(pad_to=600, delay=0.001)
+    # Plans for the messages of the default (hybrid) Profiles.
+    shaper = zmux.shaping.ShapingBundle.from_json(
+        """{"tables":{"a":[[1,600,600]]},"kinds":{"default":[{"handshakes":
+        {"establish":{"hello":{"pad_to":{"t":"a"},"delay":1000},
+        "reply":{"pad_to":{"t":"a"}},"finish":{"pad_to":{"t":"a"}}}}}]}}"""
+    )
+    assert shaper.plan("default", "establish", "hello") == zmux.shaping.UnitPlan(
+        pad_to=600, delay=0.001
+    )
 
     gate = Gate()
     server = zmux.SecureServer(gate, NODE, shaper=shaper)
@@ -221,10 +221,6 @@ async def test_a_server_credential_and_the_shaper() -> None:
             assert peer.verdict.principal == zmux.Principal(
                 "static_key", peer.static_key
             )
-    # The default Profiles are hybrid, and their messages have a name of their own.
-    assert ("establish", "hello") in calls
-    assert ("establish", "reply") in calls
-    assert ("establish", "finish") in calls
 
 
 @pytest.mark.parametrize("profile", [1, 3, 4, 5])
@@ -317,11 +313,10 @@ async def test_a_refused_establish_goes_to_on_reject() -> None:
 async def test_record_policy_and_declare_end_to_end() -> None:
     seen: list[zmux.RecordPolicyInput] = []
 
-    def policy(c: zmux.RecordPolicyInput) -> zmux.RecordMode:
-        seen.append(c)
-        return zmux.RecordMode.TRUSTED
+    policy = zmux.RecordPolicy(default=zmux.RecordMode.TRUSTED)
 
     def allow(c: zmux.RecordPolicyInput, mode: zmux.RecordMode, peer: object) -> bool:
+        seen.append(c)
         return mode is zmux.RecordMode.TRUSTED
 
     auth = zmux.PipeAuth.psk(b"k" * 32)
@@ -346,25 +341,30 @@ async def test_record_policy_and_declare_end_to_end() -> None:
 
 
 async def test_a_secure_carrier_authorized_join_and_tracer() -> None:
-    seen: list[zmux.RecordPolicyInput] = []
     asked: list[int] = []
 
     class Trace(zmux.Tracer):
         def __init__(self) -> None:
             self.established_ = False
+            self.sessions: set[int] = set()
             self.events: list[zmux.Event] = []
 
-        def established(self) -> None:
+        def established(self, session: int) -> None:
             self.established_ = True
+            self.sessions.add(session)
 
-        def event(self, event: zmux.Event) -> None:
+        def event(self, session: int, event: zmux.Event) -> None:
+            self.sessions.add(session)
             self.events.append(event)
 
-    def policy(c: zmux.RecordPolicyInput) -> zmux.RecordMode:
-        seen.append(c)
-        return zmux.RecordMode.SEALED
+    # The secure carrier takes SEALED; TRUSTED, which the acceptor refuses,
+    # would fail the join.
+    policy = zmux.RecordPolicy(
+        default=zmux.RecordMode.TRUSTED, secure=zmux.RecordMode.SEALED
+    )
 
-    def authorize(pipe: int) -> bool:
+    async def authorize(pipe: int) -> bool:
+        await asyncio.sleep(0)
         asked.append(pipe)
         return True
 
@@ -383,16 +383,17 @@ async def test_a_secure_carrier_authorized_join_and_tracer() -> None:
             async with await zmux.connect_tcp(*addr, config=config) as session:
                 session.declare_end_to_end()
                 reader, writer = await asyncio.open_connection(*addr)
-                carrier = zmux.pipe_from_streams(reader, writer, max_record=4096)
+                carrier = zmux.pipe_from_streams(reader, writer, max_record=16384)
                 carrier.declare_secure()
                 extra = await session.add_pipe(carrier)
                 await extra.joined()
                 await round_trip(session)
                 assert session.multipath is zmux.Multipath.IN_USE
+                session_id = session.id
         server.cancel()
-    assert seen and seen[-1].secure
     assert asked == [extra.id]
     assert trace.established_
+    assert trace.sessions == {session_id}
     assert any(
         isinstance(e, zmux.PipeJoined) and e.pipe == extra.id for e in trace.events
     )
@@ -611,6 +612,26 @@ async def test_too_much_application_data_fails_and_none_is_unbounded() -> None:
                 max_app_data=None,
             )
             assert peer.app_data[0].data == b"x" * 300
+
+
+async def test_a_handshake_message_above_8192_bytes_is_refused_locally() -> None:
+    # The client's message 3 would exceed the 8192-byte handshake message
+    # floor: nothing is written and the caller's value is at fault.
+    server = zmux.SecureServer(Gate(), NODE, client_verifier=Judge())
+    async with zmux.Listener(
+        config=CONFIG, listener_config=zmux.ListenerConfig(secure_server=server)
+    ) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
+        async with asyncio.timeout(10):
+            with pytest.raises(zmux.InvalidArgumentError) as e:
+                await zmux.establish(
+                    await zmux.dial_tcp(*addr),
+                    verifier=Judge(),
+                    handle=HANDLE,
+                    psk=PSK,
+                    credential=(5, b"c" * 9000),
+                )
+            assert e.value.kind is zmux.ErrorKind.TOO_LARGE
 
 
 async def test_transcript_proofs_and_pq_authentication() -> None:

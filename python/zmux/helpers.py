@@ -17,6 +17,7 @@ from ._types import (
     SpliceEnd,
 )
 from ._zmux import (
+    MIN_RECHECK,
     MaintainHandle,
     PacketReceiver,
     PacketSender,
@@ -35,6 +36,7 @@ DEFAULT_MAX_PACKET = 65535
 
 __all__ = [
     "DEFAULT_MAX_PACKET",
+    "MIN_RECHECK",
     "DuplicateRule",
     "Forwarded",
     "Limiter",

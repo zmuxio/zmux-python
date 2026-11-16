@@ -6,13 +6,13 @@ use std::time::Duration;
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyString};
-use pyo3_async_runtimes::TaskLocals;
 use zmux::helpers::{PoolDecision, PoolView};
 
 use zmux_shaping::{MachinePoolPolicy, MemberDecision, PoolMember};
 
-use crate::rt::get_runtime;
-use crate::{Pipe, PipeIo, Session, options_obj, pipe_options};
+use crate::helpers::lock;
+use crate::rt::LoopRef;
+use crate::{Pipe, Session, options_obj, pipe_options};
 
 /// The JSON text of `json`: `str`, `bytes` or a `dict` (serialised).
 fn json_bytes(json: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
@@ -123,10 +123,7 @@ impl PoolPolicy {
             s => s.map(micros),
         };
         let mut out = MemberDecision::default();
-        self.0
-            .lock()
-            .unwrap()
-            .decide_members(failures, since, &ms, &mut out);
+        lock(&self.0).decide_members(failures, since, &ms, &mut out);
         Ok(PoolPolicyDecision {
             count: out.count.map(|c| usize::try_from(c).unwrap_or(usize::MAX)),
             dial_after: out.dial_after.map(secs),
@@ -217,10 +214,7 @@ struct Shared(Arc<StdMutex<MachinePoolPolicy>>);
 
 impl zmux::helpers::PoolPolicy for Shared {
     fn decide(&mut self, view: &PoolView<'_>, out: &mut PoolDecision) {
-        let mut p = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut p = lock(&self.0);
         zmux::helpers::PoolPolicy::decide(&mut *p, view, out);
     }
 }
@@ -367,48 +361,36 @@ impl PipePool {
         })
     }
 
-    fn native(&self, locals: TaskLocals) -> zmux::helpers::PipePool {
-        let locals = Arc::new(locals);
-        let report = locals.clone();
+    fn native(&self, lp: LoopRef) -> zmux::helpers::PipePool {
+        let report = lp.clone();
         let mut p = if let Some((choice, policy)) = &self.choice {
             let mut p = zmux::helpers::PipePool::choice(choice, policy)
                 .expect("checked when the pool was made");
             p.count = self.count;
             p
         } else if let Some(f) = self.join.clone() {
+            let lp = lp.clone();
             zmux::helpers::PipePool::join(self.count, move |s: zmux::Session, o| {
-                let (f, locals) = (f.clone(), locals.clone());
-                async move {
-                    let fut = crate::rt::attach(|py| {
-                        let coro = f.bind(py).call1((Session::new(s), options_obj(py, &o)?))?;
-                        crate::rt::into_future(&locals, coro)
-                    })
-                    .map_err(dial_err)?;
-                    let obj = fut.await.map_err(dial_err)?;
-                    crate::rt::attach(|py| {
+                let f = f.clone();
+                let call = lp.call(
+                    move |py| f.bind(py).call1((Session::new(s), options_obj(py, &o)?)),
+                    |v| {
                         let mut pipes = Vec::new();
-                        for p in obj.bind(py).try_iter()? {
+                        for p in v.try_iter()? {
                             pipes.push(p?.cast::<Pipe>()?.get().0.clone());
                         }
-                        Ok::<_, PyErr>(pipes)
-                    })
-                    .map_err(dial_err)
-                }
+                        Ok(pipes)
+                    },
+                );
+                async move { call.await.map_err(dial_err) }
             })
         } else {
             let f = self.dial.clone().expect("a dial or a join");
+            let lp = lp.clone();
             zmux::helpers::PipePool::new(self.count, move |_req: zmux::DialRequest| {
-                let (f, locals) = (f.clone(), locals.clone());
-                async move {
-                    let fut = crate::rt::attach(|py| {
-                        let coro = f.bind(py).call0()?;
-                        crate::rt::into_future(&locals, coro)
-                    })
-                    .map_err(dial_err)?;
-                    let obj = fut.await.map_err(dial_err)?;
-                    crate::rt::attach(|py| obj.bind(py).cast::<PipeIo>()?.get().take())
-                        .map_err(dial_err)
-                }
+                let f = f.clone();
+                let call = crate::helpers::call_pipe(&lp, move |py| f.bind(py).call0());
+                async move { call.await.map_err(dial_err) }
             })
         }
         .with_options(self.options.clone());
@@ -424,10 +406,10 @@ impl PipePool {
         if let Some(f) = self.decision_rejected.clone() {
             // Called on the event loop, as `dial` and `join` are.
             p = p.with_decision_rejected(move |reason: &str| {
-                crate::rt::attach(|py| {
-                    let lp = report.event_loop(py);
-                    if let Err(e) = lp.call_method1("call_soon_threadsafe", (f.bind(py), reason)) {
-                        e.write_unraisable(py, None);
+                let (f, reason) = (f.clone(), reason.to_owned());
+                report.post(move |py| {
+                    if let Err(e) = f.call1(py, (reason,)) {
+                        e.write_unraisable(py, Some(f.bind(py)));
                     }
                 });
             });
@@ -458,14 +440,14 @@ impl MaintainHandle {
 /// Keeps `pool`'s pipes of `session` up; called with a running event loop,
 /// on which the pool's `dial` runs.
 pub(crate) fn maintain(py: Python<'_>, s: &Session, pool: &PipePool) -> PyResult<MaintainHandle> {
-    let locals = pyo3_async_runtimes::tokio::get_current_locals(py).map_err(|_| {
+    let lp = crate::rt::LoopRef::current(py).map_err(|_| {
         crate::new_err(
             "NoRunningLoopError",
             "maintain_pipes needs a running event loop",
         )
     })?;
-    let p = pool.native(locals);
-    let _g = get_runtime().enter();
+    let p = pool.native(lp);
+    let _g = crate::rt::runtime()?.enter();
     Ok(MaintainHandle(
         zmux::helpers::maintain_pipes(&s.0, p).map_err(crate::connect_err)?,
     ))

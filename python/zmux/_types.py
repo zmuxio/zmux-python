@@ -384,10 +384,26 @@ class RejectInfo:
     source: tuple[str, int] | None
 
 
+@dataclass(frozen=True, kw_only=True)
+class RecordPolicy:
+    """How a joiner chooses the record mode of a pipe it adds
+    (`Config.record_policy`), when the pipe's options name none: the mode
+    `by_label` gives the pipe's label, else `secure` for a carrier declared
+    secure (`PipeIo.declare_secure`) when given, else `default`. It is data,
+    chosen in the call that adds the pipe; an unmanaged mode raises
+    `ValueError` when the `Config` is made."""
+
+    default: RecordMode | str = RecordMode.SEALED
+    secure: RecordMode | str | None = None
+    by_label: Mapping[str, RecordMode | str] = field(default_factory=dict, hash=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "by_label", dict(self.by_label))
+
+
 @dataclass(frozen=True, slots=True)
 class RecordPolicyInput:
-    """What `Config.record_policy` and `Config.allow_record_mode` know of a
-    carrier."""
+    """What `Config.allow_record_mode` knows of a carrier."""
 
     has_exporter: bool
     secure: bool
@@ -1260,8 +1276,9 @@ class ShapingLimits:
 
 @dataclass(frozen=True, kw_only=True)
 class ShapingBudget:
-    """What a shaping configuration allows for a session (`Config(shaping_budget=...)`, a
-    callable returning this, called once per session). It cannot widen `ShapingLimits`."""
+    """What a shaping configuration allows for a session (`Config(shaping_budget=...)`,
+    the same for every session; a `ShapingBundle` draws one per session). It cannot
+    widen `ShapingLimits`."""
 
     wire: ShapingAccount = ShapingAccount()
     """What injections may spend."""
@@ -1283,15 +1300,6 @@ class UnitPlan:
     pad_multiple: int = 0
     pad: int = 0
     delay: float = 0.0
-
-
-@dataclass(frozen=True, kw_only=True)
-class HandshakeView:
-    """What a handshake shaper is told of a message: never a size."""
-
-    kind: CarrierKind | None
-    handshake: str
-    message: str
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1579,35 +1587,56 @@ class Backoff:
 class CapacityFloor:
     """The floor under the session's outbound capacity in bytes per second:
     `CapacityBelow` once below `rate`, `CapacityRestored` once back above
-    `rate * rate_ratio` (a ratio below 1 counts as 1; a negative or NaN one
-    raises `ValueError`)."""
+    `rate * recovery_ratio` (0 for the default, 1.25; else at least 1: any
+    other value, NaN included, raises `ValueError`)."""
 
     rate: int
-    rate_ratio: float = 1.25
+    recovery_ratio: float = _zmux._DEFAULT_RECOVERY_RATIO
 
     def __post_init__(self) -> None:
-        if not self.rate_ratio >= 0:
-            raise ValueError("rate_ratio is a non-negative number")
+        # `inf` passes on purpose, as in the Rust crate: a floor that, once
+        # crossed, is never reported restored. The default reads 1.25, the
+        # value 0 stands for, so both mean the same.
+        if not (self.recovery_ratio == 0 or self.recovery_ratio >= 1):
+            raise ValueError("recovery_ratio is 0 (the default) or at least 1")
 
 
 class Limiter(Protocol):
-    """A rate limiter of a splice direction (`zmux.splice(a_to_b=...)`):
-    `ready(least, most)` waits until it allows at least `least` bytes (or
-    its burst) and returns how many, at most `most`; `try_ready(most)` is
-    the allowance now; `charge(n)` accounts for `n` bytes forwarded. The
-    parameters are positional-only, so an implementation names them freely.
-    An exception allows nothing."""
+    """A rate limiter of a splice direction (`zmux.splice(a_to_b=...)`),
+    reserve then refund, in bytes. `acquire(min, max)` waits until it can
+    grant and takes and returns n bytes, `min <= n <= max` (or fewer than
+    `min` when its burst never allows `min` at once); `try_acquire(min,
+    max)` does the same without waiting, or returns 0 with nothing taken;
+    `refund(n)` gives back `n` bytes granted and not forwarded. The binding
+    calls them with `1 <= min <= max` only, and never with `max` 0: an empty
+    datagram passes without a call. `(n, n)` asks for a whole capsule or
+    datagram; a grant then lets all of it pass.
 
-    async def ready(self, least: int, most: int, /) -> int:
-        """Waits for an allowance of `least..=most` bytes."""
+    Each runs on the event loop of the splice and must not block; `acquire`
+    may also be a plain method. The binding holds what it took until the
+    direction forwards it: answering a datagram at once, it takes the
+    shortfall with `try_acquire` for the datagrams that follow (so the first
+    one after the allowance ran out is dropped), and what it holds when the
+    splice ends goes back with `refund`. The parameters are positional-only,
+    so an implementation names them freely.
+
+    A limiter that fails is reported as unraisable: an `acquire` that raises
+    or grants anything but an int in `1..=max` ends the direction with
+    `SpliceEnd.LIMITER_FAILED`; a `try_acquire` that raises grants nothing;
+    a `refund` that raises changes nothing. A grant above `max` is refunded
+    at once."""
+
+    async def acquire(self, min: int, max: int, /) -> int:
+        """Waits for a grant of `min..=max` bytes and takes it."""
         ...
 
-    def try_ready(self, most: int, /) -> int:
-        """The allowance now, at most `most`; 0 when it would wait."""
+    def try_acquire(self, min: int, max: int, /) -> int:
+        """Takes a grant of `min..=max` bytes now; 0, taking nothing, when
+        it would wait."""
         ...
 
-    def charge(self, n: int, /) -> None:
-        """Accounts for `n` bytes."""
+    def refund(self, n: int, /) -> None:
+        """Gives back `n` bytes granted and not forwarded; never raises."""
         ...
 
 
@@ -1621,6 +1650,9 @@ class SpliceEnd(_Enum):
     DOWNSTREAM_LOST = "downstream_lost"
     CANCELLED = "cancelled"
     """Aborted with `SpliceAbort`; `Forwarded.code` is its code."""
+    LIMITER_FAILED = "limiter_failed"
+    """The direction's limiter failed (see `Limiter`): the downstream part
+    was reset and the upstream part stopped with `ZMUX_CANCELLED`."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1757,23 +1789,27 @@ class KeyAlg(enum.IntEnum):
 class Tracer:
     """`Config(tracer=...)`: observes a session's events without taking them
     from `Session.events()`. Subclass it and override what you need; each
-    method runs in order, serially per session, on a native thread holding
-    the GIL (quick, not blocking), and an exception is reported as
-    unraisable."""
+    method runs on the `Config`'s event loop, in order
+    (every session of the `Config` tells the one tracer, each session's
+    calls in its own order), and an exception is reported as unraisable.
+    The calls wait for the loop in a queue of `Config.hook_queue` entries:
+    past it the oldest are dropped and counted in the next `dropped`."""
 
-    def established(self) -> None:
-        """The session was established."""
+    def established(self, session: int) -> None:
+        """The session `session` (its `Session.id`) was established."""
 
-    def event(self, event: Event) -> None:
+    def event(self, session: int, event: Event) -> None:
         """A session event."""
 
-    def dropped(self, count: int) -> None:
-        """`count` events were dropped since the previous call, before the
-        next delivered."""
+    def dropped(self, session: int | None, count: int) -> None:
+        """`count` calls were dropped before the next one delivered: of the
+        session `session` (its tracer backlog was full), or, for `None`,
+        of any session and the logger's messages (the queue to the event
+        loop was full, or the loop closed)."""
 
-    def closed(self, reason: BaseException) -> None:
+    def closed(self, session: int, reason: BaseException) -> None:
         """The session ended, with the reason (the error `Session` calls
-        raise from then on); nothing follows."""
+        raise from then on); nothing of it follows."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1794,6 +1830,9 @@ class Config:
     at least 16 KiB), `max_connection_receive_window` (`AUTO`, or a fixed
     cap), `memory_budget` (1 GiB; `None`: unlimited), `send_buffer` (4
     MiB), `send_buffer_max` (`AUTO`, or a fixed maximum).
+    `max_send_record` (16382, one TLS record) is the largest Frames field
+    of the records this endpoint sends before the peer's `max_record_size`
+    caps it: at least 8192, the carrier record floor, with no upper bound.
 
     Streams: `max_incoming_streams` (256; 0: the peer may open none, else at
     least 4 and at most `MAX_STREAM_CREDIT`), `max_incoming_uni_streams`
@@ -1816,8 +1855,18 @@ class Config:
     `None`: no first batch). `resume_timeout` (`None`: off; else at least
     0.001) with `redial`, an async callable given the direction that
     returns the `PipeIo` replacing a lost pipe, with the backoff
-    `redial_backoff` (a `Backoff`: 1 s doubling up to 60 s, jitter 0.2); a
-    `Config` with `redial` is made inside a running event loop.
+    `redial_backoff` (a `Backoff`: 1 s doubling up to 60 s, jitter 0.2).
+
+    Every Python hook of a `Config` runs on one event loop: the one running
+    when the `Config` is made, else the one running when it is first used
+    (given to a connect, a `Listener`, a `session_config` answer); it stays
+    bound to that loop while the loop is open. What reaches a hook before
+    then waits for it. Once that loop closes (the end of an `asyncio.run`),
+    what reaches a hook is answered at once without it: a deciding hook
+    refuses, a call such as `redial` fails, and the events of `logger` and
+    `tracer` are dropped and counted (`Tracer.dropped(None, n)`, or a
+    warning to the logger, before the next event delivered). The next use
+    from a running loop binds the `Config` to that loop.
 
     Scheduling: `scheduler` (`Scheduler.AFFINITY`), `spread_chunk`,
     `probation` (`AUTO`, derived from the pipe's RTT; `None` off; else the
@@ -1832,15 +1881,24 @@ class Config:
     `Session.release_first_flight()` or the handshake timeout.
 
     Security: `session_crypto` (`SessionCrypto.LOCAL`), `epoch_policy`
-    (`EpochPolicy()`), `record_policy(input)` choosing a joined pipe's
-    record mode and `allow_record_mode(input, mode, admitted)` admitting
+    (`EpochPolicy()`), `record_policy` (a `RecordPolicy`; `None`: sealed)
+    choosing a joined pipe's record mode and `allow_record_mode(input, mode, admitted)` admitting
     it, `authorize_join(pipe_id)` (on an acceptor, a further check of a
     join after its authentication and record mode: falsy or an exception
-    refuses it). These run on a native thread holding the GIL.
+    refuses it), and `allow_connection_window_increase(increase)` (when
+    given, the session receive window grows only by increases it approves:
+    falsy or an exception refuses). `allow_record_mode`, `authorize_join`
+    and `allow_connection_window_increase` may be `async`; they run on the
+    `Config`'s event loop and are cancelled when the join's deadline or the
+    session ends, which refuses.
 
     Hooks: `protocols`, the application protocols offered; `logger` (a
     `logging.Logger`) receives zmux's warnings; `tracer` (a `Tracer`)
-    receives every event in order beside the event stream;
+    receives every event in order beside the event stream. Both run on the
+    `Config`'s event loop, never on the library's threads: what
+    they are told waits for the loop in a queue of `hook_queue` (1024, at
+    least 1) entries, past which the oldest is dropped (`Tracer.dropped`,
+    or a warning to `logger`);
     `shaping_limits`, `shaping_budget`, `shaping` (definitions by carrier
     kind, `None` key the default), `shaping_by_variant` (by carrier variant,
     first), `handshake_shaper` and `shaping_bundle`. A hook left at `None`
@@ -1869,6 +1927,7 @@ class Config:
     datagram_stream_bytes: int | None = _DEFAULTS["datagram_stream_bytes"]
     send_buffer: int = _DEFAULTS["send_buffer"]
     send_buffer_max: int | Auto = AUTO
+    max_send_record: int = _DEFAULTS["max_send_record"]
     max_pipes: int = _DEFAULTS["max_pipes"]
     pipe_headroom: int = _DEFAULTS["pipe_headroom"]
     replay_window: int | Auto = AUTO
@@ -1887,22 +1946,26 @@ class Config:
     join_early_hello: int | None = _DEFAULTS["join_early_hello"]
     session_crypto: SessionCrypto = SessionCrypto.LOCAL
     epoch_policy: EpochPolicy = EpochPolicy()
-    record_policy: Callable[[RecordPolicyInput], RecordMode | str] | None = field(
+    record_policy: RecordPolicy | None = None
+    allow_record_mode: (
+        Callable[[RecordPolicyInput, RecordMode, Any], bool | Awaitable[bool]] | None
+    ) = field(default=None, compare=False)
+    authorize_join: Callable[[PipeId], bool | Awaitable[bool]] | None = field(
         default=None, compare=False
     )
-    allow_record_mode: Callable[[RecordPolicyInput, RecordMode, Any], bool] | None = (
+    allow_connection_window_increase: Callable[[int], bool | Awaitable[bool]] | None = (
         field(default=None, compare=False)
     )
-    authorize_join: Callable[[PipeId], bool] | None = field(default=None, compare=False)
     early_data: bool = False
     carrier_early_data: bool = False
     hold_first_flight: bool = False
     protocols: tuple[str, ...] | None = None
     logger: logging.Logger | None = field(default=None, repr=False, compare=False)
     tracer: Tracer | None = field(default=None, repr=False, compare=False)
+    hook_queue: int = _DEFAULTS["hook_queue"]
     shaping_limits: ShapingLimits = ShapingLimits()
-    shaping_budget: Callable[[], ShapingBudget] | None = None
-    handshake_shaper: Callable[[HandshakeView], UnitPlan | None] | None = field(
+    shaping_budget: ShapingBudget | None = None
+    handshake_shaper: ShapingBundle | None = field(
         default=None, repr=False, compare=False
     )
     shaping_bundle: ShapingBundle | None = field(
@@ -1980,25 +2043,34 @@ class ListenerConfig:
     after its admission and before its first record, each half of a split
     bootstrap included, and returns the carrier the listener goes on with
     (typically `await pipe.wrap(layer, server_side=True)`, or `pipe`
-    itself); `async`, it runs on the event loop of the listener's creation,
-    which must be running (`NoRunningLoopError` otherwise). It holds the
+    itself); `async`, it runs on the listener's event loop. It holds the
     carrier's source slot and `handshake_timeout` bounds it (then it is
     cancelled); the first-record timeout runs from its return. A carrier of
     another kind (other halves or framing), an exception or the bound closes
     the carrier as a setup failure; an exception other than a cancellation
     is reported as unraisable. `on_reject(info)` decides what happens to an
     unauthenticated carrier: an unknown Locator, a failed Hello, a refused
-    Establish. Nothing is sent either way. `secure_server` runs Establish on
+    Establish (it may be `async`; past the handshake timeout the carrier is
+    closed). Nothing is sent either way. Every Python hook of the
+    listener runs on its event loop: the one running when the `Listener` is
+    made, else the one running at its first use (`async with`, a `serve_*`,
+    `handle_pipe`, `accept`); an admission decider runs on the loop running
+    when the `Admission` is made, else on the listener's. Once that loop
+    closes, hooks are answered without it as for a `Config` (a decider
+    refuses at once), until a use from a running loop binds the listener
+    to that loop. `secure_server` runs Establish on
     every new carrier; it is a transform, so not together with
     `inbound_transform`. `session_config(carrier)` runs once for every
-    carrier that starts a session, never for a join, on a native thread
-    holding the GIL (quick, not blocking), and returns its `Config`, or
-    `None` for the listener's; joins verify with the session's own. The
+    carrier that starts a session, never for a join, and returns its
+    `Config`, or `None` for the listener's (or is `async` and resolves to
+    one within the handshake timeout); joins verify with the session's own. The
     listener's memory budget and carrier-level bounds stay its own. An
     invalid configuration, an exception or another value closes the carrier
     without a byte, counted as `rejected`. `logger` receives the failures of
     the listener's own callbacks that it contains; its sessions log through
-    their `Config.logger`."""
+    their `Config.logger`. `logger` and `on_memory_pressure` run on the
+    listener's event loop, through a queue of `hook_queue` (1024,
+    at least 1) entries past which the oldest is dropped."""
 
     max_pending: int | None = _LISTENER["max_pending"]
     max_pending_per_source: int = _LISTENER["max_pending_per_source"]
@@ -2022,14 +2094,16 @@ class ListenerConfig:
     inbound_transform: (
         Callable[[PipeIo, PipeHint], Awaitable[PipeIo] | PipeIo] | None
     ) = field(default=None, compare=False)
-    on_reject: Callable[[RejectInfo], RejectAction | str] | None = field(
-        default=None, compare=False
-    )
+    on_reject: (
+        Callable[[RejectInfo], RejectAction | str | Awaitable[RejectAction | str]]
+        | None
+    ) = field(default=None, compare=False)
     secure_server: SecureServer | None = field(default=None, compare=False)
-    session_config: Callable[[SessionCarrier], Config | None] | None = field(
-        default=None, compare=False
-    )
+    session_config: (
+        Callable[[SessionCarrier], Config | Awaitable[Config | None] | None] | None
+    ) = field(default=None, compare=False)
     logger: logging.Logger | None = field(default=None, repr=False, compare=False)
+    hook_queue: int = _LISTENER["hook_queue"]
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -2041,7 +2115,7 @@ class Shaper:
     definition is not shaped); not both. `limits` bounds the definitions,
     `seed` (for tests) makes every pipe draw the same deterministic sequence
     instead of the operating system's generator (never use it for real
-    traffic), and `budget`, called once at assignment, gives the spending
+    traffic), and `budget` is the spending
     budget. An invalid definition raises `ValueError` at assignment."""
 
     definition: str | None = None
@@ -2049,7 +2123,7 @@ class Shaper:
     by_variant: Mapping[str, str] | None = None
     limits: ShapingSizeLimits | None = None
     seed: bytes | None = None
-    budget: Callable[[], ShapingBudget] | None = None
+    budget: ShapingBudget | None = None
 
     def __post_init__(self) -> None:
         if self.definition is not None and (
@@ -2061,8 +2135,9 @@ class Shaper:
 @runtime_checkable
 class CarrierCredential(Protocol):
     """What a client presents to a server's admission on a new carrier, as
-    `carrier_credential=` of the `dial_*` functions (`PrefixAuth` is one). Called on
-    a native thread holding the GIL, once per carrier, after its handshake:
+    `carrier_credential=` of the `dial_*` functions (`PrefixAuth` is one). Called
+    once per carrier, after its handshake, on the library's thread that
+    dials (the one hook that runs there: it must be quick and not block):
     `info.export()` gives the exporter of that handshake for a bound
     credential. An exception fails the dial."""
 

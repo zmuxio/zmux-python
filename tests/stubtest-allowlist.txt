@@ -28,9 +28,10 @@ zmux\._zmux\.Signer
 zmux\._zmux\.Verifier
 
 # Native internals that are not API: the module's export list, the atexit
-# hook and the buffer exporter behind read_chunk's memoryview.
+# and fork hooks and the buffer exporter behind read_chunk's memoryview.
 zmux\._zmux\.__all__
 zmux\._zmux\._shutdown
+zmux\._zmux\._forked
 zmux\._zmux\.Chunk
 
 # PEP 695 `type` aliases and the NewType are TypeAliasType / callables at

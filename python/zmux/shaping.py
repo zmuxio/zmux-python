@@ -1,12 +1,11 @@
 """Traffic shaping: definitions, bundles, limits and budgets. A shaper is
 given to `Config` (`shaping`, `shaping_by_variant`, `shaping_bundle`,
-`shaping_limits`, `shaping_budget`, `handshake_shaper`) or assigned to
+`shaping_limits`, `shaping_budget`, `handshake_shaper`, all data) or assigned to
 `Session.shaper`."""
 
 from __future__ import annotations
 
 from ._types import (
-    HandshakeView,
     Shaper,
     ShapingAccount,
     ShapingBudget,
@@ -27,7 +26,6 @@ __all__ = [
     "DEFAULT_MAX_DELAY",
     "DEFAULT_MAX_SLOTS",
     "MIN_MAX_LEN",
-    "HandshakeView",
     "InstalledShaper",
     "Shaper",
     "ShapingAccount",

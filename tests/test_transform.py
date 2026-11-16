@@ -140,13 +140,27 @@ async def test_a_failing_transform_is_a_setup_failure() -> None:
                 await asyncio.sleep(0.01)
 
 
-def test_a_transform_needs_a_running_loop() -> None:
-    with pytest.raises(RuntimeError):
-        zmux.Listener(
-            listener_config=zmux.ListenerConfig(
-                inbound_transform=lambda pipe, hint: pipe
-            )
-        )
+def test_a_listener_made_without_a_loop_binds_its_hooks_at_first_use() -> None:
+    seen: list[zmux.adapter.PipeHint] = []
+
+    def transform(pipe: zmux.PipeIo, hint: zmux.adapter.PipeHint) -> zmux.PipeIo:
+        seen.append(hint)
+        return pipe
+
+    listener = zmux.Listener(
+        listener_config=zmux.ListenerConfig(inbound_transform=transform)
+    )
+
+    async def main() -> None:
+        async with listener:
+            addr = await listener.serve_tcp("127.0.0.1", 0)
+            async with await zmux.connect_tcp(*addr):
+                async with asyncio.timeout(5):
+                    async with await listener.accept():
+                        pass
+
+    asyncio.run(main())
+    assert seen
 
 
 async def test_open_carrier_writes_once_per_write() -> None:

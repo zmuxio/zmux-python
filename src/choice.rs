@@ -148,7 +148,14 @@ impl Candidate {
         carrier_credential: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let addr = hostport(&host, port);
-        let d = QuicDial::new(addr, tls, server_name, lanes, carrier_credential)?;
+        let d = QuicDial::new(
+            addr,
+            tls,
+            server_name,
+            lanes,
+            carrier_credential,
+            zmux::adapter::DIAL_TIMEOUT,
+        )?;
         Ok(Self(zmux::Candidate::new(
             zmux::CarrierKind::Quic,
             move || {
@@ -169,7 +176,14 @@ impl Candidate {
         lanes: u32,
         carrier_credential: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
-        let d = H3Dial::new(url, tls, addr, lanes, carrier_credential)?;
+        let d = H3Dial::new(
+            url,
+            tls,
+            addr,
+            lanes,
+            carrier_credential,
+            zmux::adapter::DIAL_TIMEOUT,
+        )?;
         Ok(Self(zmux::Candidate::new(
             zmux::CarrierKind::Http3,
             move || {
@@ -189,7 +203,13 @@ impl Candidate {
         lanes: u32,
         carrier_credential: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
-        let d = WebTransportDial::new(url, tls, lanes, carrier_credential)?;
+        let d = WebTransportDial::new(
+            url,
+            tls,
+            lanes,
+            carrier_credential,
+            zmux::adapter::DIAL_TIMEOUT,
+        )?;
         Ok(Self(zmux::Candidate::new(
             zmux::CarrierKind::WebTransport,
             move || {
@@ -442,15 +462,19 @@ fn connect_choice<'p>(
         match zmux::dial_choice(&choice, config, &policy).await {
             Ok(s) => Ok(Session::new(s)),
             Err(e) if e.invalid.is_some() => Err(PyValueError::new_err(e.to_string())),
-            Err(e) => crate::rt::attach(|py| {
-                let results = e
+            Err(e) => Err(crate::rt::lazy_err(move |py| {
+                let results = match e
                     .results
                     .iter()
                     .map(|r| result_obj(r)(py))
-                    .collect::<PyResult<Vec<_>>>()?;
+                    .collect::<PyResult<Vec<_>>>()
+                {
+                    Ok(r) => r,
+                    Err(err) => return err,
+                };
                 let t = crate::err_type(py, "CarrierChoiceError");
-                Err(PyErr::from_type(t, (e.to_string(), results)))
-            }),
+                PyErr::from_type(t, (e.to_string(), results))
+            })),
         }
     })
 }

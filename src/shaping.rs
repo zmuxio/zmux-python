@@ -83,24 +83,12 @@ fn budget_obj<'p>(py: Python<'p>, b: &Budget) -> PyResult<Bound<'p, PyAny>> {
         .call((), Some(&d))
 }
 
-/// The budget source of a callable returning `zmux.ShapingBudget`. An exception is no budget.
-pub(crate) fn budget_hook(f: Py<PyAny>) -> ShapingBudget {
-    ShapingBudget::new(move || {
-        crate::rt::attach(|py| {
-            let asked = (|| -> PyResult<Budget> {
-                let r = f.bind(py).call0()?;
-                Ok(Budget::new(
-                    account_of(&r)?,
-                    wait_of(&r)?,
-                    attr(&r, "no_injection")?,
-                ))
-            })();
-            asked.unwrap_or_else(|e| {
-                e.write_unraisable(py, Some(f.bind(py)));
-                Budget::default()
-            })
-        })
-    })
+/// The budget of a `zmux.ShapingBudget`, the same for every session: a
+/// value, so that no session asks Python on the runtime's threads (a
+/// shaping bundle draws one per session).
+pub(crate) fn budget_of(v: &Bound<'_, PyAny>) -> PyResult<ShapingBudget> {
+    let b = Budget::new(account_of(v)?, wait_of(v)?, attr(v, "no_injection")?);
+    Ok(ShapingBudget::new(move || b))
 }
 
 /// Reads local limits from JSON.
@@ -253,51 +241,11 @@ fn plan_obj<'p>(py: Python<'p>, p: &zmux::shaping::UnitPlan) -> PyResult<Bound<'
     crate::types(py)?.getattr("UnitPlan")?.call((), Some(&d))
 }
 
-/// The hook of a Python callable: given a `zmux.HandshakeView`, a `zmux.UnitPlan` or `None`.
-/// A callable that raises reports it and counts as a failed call.
-pub(crate) fn handshake_hook(f: Py<PyAny>) -> zmux::shaping::HandshakeShaper {
-    zmux::shaping::HandshakeShaper::new(move |v| {
-        crate::rt::attach(|py| {
-            let asked = (|| -> PyResult<Option<zmux::shaping::UnitPlan>> {
-                let d = pyo3::types::PyDict::new(py);
-                let types = crate::types(py)?;
-                let kind = match v.kind {
-                    Some(k) => Some(types.getattr("CarrierKind")?.call1((k.name(),))?),
-                    None => None,
-                };
-                d.set_item("kind", kind)?;
-                d.set_item("handshake", v.handshake)?;
-                d.set_item("message", v.message)?;
-                let view = types.getattr("HandshakeView")?.call((), Some(&d))?;
-                let r = f.bind(py).call1((view,))?;
-                if r.is_none() {
-                    return Ok(None);
-                }
-                let delay: f64 = r.getattr("delay")?.extract()?;
-                let delay = Duration::try_from_secs_f64(delay).map_err(crate::value_err)?;
-                Ok(Some(
-                    zmux::shaping::UnitPlan::new(
-                        r.getattr("pad_to")?.extract()?,
-                        r.getattr("pad_multiple")?.extract()?,
-                        r.getattr("pad")?.extract()?,
-                    )
-                    .with_delay(delay),
-                ))
-            })();
-            asked.unwrap_or_else(|e| {
-                e.write_unraisable(py, Some(f.bind(py)));
-                std::panic::resume_unwind(Box::new(()))
-            })
-        })
-    })
-}
-
-/// A shaper hook from what Python gave: a `ShapingBundle` or a callable.
-pub(crate) fn hook_of(v: &Bound<'_, PyAny>) -> zmux::shaping::HandshakeShaper {
-    if let Ok(b) = v.cast::<ShapingBundle>() {
-        return b.get().0.handshake_shaper();
-    }
-    handshake_hook(v.clone().unbind())
+/// The handshake shaper of a `ShapingBundle`: its plans, drawn in Rust per
+/// handshake message. A Python callable would be asked on the runtime's
+/// threads for every message, so none is taken.
+pub(crate) fn hook_of(v: &Bound<'_, PyAny>) -> PyResult<zmux::shaping::HandshakeShaper> {
+    Ok(v.cast::<ShapingBundle>()?.get().0.handshake_shaper())
 }
 
 /// The shaper in force on a session's outbound pipes, as `Session.shaper`

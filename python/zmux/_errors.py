@@ -14,6 +14,7 @@ __all__ = [
     "ApplicationClosedError",
     "CarrierChoiceError",
     "ConnectError",
+    "DatagramBlockedError",
     "DatagramError",
     "DeadlineExceededError",
     "EarlyDataRejectedError",
@@ -183,9 +184,12 @@ class StreamBusyError(StreamError):
 
 
 class PreambleTooLargeError(ZmuxError, ValueError):
-    """A stream's preamble is larger than the limit known: the peer's
-    Maximum Preamble Size (before its parameters the remembered one or 1024
-    bytes), at most 4096."""
+    """A stream's preamble is larger than the limit known, `max`: the
+    peer's Maximum Preamble Size (before its parameters the remembered one
+    or 1024 bytes), at most 4096 and the carrier record floor less 32
+    (8160)."""
+
+    max: int = 0
 
 
 class NotNegotiatedError(ZmuxError):
@@ -199,6 +203,12 @@ class NotEstablishedError(ZmuxError):
 
 class DatagramError(ZmuxError):
     """Sending a datagram failed."""
+
+
+class DatagramBlockedError(DatagramError):
+    """The stream has no identifier yet and the peer's stream limit allows
+    none now: its datagram was refused and the stream stays unopened. A
+    datagram sent once the stream is opened may pass."""
 
 
 class PacketError(ZmuxError):

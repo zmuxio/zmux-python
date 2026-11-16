@@ -346,6 +346,10 @@ def test_prefix_auth_config() -> None:
     assert zmux.ExchangeOptions(psk=b"k", time_window=30, max_recorded=16).path
 
 
+# A label of zmux's own, whose value the carrier metadata holds.
+LABEL = "EXPORTER-zmux-prefix-auth"
+
+
 class ExportedToken:
     """A credential of the application's own: the TLS exporter as the
     prefix, or in a header field."""
@@ -355,7 +359,7 @@ class ExportedToken:
 
     def _value(self, info: zmux.CarrierInfo) -> bytes:
         self.calls.append(info)
-        value = info.export(b"EXPORTER-test", b"", 32)
+        value = info.export(LABEL, b"", 32)
         assert value is not None and len(value) == 32
         return value
 
@@ -373,7 +377,7 @@ async def test_custom_credential_and_decider(carrier: str, tls: Tls) -> None:
 
     def decide(info: zmux.CarrierInfo, prefix: bytes) -> zmux.AdmissionVerdict:
         seen.append(info)
-        expected = info.export(b"EXPORTER-test", b"", 32)
+        expected = info.export(LABEL, b"", 32)
         assert expected is not None
         if info.head:
             assert prefix == b"" and info.headers is not None
@@ -405,9 +409,10 @@ async def test_custom_credential_and_decider(carrier: str, tls: Tls) -> None:
         server.cancel()
     assert len(seen) == 1 and seen[0].source is not None and seen[0].peer is not None
     assert seen[0].head == (carrier in ("wss", "webtransport"))
-    # The views outlive their call, their exporters do not.
-    assert seen[0].export(b"EXPORTER-test") is None
-    assert credential.calls[0].export(b"EXPORTER-test") is None
+    # A TLS listener's metadata holds zmux's own labels only.
+    if carrier == "tls":
+        assert seen[0].export(LABEL) is not None
+        assert seen[0].export("EXPORTER-test") is None
 
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
@@ -1387,6 +1392,7 @@ async def test_preamble_too_large() -> None:
             with pytest.raises(zmux.PreambleTooLargeError) as e:
                 await session.open_bi(info=b"x" * 5000)
             assert isinstance(e.value, ValueError)
+            assert 0 < e.value.max <= 4096
             await round_trip(session)
         server.cancel()
 

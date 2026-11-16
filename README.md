@@ -109,9 +109,12 @@ A `PipeIo`'s settings are properties, changed in place until the input is
 given to a session: `carrier_kind`, `variant` (the host's name of the
 transform a carrier runs, reported in `PipeStats.variant`), `write_overhead`
 and `terminated_tls`; `declare_secure()` declares the carrier secure for the
-Bound record mode. What a carrier's author sets once is a parameter of the
+Bound record mode, and `set_max_record(n)` limits the largest record
+plaintext the carrier takes (at least 8192, the carrier record floor; no upper
+bound; the smaller limit holds; a pipe whose limit falls below 8192 after a
+Sealed transform's overhead is refused). What a carrier's author sets once is a parameter of the
 function that builds the input (`pipe_from_streams`, `zmux.adapter.pipe_pair`):
-`max_record`, the largest record plaintext, `exporter`, the exporter of an
+`max_record` (as `set_max_record`), `exporter`, the exporter of an
 end-to-end handshake, and `unsent` (a `zmux.adapter.UnsentCount` the
 application keeps up to date, read by the session without the interpreter
 lock).
@@ -233,16 +236,20 @@ once, like `asyncio.Transport.abort`; both always take the code. Every
 coroutine is cancellation-safe except `write`: a cancelled `write` may have
 sent a prefix of its data and says nothing about how much, so reset the
 stream rather than write to it again. `await send.write_some(data)` and
-`await send.writev(buffers)` are the cancellation-safe writes: they take a
-prefix once the stream has room and return its length; cancelled while they
-wait, they took nothing (a cancellation that lands just as one completes
-cannot take the bytes back; `stats().bytes_written` tells). Use
+`await send.writev(buffers)` are the cancellation-safe writes: they wait for
+`await send.writable()` (room in the send buffer, which takes nothing; it
+returns the bytes `try_write` takes now), then write synchronously and return
+the length taken, so a cancelled call took nothing. `send_capacity()` and
+`wait_send_capacity(minimum)` report the flow-control credit instead. `send.try_write(data)` and
+`send.try_writev(buffers)` write without waiting (0 when there is no room).
+Use
 `asyncio.timeout()` for deadlines. `send.priority` is writable, and so are the runtime settings of a stream, which
 read back as in force: `send.send_buffer`, `send.scheduler`,
 `send.redundant`, `recv.receive_window` and `recv.peer_priority`;
 `await recv.read_chunk(n)` returns a `memoryview` of the received buffer, and
-every write takes any buffer-protocol object without copying it (the caller
-leaves a mutable buffer unchanged until the write returned).
+every write takes any buffer-protocol object: `bytes` (or a contiguous
+`memoryview` of `bytes`) goes without a copy, any other buffer is copied when
+the call is made, so it may be reused at once.
 
 `open_bi` and `accept_bi` give a `BiStream`, which unpacks as `send, recv`.
 `await session.open_stream_pair(limit=...)` returns a `(StreamPairReader,
@@ -274,7 +281,14 @@ async for event in session.events():
 ```
 
 Relays and nested sessions: `await zmux.helpers.splice((send_a, recv_a), (send_b,
-recv_b), a_to_b=limiter)` forwards two streams into each other.
+recv_b), a_to_b=limiter)` forwards two streams into each other; a limiter
+(`zmux.helpers.Limiter`) reserves bytes with `acquire(min, max)` and
+`try_acquire(min, max)` and takes back what was not forwarded with
+`refund(n)`, all on the event loop. A stream direction asks `acquire(1, k)`
+per chunk; `splice_packets` asks `acquire(n, n)` per whole capsule; a
+forwarded stream datagram needs `try_acquire(n, n)` and is dropped without a
+grant. An `acquire` that raises ends the direction with
+`SpliceEnd.LIMITER_FAILED`.
 `zmux.helpers.SpliceAbort()` given as `abort=` ends the splices sharing it
 with a chosen code: `abort.abort(0x77)` resets the downstream parts and stops
 the upstream parts with it, and the directions still running report
@@ -314,7 +328,8 @@ is a close without error; give an application `code` and `reason` when the
 peer should learn why the session ended. `session.abort(code, reason)` ends
 the session at once with an application error, draining nothing. Both are
 idempotent: the first call decides what is sent, code and reason included,
-and an `abort` while a close is still flushing ends it at once.
+and an `abort` while a close is still flushing ends it at once. A reason
+above 1024 bytes is cut to at most 1024, never inside a UTF-8 character.
 `await session.shutdown(code, reason)` sends GOAWAY and closes once the open
 streams ended.
 
@@ -411,6 +426,21 @@ config = zmux.Config(
     logger=logging.getLogger("zmux"),
 )
 ```
+
+Every Python hook runs on the event loop of its `Config` or `Listener`: the
+one running when it is made, else the one running at its first use. Once
+that loop closes, hooks are answered at once without it (a deciding hook
+refuses, `redial` fails, observed events are dropped and counted) until the
+next use from a running loop binds the object to that loop, so a `Config`
+can serve one `asyncio.run` after another.
+`logger` and `tracer` read a bounded queue
+there (`hook_queue`), and deciding hooks (`authorize_join`,
+`allow_record_mode`, `on_reject`, `session_config`, an admission decider)
+may be `async` and are cancelled at the library's deadline. Choices the
+library makes in its own calls are data: `record_policy=zmux.RecordPolicy(...)`,
+`shaping_budget=ShapingBudget(...)` and handshake plans from a
+`ShapingBundle`. A custom `carrier_credential` is the one hook called on the
+library's thread that dials; it must be quick.
 
 A suspected leak of a session-level secret is answered by
 `await session.replace_pipes()`, which advances the epoch and replaces every
@@ -538,7 +568,7 @@ except (zmux.ResumeTimeoutError, zmux.PipesLostError) as e:
 `session.shaper = zmux.shaping.Shaper(definition=...)` (or a
 `zmux.shaping.ShapingBundle`; `None` removes it), `Config(shaping=...,
 shaping_limits=..., shaping_budget=...)` and `ShapingBundle` take JSON
-definitions run natively; no Python code runs per record. Bounds left unset
+definitions and values run natively; no Python code runs per record. Bounds left unset
 keep the library's defaults (`ShapingLimits.max_delay`,
 `ShapingSizeLimits.max_slots`); `None` lifts a bound.
 

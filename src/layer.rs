@@ -6,17 +6,17 @@
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use pyo3::prelude::*;
-use pyo3_async_runtimes::TaskLocals;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
 use tokio::sync::{Mutex, mpsc};
 
-use crate::rt::{self, future_into_py};
-use crate::{PipeIo, Returned, admission, io_err, pyb, unread_take};
+use crate::helpers::lock;
+use crate::rt::{self, LoopRef, future_into_py};
+use crate::{PipeIo, Returned, admission, io_err, unread_take};
 
 /// How many writes each way a layer's channel holds.
 const DEPTH: usize = 8;
@@ -81,20 +81,20 @@ impl CarrierStream {
                 // Held until the result is settled: bytes taken back come first.
                 let mut held = r.lock_owned().await;
                 if let Some(b) = unread_take(&unread, n.max(1)) {
-                    return Ok((pyb(&b), held));
+                    return Ok((rt::Bin(b), held));
                 }
-                let mut buf = vec![0; n.max(1)];
+                let mut buf = bytes::BytesMut::with_capacity(n.max(1));
                 let r = held.as_mut().ok_or_else(released)?;
-                let k = r.read(&mut buf).await.map_err(io_err)?;
-                Ok((pyb(&buf[..k]), held))
+                r.read_buf(&mut buf).await.map_err(io_err)?;
+                Ok((rt::Bin(buf.freeze()), held))
             },
             undo,
         )
     }
     /// Writes `data` as one write on the carrier (one message on a carrier
     /// with message framing); fails without a sending half.
-    fn write<'p>(&self, py: Python<'p>, data: Vec<u8>) -> PyResult<Bound<'p, PyAny>> {
-        let w = self.w.clone();
+    fn write<'p>(&self, py: Python<'p>, data: &Bound<'p, PyAny>) -> PyResult<Bound<'p, PyAny>> {
+        let (w, data) = (self.w.clone(), crate::chunk_of(data)?);
         future_into_py(py, async move {
             let mut w = w.lock().await;
             let w = w.as_mut().ok_or_else(released)?;
@@ -229,53 +229,53 @@ impl LayerEnd {
                 // Held until the result is settled: a write taken back comes first, whole.
                 let mut rx = rx.lock_owned().await;
                 if let Some(b) = unread_take(&unread, usize::MAX) {
-                    return Ok((pyb(&b), rx));
+                    return Ok((rt::Bin(b), rx));
                 }
                 let b = rx.recv().await.unwrap_or_default();
-                Ok((pyb(&b), rx))
+                Ok((rt::Bin(b), rx))
             },
             undo,
         )
     }
     /// Bytes the layer read, for the carrier's reads.
-    fn write<'p>(&self, py: Python<'p>, data: Vec<u8>) -> PyResult<Bound<'p, PyAny>> {
-        let tx = self.tx.lock().unwrap().clone();
+    fn write<'p>(&self, py: Python<'p>, data: &Bound<'p, PyAny>) -> PyResult<Bound<'p, PyAny>> {
+        let (tx, data) = (lock(&self.tx).clone(), crate::chunk_of(data)?);
         future_into_py(py, async move {
             let tx = tx.ok_or_else(|| crate::new_err("ConnectError", "layer end closed"))?;
             if !data.is_empty() {
                 // The carrier dropped its reader: nothing reads any more.
-                let _ = tx.send(Bytes::from(data)).await;
+                let _ = tx.send(data).await;
             }
             Ok(())
         })
     }
     /// The end of what the layer reads.
     fn close(&self) {
-        self.tx.lock().unwrap().take();
+        lock(&self.tx).take();
     }
 }
 
 /// `PipeIo.wrap`: runs the Python `layer` over `io` through
-/// `zmux._layer.run`, on `locals`' loop.
+/// `zmux._layer.run`, on `lp`'s loop.
 pub(crate) async fn wrap(
     io: zmux::PipeIo,
     layer: Py<PyAny>,
     server_side: bool,
-    locals: TaskLocals,
+    lp: LoopRef,
 ) -> io::Result<zmux::PipeIo> {
     io.wrap(move |stream| async move {
         let (chan, end) = chan_pair();
         let stream = CarrierStream::new(stream);
         let ours = stream.handle();
-        let r = async {
-            let fut = rt::attach(|py| {
-                let run = py.import("zmux._layer")?.getattr("run")?;
-                let coro = run.call1((layer, stream, end, server_side))?;
-                rt::into_future(&locals, coro)
-            })?;
-            fut.await
-        }
-        .await;
+        let r = lp
+            .call(
+                move |py| {
+                    let run = py.import("zmux._layer")?.getattr("run")?;
+                    run.call1((layer, stream, end, server_side))
+                },
+                |_| Ok(()),
+            )
+            .await;
         if let Err(e) = r {
             // Closed now, though Python may still hold the stream.
             ours.release().await;
@@ -339,18 +339,17 @@ impl PipeHint {
 }
 
 /// A listener's inbound transform written in Python: `f(pipe, hint)`
-/// returning a `PipeIo`, or a coroutine resolving to one, run on `locals`'
+/// returning a `PipeIo`, or a coroutine resolving to one, run on `lp`'s
 /// loop. An exception other than a cancellation is reported as unraisable.
-pub(crate) fn transform(f: Py<PyAny>, locals: TaskLocals) -> zmux::InboundTransform {
+pub(crate) fn transform(f: Py<PyAny>, lp: LoopRef) -> zmux::InboundTransform {
     let f = Arc::new(f);
-    let locals = Arc::new(locals);
     zmux::InboundTransform::new(move |io, hint| {
         let hint = PipeHint::of(hint);
-        let (f, locals) = (f.clone(), locals.clone());
+        let (f, lp) = (f.clone(), lp.clone());
         async move {
-            let r = call(&f, &locals, io, hint).await;
+            let r = call(&f, &lp, io, hint).await;
             r.map_err(|e| {
-                rt::attach(|py| {
+                lp.post(move |py| {
                     if !e.is_instance_of::<pyo3::exceptions::asyncio::CancelledError>(py) {
                         e.write_unraisable(py, Some(f.bind(py)));
                     }
@@ -362,37 +361,32 @@ pub(crate) fn transform(f: Py<PyAny>, locals: TaskLocals) -> zmux::InboundTransf
 }
 
 async fn call(
-    f: &Py<PyAny>,
-    locals: &TaskLocals,
+    f: &Arc<Py<PyAny>>,
+    lp: &LoopRef,
     io: zmux::PipeIo,
     hint: PipeHint,
 ) -> PyResult<zmux::PipeIo> {
     // The carrier closes with a failure even while Python still holds the
     // object (in a traceback, say): what it has not used up is dropped.
-    struct Release(Option<Py<PipeIo>>);
+    struct Release(Arc<StdMutex<Option<Py<PipeIo>>>>);
     impl Drop for Release {
         fn drop(&mut self) {
-            if let Some(p) = self.0.take() {
-                drop(p.get().0.lock().unwrap().take());
+            if let Some(p) = lock(&self.0).take() {
+                drop(lock(&p.get().0).take());
             }
         }
     }
-    let mut given = Release(None);
-    let pending = rt::attach(|py| -> PyResult<_> {
-        let p = Py::new(py, PipeIo::wrap(io))?;
-        given.0 = Some(p.clone_ref(py));
-        let r = f.bind(py).call1((p, hint))?;
-        if r.hasattr("__await__")? {
-            Ok(Err(rt::into_future(locals, r)?))
-        } else {
-            Ok(Ok(r.unbind()))
-        }
-    })?;
-    let obj = match pending {
-        Ok(o) => o,
-        Err(fut) => fut.await?,
-    };
-    rt::attach(|py| obj.bind(py).cast::<PipeIo>()?.get().take())
+    let given = Release(Arc::default());
+    let (slot, f) = (given.0.clone(), f.clone());
+    lp.call(
+        move |py| {
+            let p = Py::new(py, PipeIo::wrap(io))?;
+            *lock(&slot) = Some(p.clone_ref(py));
+            f.bind(py).call1((p, hint))
+        },
+        |v| v.cast::<PipeIo>()?.get().take(),
+    )
+    .await
 }
 
 /// Registers the classes.

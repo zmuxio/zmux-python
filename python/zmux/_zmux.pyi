@@ -67,6 +67,12 @@ grants the peer as many streams as it can, in effect no limit. It is the top
 of the range of `Config.max_incoming_streams`,
 `Config.max_incoming_uni_streams` and `Session.raise_incoming_streams`, a
 value of that range and not a setting: 0 keeps meaning none."""
+MIN_RECHECK: float
+"""The shortest `PoolPolicyDecision.recheck` a pool honours, seconds
+(0.01): a shorter one, 0 included, is lengthened to it."""
+DIAL_TIMEOUT: float
+"""The default bound of a TLS, QUIC, WebSocket, HTTP/3 or WebTransport dial,
+seconds (10)."""
 RESERVED_EXPORTER_PREFIX: str
 """The start of the exporter labels zmux itself uses."""
 DEFAULT_MAX_RECORD_SIZE: int
@@ -93,6 +99,7 @@ DEFAULT_MAX_SLOTS: int
 """Default bound on the counters and timers of a shaping candidate (4096)."""
 _KEYALG_X25519: int
 _KEYALG_MLDSA44: int
+_DEFAULT_RECOVERY_RATIO: float
 
 def _config_defaults() -> dict[str, Any]:
     """Internal: the library's defaults of the `zmux.Config` fields."""
@@ -179,11 +186,21 @@ class PipeIo:
         the `exporter` parameter of the function that builds the input."""
     @terminated_tls.setter
     def terminated_tls(self, state: _t.TlsState) -> None: ...
+    def set_max_record(self, max: int) -> None:
+        """Limits the largest record plaintext the carrier takes, applied
+        beside the peer's `max_record_size` on every pipe this input
+        becomes, the session's first included: the smaller of `max` and a
+        limit already set holds, and a Sealed transform above keeps it less
+        its overhead. 0 keeps the carrier's default; a value below 8192,
+        the carrier record floor, raises `InvalidArgumentError` (it is never
+        clamped). There is no upper bound: the peer's `max_record_size`
+        reduces it. A pipe whose limit, less a Sealed transform's overhead,
+        is below 8192 is refused when it is added or joined."""
     def declare_secure(self) -> None:
         """Declares the carrier secure: it meets the secure carrier's Bound
         contract, record confidentiality and integrity included, so a
         `record_policy` may choose `RecordMode.BOUND` on it
-        (`RecordPolicyInput.secure`). An exporter alone is no such
+        (`RecordPolicy.secure`). An exporter alone is no such
         declaration; a carrier whose TLS ends outside the process is not
         secure."""
     def into_stream(self) -> CarrierStream:
@@ -207,7 +224,8 @@ class PipeIo:
         write), so that every carrier write stays one write on the
         connection. With `server_side`, `writer.start_tls` takes the server
         side. This object is used up; the layer runs on the running event
-        loop. A layer's error raises `ConnectError`."""
+        loop (`NoRunningLoopError` without one). A layer's error raises
+        `ConnectError`."""
 
 @final
 class CarrierStream:
@@ -217,8 +235,9 @@ class CarrierStream:
 
     async def read(self, n: int = 65536) -> bytes:
         """Up to `n` bytes; `b""` at the end (also without a receiving half)."""
-    async def write(self, data: bytes) -> None:
-        """Exactly one write on the carrier; fails without a sending half."""
+    async def write(self, data: Buffer) -> None:
+        """Exactly one write on the carrier; fails without a sending half.
+        `data` is copied unless it is `bytes`."""
     async def shutdown(self) -> None:
         """Ends the sending half gracefully."""
 
@@ -227,7 +246,7 @@ class _LayerEnd:
     """Internal: the Python side of the stream a `PipeIo.wrap` layer returns."""
 
     async def read(self) -> bytes: ...
-    async def write(self, data: bytes) -> None: ...
+    async def write(self, data: Buffer) -> None: ...
     def close(self) -> None: ...
 
 @final
@@ -255,15 +274,17 @@ class PipeEnd:
 
     async def read(self, n: int = 65536) -> bytes:
         """Up to `n` bytes the session wrote; `b""` once it closed."""
-    async def write(self, data: bytes) -> None:
-        """Delivers `data` to the session; `b""` ends the pipe."""
+    async def write(self, data: Buffer) -> None:
+        """Delivers `data` to the session (copied unless it is `bytes`);
+        `b""` ends the pipe."""
 
 def pipe_pair(
     *,
     carrier_kind: _t.CarrierKind | str | None = None,
     unsent: UnsentCount | None = None,
     max_record: int | None = None,
-    exporter: Callable[[str, bytes, int], bytes | None] | None = None,
+    exporter: Callable[[str, bytes, int], Awaitable[bytes | None] | bytes | None]
+    | None = None,
 ) -> tuple[PipeIo, PipeEnd]:
     """An in-memory pipe: give the `PipeIo` to a session, drive the
     `PipeEnd` yourself. `carrier_kind` labels it with a carrier kind
@@ -271,23 +292,24 @@ def pipe_pair(
     the application keeps up to date with the bytes the carrier took and has
     not yet transmitted (it feeds `PipeStats.queued_bytes` and the
     scheduler's queue estimate; the session's driver reads it without the
-    interpreter lock). `max_record` (at least 1) is the largest record
-    plaintext the carrier takes, applied beside the peer's
-    `max_record_size`. `exporter(label, context, length)` is the exporter of
+    interpreter lock). `max_record` is the largest record plaintext the
+    carrier takes (`PipeIo.set_max_record`: at least 8192, no upper
+    bound, 0 the default). `exporter(label, context, length)` is the exporter of
     the carrier's innermost end-to-end handshake, the one source of
-    `PipeAuth.exporter()`, carrier-bound joins and
-    `Session.export_keying_material`: it returns `length` bytes, or `None`
-    while the handshake is incomplete; an exception or another length gives
-    no value and is reported as unraisable. It is called from any thread
-    when a value is needed, possibly with the session's lock held: it must
-    be quick and must not call this session. Where the session's thread
-    waits, it waits at most a second for the interpreter, then has no value.
+    `PipeAuth.exporter()`, carrier-bound joins and the session secret: it
+    returns `length` bytes, or `None` while the handshake is incomplete
+    (synchronously or `async`); an exception or another length gives no
+    value and is reported as unraisable. It runs on the event loop running
+    when `pipe_pair` is called (`NoRunningLoopError` without one): the
+    values zmux reads are fetched there before the carrier's session, join
+    or Establish needs them, bounded by its handshake or join deadline.
+    `Session.export_keying_material` gives nothing for such a carrier.
     Never give an early exporter. A stream carrier ignores it."""
 
 @final
 class CarrierInfo:
     """The metadata of a carrier, given to an `Admission` decider and to a
-    credential for the duration of one call."""
+    credential: a copy, usable for as long as it is kept."""
 
     @property
     def source(self) -> tuple[str, int] | None:
@@ -312,11 +334,14 @@ class CarrierInfo:
         WebTransport): there is no prefix, and a credential travels in a
         request header field."""
     def export(
-        self, label: bytes, context: bytes = b"", length: int = 32
+        self, label: str, context: bytes = b"", length: int = 32
     ) -> bytes | None:
-        """`length` bytes of the TLS exporter of the carrier's completed
-        handshake; None without one, or after the call that was given this
-        object has returned (for an `async` decide, its first `await`)."""
+        """`length` bytes of the exporter of the carrier's completed
+        handshake for `label` and `context`, as it answers without waiting;
+        None without one, for a value it does not hold, or once the
+        connection is gone. The metadata a TLS over TCP listener gives holds
+        the values of zmux's own labels only (prefix authentication's among
+        them), read at the handshake."""
 
 @final
 class AdmissionVerdict:
@@ -378,10 +403,10 @@ class Admission:
     handshake, with its metadata and up to `peek` first bytes (none on
     carriers decided on an HTTP request head) and returns an `AdmissionVerdict` or
     `Decision`, or is
-    `async` and resolves to one. A synchronous one runs on a native thread
-    holding the GIL, so it must be quick and must not block; an `async` one
-    runs on the event loop the `Listener` was made in, and is cancelled
-    (`CancelledError`) when the peek timeout ends or the listener closes.
+    `async` and resolves to one. It runs on the event loop running when the
+    admission is made, else on the one the `Listener` was made in, and is
+    cancelled (`CancelledError`) when the peek timeout ends or the
+    listener closes.
     An exception or another return value closes the carrier.
     `max_peek` is the largest prefix `AdmissionVerdict.more` may ask for and the
     largest first message of a message-framed carrier taken as a prefix (`peek`
@@ -476,10 +501,13 @@ async def dial_tls(
     tls: TlsConfig | None = None,
     server_name: str | None = None,
     carrier_credential: _CarrierCredential | None = None,
+    timeout: float = DIAL_TIMEOUT,
 ) -> PipeIo:
     """A pipe input on TLS over TCP; `server_name` defaults to `host`.
     With `carrier_credential`, its prefix is sent after the handshake. Without ALPN
-    identifiers in `tls`, zmux's are offered."""
+    identifiers in `tls`, zmux's are offered. `timeout` (seconds, positive)
+    bounds the dial, from the TCP connect to the prefix written: past it
+    the dial fails with `ConnectError`."""
 
 async def dial_quic(
     host: _Host,
@@ -489,10 +517,12 @@ async def dial_quic(
     server_name: str | None = None,
     lanes: int = DEFAULT_LANES,
     carrier_credential: _CarrierCredential | None = None,
+    timeout: float = DIAL_TIMEOUT,
 ) -> PipeIo:
     """A pipe input on a new QUIC connection using up to `lanes` QUIC
     streams. With `carrier_credential`, its prefix is the first stream's
-    first bytes."""
+    first bytes. `timeout` (seconds, positive) bounds the dial: past it
+    the dial fails with `ConnectError`."""
 
 async def dial_websocket(
     url: str,
@@ -501,12 +531,16 @@ async def dial_websocket(
     headers: _Headers | None = None,
     carrier_credential: _CarrierCredential | None = None,
     no_subprotocol: bool = False,
+    timeout: float = DIAL_TIMEOUT,
 ) -> PipeIo:
     """A pipe input on a WebSocket (`ws://` or `wss://`); `headers` go on the upgrade
     request, with the carrier credential's header field (given the TLS exporter with `wss://`).
     With `no_subprotocol` the request offers no subprotocol, so the carrier has
     no application protocol identifier; the server must allow it
-    (`serve_http(websocket_no_subprotocol=True)`)."""
+    (`serve_http(websocket_no_subprotocol=True)`). `timeout` (seconds,
+    positive) bounds the dial, from the TCP connect to the upgrade's
+    response, redirects included: past it the dial fails with
+    `ConnectError`."""
 
 async def dial_streaming(
     host: _Host,
@@ -606,8 +640,9 @@ class PoolPolicyDecision:
     def recheck(self) -> float | None:
         """Seconds within which to decide again even if nothing changes: the
         soonest an `age` or `idle` rule of a member kept fires, or
-        `dial_after` elapses after the last dial; never 0. A `PipePool`
-        with this policy wakes its maintainer by it."""
+        `dial_after` elapses after the last dial. A `PipePool` with this
+        policy wakes its maintainer by it, lengthening a shorter one than
+        `MIN_RECHECK` (0 included) to that."""
     @property
     def probe_interval(self) -> float | None:
         """Idle-probe interval in seconds of the pipes added from now on, as
@@ -971,10 +1006,13 @@ async def dial_http3(
     addr: _HostPort | None = None,
     lanes: int = DEFAULT_LANES,
     carrier_credential: _CarrierCredential | None = None,
+    timeout: float = DIAL_TIMEOUT,
 ) -> PipeIo:
     """A pipe input on an HTTP/3 request to `url` (`https://`; kind
     `http3`), sent to `addr`, a `(host, port)`, when given. With `carrier_credential`, its
-    prefix is the first bytes of every request body."""
+    prefix is the first bytes of every request body. `timeout` (seconds,
+    positive) bounds the dial: past it the dial fails with
+    `ConnectError`."""
 
 async def dial_webtransport(
     url: str,
@@ -982,10 +1020,12 @@ async def dial_webtransport(
     tls: TlsConfig | None = None,
     lanes: int = DEFAULT_LANES,
     carrier_credential: _CarrierCredential | None = None,
+    timeout: float = DIAL_TIMEOUT,
 ) -> PipeIo:
     """A pipe input on a new WebTransport session to `url` (`https://`; kind
     `webtransport`); the carrier credential's header field goes on the
-    session request."""
+    session request. `timeout` (seconds, positive) bounds the dial, the
+    QUIC handshake included: past it the dial fails with `ConnectError`."""
 
 @final
 class Http2Connection:
@@ -1086,7 +1126,8 @@ class SendStream:
     to finish on a normal exit and reset with `ZMUX_CANCELLED` on an
     exception; leaving a stream neither finished nor reset keeps it
     half-open until the session ends. One operation at a time: a second
-    concurrent call raises `StreamBusyError`. The runtime settings
+    concurrent call raises `StreamBusyError`; `id` and `stats` read on
+    while an operation is in progress. The runtime settings
     `send_buffer`, `scheduler` and `redundant` are writable properties and
     read back as in force."""
 
@@ -1100,27 +1141,32 @@ class SendStream:
     @priority.setter
     def priority(self, priority: _Prio) -> None: ...
     async def write(self, data: Buffer) -> None:
-        """Writes all of `data`, any buffer-protocol object, without copying
-        it, waiting for room; the caller does not modify a mutable buffer
-        until the call returned. Not cancellation-safe: a cancelled call may
+        """Writes all of `data`, any buffer-protocol object, waiting for room.
+        `bytes` (or a contiguous `memoryview` of `bytes`) is sent without a
+        copy; any other buffer is copied when the call is made, so the caller
+        may reuse it at once. Not cancellation-safe: a cancelled call may
         have taken a prefix of `data` and does not say how much, so a stream
         whose `write` was cancelled is to be reset, not written to again
         (`write_some` is the cancellation-safe write)."""
     async def write_some(self, data: Buffer) -> int:
-        """Writes a prefix of `data` without copying it, waiting until the
-        stream takes some, and returns the number of bytes taken (0 only for
-        empty `data`); the caller does not modify the taken bytes of a
-        mutable buffer afterwards. Cancellation-safe: when the call raises
-        `CancelledError` while it waits, nothing of `data` was taken. A
-        cancellation that lands as the call completes, after the stream took
-        the bytes and before the result reached the awaiter, cannot take
-        them back: compare the stream's `stats().bytes_written` before and
-        after to tell (just after a cancellation `stats()` may still raise
-        `StreamBusyError` until the native side let go of the stream)."""
+        """Writes a prefix of `data` (copied as `write` says), waiting until
+        the stream takes some, and returns the number of bytes taken (0 only
+        for empty `data`). Cancellation-safe: the call only waits
+        for `writable`, which takes nothing, and then writes synchronously, so
+        a call that raises `CancelledError` took nothing of `data`."""
     async def writev(self, buffers: Iterable[Buffer]) -> int:
         """`write_some` over several buffers: writes a prefix of their
-        concatenation without copying them and returns the number of bytes
+        concatenation (copied as `write` says) and returns the number of bytes
         taken; the same cancellation semantics."""
+    def try_write(self, data: Buffer) -> int:
+        """Writes as much of `data` as the stream takes now (copied as
+        `write` says), without waiting: the number of bytes taken, 0 when there is
+        no room (or `data` is empty); `StreamBusyError` while another
+        operation holds the part. With `writable` it is the building
+        block of `write_some`."""
+    def try_writev(self, buffers: Iterable[Buffer]) -> int:
+        """`try_write` over several buffers in order: the number of bytes
+        taken."""
     async def flush(self) -> None:
         """Opens the stream now and waits until the opening frame and the data
         written so far left for a carrier: the peer sees the stream even with
@@ -1141,11 +1187,16 @@ class SendStream:
     def set_reliable_boundary(self) -> None:
         """Marks the bytes written so far as delivered even if the stream is
         reset later (RESET_STREAM_AT Reliable Size)."""
+    async def writable(self) -> int:
+        """Waits until `try_write` takes bytes (room in the send buffer, not
+        credit) and returns how many it takes now; the stream's error once the
+        part ended. Takes nothing, so a cancelled call has no effect."""
     def send_capacity(self) -> int:
         """The bytes the part could transmit now: the smaller of its stream
         and session credit, minus what it holds unsent."""
     async def wait_send_capacity(self, minimum: int) -> int:
-        """Waits until the send capacity is at least `minimum` (>= 1), or above 0
+        """The credit statistic's wait, not write readiness (see `writable`):
+        waits until the send capacity is at least `minimum` (>= 1), or above 0
         while nothing is unsent, and returns it; the stream's error otherwise."""
     @property
     def send_buffer(self) -> int:
@@ -1194,7 +1245,8 @@ class RecvStream:
     no-op once it ended; it returns at once). `async for` ends silently at the end of the stream and raises
     the stream's error otherwise. The runtime settings `receive_window` and
     `peer_priority` are writable properties and read back as last
-    assigned."""
+    assigned. `id`, `stats`, `preamble`, `is_replayable` and
+    `requested_priority` read on while a read is in progress."""
 
     @property
     def id(self) -> int | None:
@@ -1235,6 +1287,9 @@ class RecvStream:
     async def read_chunk(self, n: int = 65536) -> memoryview:
         """Up to `n` bytes as a read-only view of the received buffer,
         without a copy; empty at the end of the stream."""
+    def _take(self, max: int, view: bool, /) -> bytes | memoryview | None: ...
+    async def _readable(self) -> None: ...
+    def _put_back(self, chunks: list[bytes], /) -> None: ...
     def reject(self) -> None:
         """Declines the stream before reading it (ZMUX_REJECTED); the handle,
         and the sending one of a stream not written to, are used up."""
@@ -1492,13 +1547,13 @@ class Session:
         `SessionClosedError` once the session ended."""
     async def accept_uni(self) -> RecvStream:
         """The next unidirectional stream the peer opened."""
-    def send_datagram(self, data: bytes) -> None:
-        """Queues an unreliable datagram; never waits. When the queue is full
+    def send_datagram(self, data: Buffer) -> None:
+        """Queues an unreliable datagram (copied unless it is `bytes`); never waits. When the queue is full
         the oldest datagram is dropped. `DatagramError` if datagrams are not
         negotiated or `data` exceeds `max_datagram_size`."""
     async def send_datagram_wait(self, data: Buffer) -> None:
-        """Queues a datagram, any buffer-protocol object without a copy,
-        waiting while the queue is full instead of dropping the oldest; the
+        """Queues a datagram, any buffer-protocol object (copied unless it is
+        `bytes`), waiting while the queue is full instead of dropping the oldest; the
         same errors as `send_datagram`. Cancellation-safe: cancelled while
         it waits, it queued nothing (a cancellation that lands as it
         completes cannot take the datagram back)."""
@@ -1513,7 +1568,8 @@ class Session:
         """The largest datagram payload; `None` without datagram support."""
     def close(self, code: int = 0, reason: bytes = b"") -> None:
         """Starts the graceful close with the application error `code` and
-        `reason` (the defaults: a close without error) and returns without
+        `reason` (the defaults: a close without error; a reason above 1024
+        bytes is cut to at most 1024, never inside a UTF-8 character) and returns without
         blocking the event loop: the data the streams wrote is sent first, so
         that the peer reads it ahead of the code, then CONNECTION_CLOSE is
         handed to every usable carrier, all within 1 s; streams still open are
@@ -1525,7 +1581,7 @@ class Session:
         `code`, `reason` and `remote=True`."""
     def abort(self, code: int, reason: bytes = b"") -> None:
         """Ends the session at once with the application error `code` and
-        `reason`, draining nothing: unsent data is discarded and
+        `reason` (cut to 1024 bytes as in `close`), draining nothing: unsent data is discarded and
         CONNECTION_CLOSE goes in the background. Returns at once. An abort
         while a close is still flushing discards what remains unsent; a
         later call of either sends nothing more."""
@@ -1658,6 +1714,10 @@ class Session:
     @property
     def zero_rtt(self) -> ZeroRtt | None:
         """For sessions from `QuicClient.connect`: what became of the 0-RTT data."""
+    @property
+    def id(self) -> int:
+        """The session's identifier in this process (unique while it runs):
+        the one `Tracer` methods are given."""
     @property
     def role(self) -> Role:
         """`Role.CLIENT` or `Role.SERVER`, negotiated when started as auto."""
@@ -1856,7 +1916,12 @@ async def splice(
     result). `abort.abort(code)` ends it with that code instead: both
     downstream parts are reset and both upstream parts stopped with it, and
     the directions still running report `SpliceEnd.CANCELLED` with `code`;
-    a handle aborted before the start ends the splice at once."""
+    a handle aborted before the start ends the splice at once. The limiters
+    run on the event loop running when it is called (`NoRunningLoopError`
+    without one): a direction takes `acquire(1, k)` for each chunk it reads
+    and refunds what it did not forward, and a forwarded stream datagram
+    `try_acquire(n, n)`, dropped without a grant. A failing `acquire` ends
+    the direction with `SpliceEnd.LIMITER_FAILED`."""
 
 async def splice_packets(
     a: tuple[SendStream, RecvStream],
@@ -1871,7 +1936,9 @@ async def splice_packets(
     with only capsule headers parsed, and a stream datagram that does not fit
     the next hop's datagrams goes on as a DATAGRAM capsule at the next
     capsule boundary (`Forwarded.datagrams_as_capsules`). A capsule never
-    becomes a datagram."""
+    becomes a datagram. A direction's limiter is asked `acquire(n, n)` once
+    for each whole capsule (n its Type, Length and Value bytes) and
+    `try_acquire(n, n)` for each datagram it forwards."""
 
 @final
 class SpliceAbort:
@@ -2004,7 +2071,8 @@ def resolve_duplicate(
 ) -> Resolved:
     """Decides between two sessions that raced between the same endpoints:
     keeps one, drains the other, and starts `rejoin` (on the running event
-    loop) to keep the loser's route as a pipe of the survivor. An
+    loop: `NoRunningLoopError` without one) to keep the loser's route as a
+    pipe of the survivor. An
     undecidable pair or one with the same dialer raises `ValueError`."""
 
 type _Source = tuple[str, int] | None
@@ -2099,8 +2167,6 @@ class Gate(Protocol):
         self, handle: bytes, peer: _t.Peer, source: _Source, /
     ) -> Any | Awaitable[Any]: ...
 
-type _Shaper = Callable[[_t.HandshakeView], _t.UnitPlan | None] | ShapingBundle
-
 @final
 class PinVerifier:
     """Trusts the one static key with this 32-byte KeyId (`static_key_id`): the key
@@ -2140,8 +2206,7 @@ class SigningKey:
 @final
 class SecureServer:
     """The server's side of Establish, for `ListenerConfig(secure_server=...)`. `shaper`, a
-    `ShapingBundle` or a callable, is asked before a handshake message with a
-    `HandshakeView` and returns a `UnitPlan`, or `None` for no plan.
+    `ShapingBundle`, plans each handshake message.
     `accepted_profiles` (unset: 1 and 3; empty raises `ValueError`) is the only way to accept a
     Profile without a pre-shared key (4, 5). `client_verifier` verifies clients from
     message 3 (unset: only the gate's `commit` admits them); `local_context` is this
@@ -2150,7 +2215,8 @@ class SecureServer:
     verdict names its key; `app_data` supplies the data of message 2, and
     `max_app_data` bounds the client's (`DEFAULT_MAX_APP_DATA` bytes; `None`: no bound
     beyond the message). `allow_record_mode(mode, peer)` decides a mode other than
-    Sealed. An unknown or reserved Profile, a key of zeros, or `require_pq_auth`
+    Sealed; it may be `async` and runs on the event loop of the listener's
+    creation, cancelled (refusing) at the handshake timeout. An unknown or reserved Profile, a key of zeros, or `require_pq_auth`
     without a verifier or with a pin of a static key alone raises `ValueError` here."""
 
     def __new__(
@@ -2159,8 +2225,9 @@ class SecureServer:
         static_key: Buffer,
         *,
         accepted_profiles: Iterable[int] | None = None,
-        allow_record_mode: Callable[[_t.RecordMode, _t.Peer], bool] | None = None,
-        shaper: _Shaper | None = None,
+        allow_record_mode: Callable[[_t.RecordMode, _t.Peer], bool | Awaitable[bool]]
+        | None = None,
+        shaper: ShapingBundle | None = None,
         shaping_limits: _t.ShapingLimits | None = None,
         client_verifier: Verifier | PinVerifier | None = None,
         local_context: Buffer = b"",
@@ -2186,7 +2253,7 @@ async def establish(
     max_app_data: int | None = 256,
     require_pq_auth: bool = False,
     signer: Signer | SigningKey | None = None,
-    shaper: _Shaper | None = None,
+    shaper: ShapingBundle | None = None,
     shaping_limits: _t.ShapingLimits | None = None,
     reply_timeout: float | None = 10.0,
 ) -> tuple[PipeIo, _t.Peer]:
@@ -2204,7 +2271,8 @@ async def establish(
     data of messages 1 (Profiles 1 and 3) and 3, and `max_app_data` bounds the
     server's (`DEFAULT_MAX_APP_DATA` bytes; `None`: no bound beyond the message);
     `require_pq_auth` fails a server without post-quantum authentication; `signer`
-    proves message 3 for a server whose verdict names its key."""
+    proves message 3 for a server whose verdict names its key. Its hooks run on
+    the event loop running when it is called (`NoRunningLoopError` without one)."""
 
 @final
 class InstalledShaper:

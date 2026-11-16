@@ -4,37 +4,23 @@
 //! synchronous or `async`, or prefix authentication); `PrefixAuth`, or any object with `prefix` and `header`
 //! methods, as a client's credential for `dial_*`.
 
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::Arc;
 use std::time::Duration;
-
-use pyo3_async_runtimes::TaskLocals;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple};
 
+use crate::rt::LoopRef;
 use crate::seconds;
 
-/// A request of the Python thread for an exporter value, answered by the
-/// thread that holds the carrier's metadata.
-enum Ask {
-    Export(Vec<u8>, Vec<u8>, usize, mpsc::Sender<Option<Vec<u8>>>),
-    Done,
-}
-
-/// The metadata of a carrier, as Python sees it during one call of a
-/// decider or a credential.
+/// The metadata of a carrier, as Python sees it: an owned copy, usable
+/// for as long as Python keeps it.
 #[pyclass(frozen, module = "zmux")]
-pub(crate) struct CarrierInfo {
-    source: Option<(String, u16)>,
-    peer: Option<(String, u16)>,
-    alpn: Option<Vec<u8>>,
-    server_name: Option<String>,
-    headers: Option<Vec<(String, Vec<u8>)>>,
-    head: bool,
-    exporter: Option<mpsc::Sender<Ask>>,
+pub(crate) struct CarrierInfo(zmux::CarrierInfo);
+
+fn addr(a: Option<std::net::SocketAddr>) -> Option<(String, u16)> {
+    a.map(|r| (r.ip().to_string(), r.port()))
 }
 
 #[pymethods]
@@ -43,111 +29,61 @@ impl CarrierInfo {
     /// intermediary reports (port 0 when it reported none), or the peer.
     #[getter]
     fn source(&self) -> Option<(String, u16)> {
-        self.source.clone()
+        addr(self.0.source)
     }
     /// The directly connected peer, `(host, port)`.
     #[getter]
     fn peer(&self) -> Option<(String, u16)> {
-        self.peer.clone()
+        addr(self.0.peer)
     }
     #[getter]
     fn alpn<'p>(&self, py: Python<'p>) -> Option<Bound<'p, PyBytes>> {
-        self.alpn.as_deref().map(|a| PyBytes::new(py, a))
+        self.0.alpn.as_deref().map(|a| PyBytes::new(py, a))
     }
     #[getter]
-    fn server_name(&self) -> Option<String> {
-        self.server_name.clone()
+    fn server_name(&self) -> Option<&str> {
+        self.0.server_name.as_deref()
     }
     #[getter]
     fn headers<'p>(&self, py: Python<'p>) -> PyResult<Option<Vec<Bound<'p, PyTuple>>>> {
-        let Some(h) = &self.headers else {
+        let mut h: Vec<(String, Vec<u8>)> = Vec::new();
+        self.0
+            .for_each_header(|n, v| h.push((n.to_owned(), v.to_vec())));
+        if self.0.request.is_none() && h.is_empty() {
             return Ok(None);
-        };
-        h.iter()
-            .map(|(n, v)| {
-                PyTuple::new(
-                    py,
-                    [
-                        n.into_pyobject(py)?.into_any(),
-                        PyBytes::new(py, v).into_any(),
-                    ],
-                )
-            })
+        }
+        h.into_iter()
+            .map(|(n, v)| (n, PyBytes::new(py, &v)).into_pyobject(py))
             .collect::<PyResult<_>>()
             .map(Some)
     }
     #[getter]
     fn head(&self) -> bool {
-        self.head
+        self.0.head
     }
-    /// `length` bytes of the TLS exporter of the carrier's handshake for
-    /// `label` and `context`; `None` without one, or once the call that
-    /// was given this object has returned.
+    /// `length` bytes of the exporter of the carrier's handshake for
+    /// `label` and `context`, as it answers without waiting; `None`
+    /// without one, or for a value it does not hold.
     #[pyo3(signature = (label, context=b"".to_vec(), length=32))]
     fn export<'p>(
         &self,
         py: Python<'p>,
-        label: Vec<u8>,
+        label: &str,
         context: Vec<u8>,
         length: usize,
     ) -> Option<Bound<'p, PyBytes>> {
-        let ask = self.exporter.as_ref()?;
-        let value = py.detach(|| {
-            let (tx, rx) = mpsc::channel();
-            ask.send(Ask::Export(label, context, length, tx)).ok()?;
-            rx.recv().ok().flatten()
-        })?;
+        let value = self.0.export(label, &context, length)?;
         Some(PyBytes::new(py, &value))
     }
     fn __repr__(&self) -> String {
         format!(
             "CarrierInfo(source={:?}, peer={:?}, server_name={:?}, head={})",
-            self.source, self.peer, self.server_name, self.head
+            addr(self.0.source),
+            addr(self.0.peer),
+            self.0.server_name.as_deref(),
+            self.0.head
         )
     }
-}
-
-/// Calls `f` with the Python view of `info`. With an exporter, `f` runs on
-/// a scoped thread of its own while this one answers its exporter
-/// requests: `info` borrows the carrier and stays here.
-fn with_info<R: Send>(
-    info: &zmux::CarrierInfo<'_>,
-    f: impl FnOnce(CarrierInfo) -> R + Send,
-) -> std::io::Result<R> {
-    let mut headers = None;
-    if info.request.is_some() {
-        let mut h = Vec::new();
-        info.for_each_header(|n, v| h.push((n.to_owned(), v.to_vec())));
-        headers = Some(h);
-    }
-    let mut view = CarrierInfo {
-        source: info.source.map(|r| (r.ip().to_string(), r.port())),
-        peer: info.peer.map(|r| (r.ip().to_string(), r.port())),
-        alpn: info.alpn.map(<[u8]>::to_vec),
-        server_name: info.server_name.map(str::to_owned),
-        headers,
-        head: info.head,
-        exporter: None,
-    };
-    if !info.has_exporter() {
-        return Ok(f(view));
-    }
-    let (tx, rx) = mpsc::channel();
-    view.exporter = Some(tx.clone());
-    std::thread::scope(|s| {
-        let call = std::thread::Builder::new().spawn_scoped(s, move || {
-            crate::rt::mark_runtime_thread();
-            let r = f(view);
-            let _ = tx.send(Ask::Done);
-            r
-        })?;
-        // Ends with Done; the view's sender may outlive the call.
-        while let Ok(Ask::Export(label, context, len, reply)) = rx.recv() {
-            let _ = reply.send(info.export(&label, &context, len));
-        }
-        call.join()
-            .map_err(|_| std::io::Error::other("the call panicked"))
-    })
 }
 
 /// An admission decision for `serve_*`.
@@ -338,7 +274,7 @@ impl Decision {
 }
 
 /// The native decision of what a decider returned.
-fn decision(v: &Bound<'_, PyAny>) -> PyResult<zmux::Decision> {
+fn decision(v: &Bound<'_, PyAny>) -> PyResult<zmux::AdmissionDecision> {
     if let Ok(d) = v.cast::<Decision>() {
         let d = d.get();
         let verdict = d.verdict.get().native();
@@ -387,92 +323,56 @@ impl Admission {
         Ok(Admission { inner: a, decider })
     }
 
-    /// The admission for a listener made now: an `async` decider's
-    /// coroutines run on the event loop running now, unless one was taken
-    /// already.
-    pub(crate) fn for_listener(&self, py: Python<'_>) -> zmux::Admission {
-        if let Some(d) = &self.decider
-            && let Ok(l) = pyo3_async_runtimes::tokio::get_current_locals(py)
-        {
-            let _ = d.locals.set(l);
-        }
-        self.inner.clone()
+    /// The admission for a listener, and the loop of its Python decider,
+    /// which the listener binds at its first use unless it is bound.
+    pub(crate) fn for_listener(&self) -> (zmux::Admission, Option<LoopRef>) {
+        (
+            self.inner.clone(),
+            self.decider.as_ref().map(|d| d.lp.clone()),
+        )
     }
 }
-
-type Started = Pin<Box<dyn Future<Output = PyResult<Py<PyAny>>> + Send>>;
 
 /// A decision written in Python: `decide(info, prefix)` returning a
 /// `AdmissionVerdict` or `Decision`, or a coroutine resolving to one.
 #[derive(Clone)]
 struct PyDecide {
     decide: Arc<Py<PyAny>>,
-    locals: Arc<OnceLock<TaskLocals>>,
+    lp: LoopRef,
 }
 
-impl PyDecide {
-    /// Calls the decider with the view of `info`: its verdict, or the
-    /// future of its coroutine.
-    fn start(&self, info: &zmux::CarrierInfo<'_>, prefix: &[u8]) -> Result<Py<PyAny>, Started> {
-        let called = with_info(info, |view| {
-            crate::rt::attach(|py| {
-                let r = Py::new(py, view)
-                    .and_then(|v| self.decide.call1(py, (v, PyBytes::new(py, prefix))));
-                match r {
-                    Ok(v) if v.bind(py).hasattr("__await__").unwrap_or(false) => {
-                        let Some(locals) = self.locals.get() else {
-                            return Err(Box::pin(std::future::ready(Err(PyValueError::new_err(
-                                "an async decide needs its Listener made inside a running event loop",
-                            )))) as Started);
-                        };
-                        match crate::rt::into_future(locals, v.into_bound(py)) {
-                            Ok(f) => Err(Box::pin(f) as Started),
-                            Err(e) => Err(Box::pin(std::future::ready(Err(e))) as Started),
-                        }
-                    }
-                    Ok(v) => Ok(v),
-                    Err(e) => Err(Box::pin(std::future::ready(Err(e))) as Started),
-                }
-            })
-        });
-        called.unwrap_or_else(|e| {
-            Err(Box::pin(std::future::ready(Err(PyValueError::new_err(
-                e.to_string(),
-            )))) as Started)
-        })
-    }
-
-    /// The decision of a decider's result; an exception or another value is
-    /// reported as unraisable and closes.
-    fn decision(&self, r: PyResult<Py<PyAny>>) -> zmux::Decision {
-        crate::rt::attach(|py| {
-            let v = r.and_then(|v| decision(v.bind(py)));
-            v.unwrap_or_else(|e| {
-                e.write_unraisable(py, Some(self.decide.bind(py)));
-                zmux::AdmissionVerdict::Close.into()
-            })
-        })
-    }
+/// The decision of a decider's result; an exception or another value is
+/// reported as unraisable and closes.
+fn settle(
+    py: Python<'_>,
+    decide: &Py<PyAny>,
+    r: PyResult<Bound<'_, PyAny>>,
+) -> zmux::AdmissionDecision {
+    r.and_then(|v| decision(&v)).unwrap_or_else(|e| {
+        e.write_unraisable(py, Some(decide.bind(py)));
+        zmux::AdmissionVerdict::Close.into()
+    })
 }
 
 impl zmux::Decide for PyDecide {
-    fn decide<'a>(
-        &'a self,
-        info: &'a zmux::CarrierInfo<'a>,
-        prefix: &'a [u8],
-    ) -> zmux::DecideFuture<'a> {
-        let started = self.start(info, prefix);
-        Box::pin(async move {
-            match started {
-                Ok(v) => self.decision(Ok(v)),
-                // Dropped when the listener gives the decision up: the
-                // coroutine's task is cancelled with it.
-                Err(f) => {
-                    let r = f.await;
-                    self.decision(r)
-                }
-            }
-        })
+    /// Asks the decider on its loop; the listener drops the answer's
+    /// future when it gives the decision up, which cancels the call.
+    fn decide(
+        &self,
+        info: &zmux::CarrierInfo,
+        prefix: &[u8],
+    ) -> zmux::Decision<zmux::AdmissionDecision> {
+        let lp = &self.lp;
+        let (info, prefix) = (info.clone(), prefix.to_vec());
+        let (decide, settling) = (self.decide.clone(), self.decide.clone());
+        zmux::Decision::later(lp.settled(
+            move |py| {
+                let view = Py::new(py, CarrierInfo(info))?;
+                decide.bind(py).call1((view, PyBytes::new(py, &prefix)))
+            },
+            move |py, r| settle(py, &settling, r),
+            || zmux::AdmissionVerdict::Close.into(),
+        ))
     }
 }
 
@@ -480,9 +380,9 @@ impl zmux::Decide for PyDecide {
 impl Admission {
     /// `decide(info, prefix)` returns an `AdmissionVerdict` or `Decision`, or is
     /// `async` and resolves to one within what remains of the peek timeout; cancelled
-    /// (`CancelledError`) when that ends or the listener closes. An `async`
-    /// decide runs on the event loop of the `Listener`'s creation; `info`'s
-    /// exporter answers only before its first `await`.
+    /// (`CancelledError`) when that ends or the listener closes. It runs on
+    /// the event loop running when the admission is made, else on that of
+    /// the `Listener`'s creation.
     #[new]
     #[pyo3(signature = (decide, *, peek=0, max_peek=0, peek_timeout=None, stall=None,
         fallback_on_peek_timeout=false))]
@@ -497,11 +397,8 @@ impl Admission {
     ) -> PyResult<Self> {
         let d = PyDecide {
             decide: Arc::new(decide),
-            locals: Arc::new(OnceLock::new()),
+            lp: LoopRef::lazy(py),
         };
-        if let Ok(l) = pyo3_async_runtimes::tokio::get_current_locals(py) {
-            let _ = d.locals.set(l);
-        }
         let a = zmux::Admission::with_decider(peek, d.clone()).with_max_peek(max_peek);
         Self::with_times(a, Some(d), peek_timeout, stall, fallback_on_peek_timeout)
     }
@@ -517,7 +414,8 @@ impl Admission {
         stall: Option<Bound<'_, PyAny>>,
         fallback_on_peek_timeout: bool,
     ) -> PyResult<Self> {
-        let verifier = zmux::PrefixAuthVerifier::new(auth.0.clone(), skew, max_nonces);
+        let verifier = zmux::PrefixAuthVerifier::new(auth.0.clone(), skew, max_nonces)
+            .map_err(crate::value_err)?;
         let a = zmux::Admission::prefix_auth(Arc::new(verifier));
         Self::with_times(a, None, peek_timeout, stall, fallback_on_peek_timeout)
     }
@@ -602,28 +500,29 @@ impl std::fmt::Debug for PyCarrierCredential {
 }
 
 impl PyCarrierCredential {
-    /// `method(info)`, its result taken by `extract`.
-    fn call<T: Send>(
+    /// `method(info)`, its result taken by `extract`. The Rust trait is
+    /// synchronous and asked on the dialing task, so this enters Python
+    /// from that thread, through the exit gate.
+    fn call<T>(
         &self,
         method: &str,
-        info: &zmux::CarrierInfo<'_>,
-        extract: impl FnOnce(&Bound<'_, PyAny>) -> PyResult<T> + Send,
+        info: &zmux::CarrierInfo,
+        extract: impl FnOnce(&Bound<'_, PyAny>) -> PyResult<T>,
     ) -> std::io::Result<T> {
-        with_info(info, |view| {
-            crate::rt::attach(|py| {
-                let v = self.0.call_method1(py, method, (Py::new(py, view)?,))?;
-                extract(v.bind(py))
-            })
-            .map_err(std::io::Error::other)
-        })?
+        crate::rt::hook_or(Err(crate::rt::exiting()), |py| {
+            let view = Py::new(py, CarrierInfo(info.clone()))?;
+            let v = self.0.call_method1(py, method, (view,))?;
+            extract(v.bind(py))
+        })
+        .map_err(std::io::Error::other)
     }
 }
 
 impl zmux::CarrierCredential for PyCarrierCredential {
-    fn prefix(&self, info: &zmux::CarrierInfo<'_>) -> std::io::Result<Vec<u8>> {
+    fn prefix(&self, info: &zmux::CarrierInfo) -> std::io::Result<Vec<u8>> {
         self.call("prefix", info, |v| v.extract::<Vec<u8>>())
     }
-    fn header(&self, info: &zmux::CarrierInfo<'_>) -> std::io::Result<(String, String)> {
+    fn header(&self, info: &zmux::CarrierInfo) -> std::io::Result<(String, String)> {
         self.call("header", info, |v| v.extract::<(String, String)>())
     }
 }

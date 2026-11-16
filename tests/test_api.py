@@ -1,6 +1,7 @@
 """The stream, session and helper calls of the API and their statistics."""
 
 import asyncio
+import threading
 import contextlib
 import datetime
 import math
@@ -13,12 +14,18 @@ import zmux
 
 @contextlib.asynccontextmanager
 async def pair(
-    client: zmux.Config | None = None, server: zmux.Config | None = None
+    client: zmux.Config | None = None,
+    server: zmux.Config | None = None,
+    max_record: int = 0,
 ) -> AsyncIterator[tuple[zmux.Session, zmux.Session, zmux.Listener]]:
-    """A connected session pair over TCP, and the server's listener."""
+    """A connected session pair over TCP, and the server's listener; the
+    client's carrier takes records of at most `max_record` (0: the
+    default)."""
     async with zmux.Listener(config=server) as listener:
         addr = await listener.serve_tcp("127.0.0.1", 0)
-        c = await zmux.Session.connect(await zmux.dial_tcp(*addr), config=client)
+        pipe = await zmux.dial_tcp(*addr)
+        pipe.set_max_record(max_record)
+        c = await zmux.Session.connect(pipe, config=client)
         s = await listener.accept()
         try:
             yield c, s, listener
@@ -398,7 +405,9 @@ async def test_quality_band_and_capacity_floor() -> None:
         with pytest.raises(ValueError):
             zmux.QualityBand(rate_ratio=bad)
         with pytest.raises(ValueError):
-            zmux.CapacityFloor(rate=1, rate_ratio=bad)
+            zmux.CapacityFloor(rate=1, recovery_ratio=bad)
+    with pytest.raises(ValueError):
+        zmux.CapacityFloor(rate=1, recovery_ratio=0.5)
 
 
 async def test_nested_session_over_a_carrier_stream() -> None:
@@ -410,7 +419,7 @@ async def test_nested_session_over_a_carrier_stream() -> None:
             assert recv.preamble.tlvs == (zmux.Tlv(0x1000, b"route"),)
             inner = await zmux.Session.accept(zmux.adapter.stream_pipe(send, recv))
             with pytest.raises(zmux.StreamError):
-                send.stats()  # used up by stream_pipe
+                send.send_capacity()  # used up by stream_pipe
             a, b = await inner.accept_bi()
             await a.write(await b.read_to_end())
             await a.finish()
@@ -429,24 +438,32 @@ async def test_nested_session_over_a_carrier_stream() -> None:
 
 
 class Counting:
-    """A limiter that allows everything and counts what it was charged."""
+    """A limiter that allows everything and counts what it handed out and
+    got back."""
 
     def __init__(self) -> None:
-        self.charged = 0
+        self.taken = 0
+        self.released = 0
         self.waits = 0
 
-    async def ready(self, least: int, most: int, /) -> int:
+    async def acquire(self, least: int, most: int, /) -> int:
         self.waits += 1
+        self.taken += most
         return most
 
-    def try_ready(self, most: int, /) -> int:
+    def try_acquire(self, least: int, most: int, /) -> int:
+        self.taken += most
         return most
 
-    def charge(self, n: int, /) -> None:
-        self.charged += n
+    def refund(self, n: int, /) -> None:
+        self.released += n
+
+    @property
+    def used(self) -> int:
+        return self.taken - self.released
 
 
-async def test_splice_forwards_and_charges() -> None:
+async def test_splice_forwards_and_takes_what_it_forwards() -> None:
     async with pair() as (c, relay_in, _l1), pair() as (relay_out, server, _l2):
 
         async def relay() -> tuple[zmux.helpers.Spliced, Counting]:
@@ -474,7 +491,7 @@ async def test_splice_forwards_and_charges() -> None:
             done.a_to_b.end is zmux.helpers.SpliceEnd.FINISHED
             and done.a_to_b.code is None
         )
-        assert done.a_to_b.bytes == 700 == limiter.charged
+        assert done.a_to_b.bytes == 700 == limiter.used
         assert done.b_to_a.bytes == 700
 
 
@@ -725,3 +742,34 @@ async def test_flush_succeeds_once_data_left_and_the_stop_comes_after() -> None:
         with pytest.raises(zmux.StreamStoppedError) as w:
             await send.write(b"more")
         assert w.value.code == 0x55
+
+
+def test_hooks_bind_to_the_loop_of_first_use() -> None:
+    seen: list[tuple[int, int]] = []
+
+    class Trace(zmux.Tracer):
+        def established(self, session: int) -> None:
+            seen.append((session, threading.get_ident()))
+
+    # Made with no loop running: bound when the connect uses it.
+    config = zmux.Config(tracer=Trace())
+
+    async def main() -> tuple[int, int]:
+        async with zmux.Listener() as listener:
+            addr = await listener.serve_tcp("127.0.0.1", 0)
+            async with await zmux.connect_tcp(*addr, config=config) as c:
+                await until(lambda: bool(seen))
+                return c.id, threading.get_ident()
+
+    assert seen == [asyncio.run(main())]
+
+
+def test_record_policy_and_budget_are_data() -> None:
+    with pytest.raises(ValueError):
+        zmux.Config(record_policy=zmux.RecordPolicy(default=zmux.RecordMode.UNMANAGED))
+    with pytest.raises(ValueError):
+        zmux.Config(record_policy=zmux.RecordPolicy(by_label={"x": "nonsense"}))
+    zmux.Config(
+        record_policy=zmux.RecordPolicy(secure="bound", by_label={"lan": "trusted"}),
+        shaping_budget=zmux.shaping.ShapingBudget(no_injection=True),
+    )

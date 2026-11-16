@@ -175,14 +175,20 @@ async def test_errors_are_classified_by_what_happened() -> None:
         with pytest.raises(zmux.InvalidArgumentError) as e:
             await c.open_bi(tlvs=[(1, b"reserved")])
         assert isinstance(e.value, ValueError)
-        # The stream part takes one operation at a time.
+        # The stream part takes one operation at a time; a waiting read
+        # holds none.
+        other, _ = await c.open_bi()
+        # The peer reads nothing: the write never ends and holds its part.
+        waiting = asyncio.ensure_future(other.write(b"x" * (16 << 20)))
         read = asyncio.ensure_future(recv.read())
         await asyncio.sleep(0.05)
         with pytest.raises(zmux.StreamBusyError):
-            recv.reject()
-        read.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await read
+            other.set_reliable_boundary()
+        assert recv.receive_window[0] > 0
+        for t in (waiting, read):
+            t.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await t
 
 
 async def test_an_unestablished_peer_is_not_a_pipe_error() -> None:
@@ -343,14 +349,35 @@ def test_the_namespaces_hold_what_they_say() -> None:
     assert isinstance(zmux.__version__, str)
 
 
-def test_a_pipe_input_takes_its_carrier_inputs_when_built() -> None:
+async def test_a_pipe_input_takes_its_carrier_inputs_when_built() -> None:
     count = zmux.adapter.UnsentCount(7)
     pipe, _end = zmux.adapter.pipe_pair(
-        unsent=count, max_record=1024, exporter=lambda *_: None
+        unsent=count, max_record=8192, exporter=lambda *_: None
     )
     assert not hasattr(pipe, "unsent") and not hasattr(pipe, "exporter")
+    zmux.adapter.pipe_pair(max_record=0)  # the carrier's default
+    zmux.adapter.pipe_pair(max_record=1 << 40)  # no upper bound
+    with pytest.raises(zmux.InvalidArgumentError) as e:
+        zmux.adapter.pipe_pair(max_record=8191)
+    assert e.value.kind is zmux.ErrorKind.INVALID_CONFIG
+
+
+def test_a_refused_record_limit_leaves_the_pipe_input_usable() -> None:
+    pipe, _end = zmux.adapter.pipe_pair()
+    for bad in (1, 4096, 8191):
+        with pytest.raises(zmux.InvalidArgumentError):
+            pipe.set_max_record(bad)
+    pipe.set_max_record(0)
+    pipe.set_max_record(8192)
+    pipe.set_max_record(1 << 20)  # the smaller limit holds
+    assert pipe.into_stream() is not None
+
+
+def test_config_max_send_record() -> None:
+    assert zmux.Config().max_send_record == 16382
+    zmux.Config(max_send_record=1 << 30)  # no upper bound
     with pytest.raises(ValueError):
-        zmux.adapter.pipe_pair(max_record=0)
+        zmux.Config(max_send_record=8191)
 
 
 async def test_a_pipe_input_is_used_once() -> None:

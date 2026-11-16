@@ -1,18 +1,18 @@
 //! The secure carrier: `establish`, `SecureServer`, the trust of `PinVerifier`, and
 //! hosts' own verifiers and gates in Python, synchronous or `async`.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple};
-use pyo3_async_runtimes::TaskLocals;
 use zmux::RecordMode;
 use zmux_seal as seal;
 use zmux_seal::{BoxFuture, VerifyError};
 
-use crate::rt::{self, future_into_py};
+use crate::rt::{self, LoopRef, future_into_py};
 use crate::{PipeIo, admission, types};
 
 /// A record mode a pipe can be given: sealed, bound or trusted.
@@ -42,64 +42,61 @@ fn source_obj(s: Option<SocketAddr>) -> Option<(String, u16)> {
     s.map(|a| (a.ip().to_string(), a.port()))
 }
 
-/// Calls `f` and waits for its result when it is awaitable.
-async fn call(
-    f: impl for<'p> FnOnce(Python<'p>) -> PyResult<Bound<'p, PyAny>>,
-    locals: &TaskLocals,
-) -> PyResult<Py<PyAny>> {
-    let pending = rt::attach(|py| -> PyResult<_> {
-        let r = f(py)?;
-        if r.hasattr("__await__")? {
-            Ok(Err(rt::into_future(locals, r)?))
-        } else {
-            Ok(Ok(r.unbind()))
-        }
-    })?;
-    match pending {
-        Ok(v) => Ok(v),
-        Err(f) => f.await,
-    }
-}
-
-/// Calls `method` of `target` with `args` and waits for its result when it is awaitable.
-async fn call_method(
-    target: &Py<PyAny>,
-    method: &str,
-    locals: &TaskLocals,
-    args: impl for<'p> FnOnce(Python<'p>) -> PyResult<Bound<'p, PyTuple>>,
-) -> PyResult<Py<PyAny>> {
-    call(|py| target.bind(py).call_method1(method, args(py)?), locals).await
+/// Calls `method` of `target` with the arguments `args` makes, on `lp`'s loop, and
+/// awaits its result there when it is awaitable: what `out` takes of it, or the
+/// exception as a verification failure.
+fn call_method<R, A, O>(
+    target: &Arc<Py<PyAny>>,
+    method: &'static str,
+    lp: &LoopRef,
+    args: A,
+    out: O,
+) -> impl Future<Output = Result<R, VerifyError>> + Send + 'static + use<R, A, O>
+where
+    R: Send + 'static,
+    A: for<'p> FnOnce(Python<'p>) -> PyResult<Bound<'p, PyTuple>> + Send + 'static,
+    O: for<'p> FnOnce(&Bound<'p, PyAny>) -> PyResult<R> + Send + 'static,
+{
+    let target = target.clone();
+    lp.settled(
+        move |py| target.bind(py).call_method1(method, args(py)?),
+        move |py, r| r.and_then(|v| out(&v)).map_err(|e| verify_err(py, &e)),
+        || Err(VerifyError::unavailable("the event loop dropped the call")),
+    )
 }
 
 /// A host's exception as a verification failure: `VerifyUnavailableError` is temporary, any
 /// other a rejection.
-fn verify_err(e: PyErr) -> VerifyError {
-    rt::attach(|py| {
-        if e.matches(py, crate::err_type(py, "VerifyUnavailableError"))
-            .unwrap_or(false)
-        {
-            VerifyError::unavailable(e.to_string())
-        } else {
-            VerifyError::rejected(e.to_string())
-        }
-    })
+fn verify_err(py: Python<'_>, e: &PyErr) -> VerifyError {
+    if e.matches(py, crate::err_type(py, "VerifyUnavailableError"))
+        .unwrap_or(false)
+    {
+        VerifyError::unavailable(e.to_string())
+    } else {
+        VerifyError::rejected(e.to_string())
+    }
 }
 
 /// The error of a failed Establish: `NoReplyError` (its `__cause__` the end or the
-/// timeout), `ValueError` for a configuration mistake, or the carrier's error.
+/// timeout), `ValueError` for a configuration mistake, `InvalidArgumentError` of kind
+/// `TooLarge` for a handshake message of this side above 8192 bytes (such as
+/// application data too large for the room left), or the carrier's error.
 fn establish_err(e: std::io::Error) -> PyErr {
     let Some(inner) = e.get_ref() else {
         return crate::io_err(e);
     };
+    if e.kind() == std::io::ErrorKind::InvalidInput
+        && let Some(seal::Error::TooLarge) = inner.downcast_ref::<seal::Error>()
+    {
+        return crate::raise("InvalidArgumentError", &seal::Error::TooLarge, false, None);
+    }
     if let Some(c) = inner.downcast_ref::<seal::ConfigError>() {
         return PyValueError::new_err(c.to_string());
     }
     if let Some(n) = inner.downcast_ref::<seal::NoReply>() {
-        return rt::attach(|py| {
-            let err = crate::new_err("NoReplyError", n.to_string());
-            let cause = pyo3::exceptions::PyOSError::new_err(n.0.to_string());
-            err.set_cause(py, Some(cause));
-            err
+        let cause = pyo3::exceptions::PyOSError::new_err(n.0.to_string());
+        return rt::decorate(crate::new_err("NoReplyError", n.to_string()), |py, v| {
+            let _ = v.setattr("__cause__", cause.into_value(py));
         });
     }
     crate::io_err(e)
@@ -170,16 +167,41 @@ fn credential_obj<'p>(
     c.map(|(k, b)| (k, PyBytes::new(py, b)))
 }
 
-fn verify_input_obj<'p>(py: Python<'p>, i: &seal::VerifyInput<'_>) -> PyResult<Bound<'p, PyAny>> {
+/// A [`seal::VerifyInput`] owned, for the loop's thread.
+struct Input {
+    role: zmux::Role,
+    profile: u64,
+    peer_static: Vec<u8>,
+    psk_identity: Option<Vec<u8>>,
+    credential: Option<(u64, Vec<u8>)>,
+    local_context: Vec<u8>,
+    peer_app_data: Vec<seal::AppData>,
+}
+
+impl Input {
+    fn of(i: &seal::VerifyInput<'_>) -> Self {
+        Input {
+            role: i.role,
+            profile: i.profile.value(),
+            peer_static: i.peer_static.to_vec(),
+            psk_identity: i.psk_identity.map(<[u8]>::to_vec),
+            credential: i.credential.map(|(k, c)| (k, c.to_vec())),
+            local_context: i.local_context.to_vec(),
+            peer_app_data: i.peer_app_data.to_vec(),
+        }
+    }
+}
+
+fn verify_input_obj<'p>(py: Python<'p>, i: &Input) -> PyResult<Bound<'p, PyAny>> {
     let role = crate::role_obj(py, i.role)?;
     types(py)?.getattr("VerifyInput")?.call1((
         role,
-        i.profile.value(),
-        PyBytes::new(py, i.peer_static),
-        i.psk_identity.map(|h| PyBytes::new(py, h)),
-        credential_obj(py, i.credential),
-        PyBytes::new(py, i.local_context),
-        app_data_obj(py, i.peer_app_data)?,
+        i.profile,
+        PyBytes::new(py, &i.peer_static),
+        i.psk_identity.as_ref().map(|h| PyBytes::new(py, h)),
+        credential_obj(py, i.credential.as_ref().map(|(k, c)| (*k, c.as_slice()))),
+        PyBytes::new(py, &i.local_context),
+        app_data_obj(py, &i.peer_app_data)?,
     ))
 }
 
@@ -371,8 +393,8 @@ impl SigningKey {
 /// A host's signer: `proof_key` is `(key_alg, public key)`, and `sign(message)` returns
 /// the signature, synchronously or `async`.
 struct PySigner {
-    obj: Py<PyAny>,
-    locals: TaskLocals,
+    obj: Arc<Py<PyAny>>,
+    lp: LoopRef,
     key_alg: u64,
     public: Vec<u8>,
 }
@@ -383,25 +405,26 @@ impl seal::Signer for PySigner {
     }
 
     fn sign<'a>(&'a self, message: &'a [u8]) -> BoxFuture<'a, std::io::Result<Vec<u8>>> {
-        Box::pin(async move {
-            let r = call_method(&self.obj, "sign", &self.locals, |py| {
-                (PyBytes::new(py, message),).into_pyobject(py)
-            })
-            .await
-            .map_err(std::io::Error::other)?;
-            rt::attach(|py| r.bind(py).extract::<Vec<u8>>()).map_err(std::io::Error::other)
-        })
+        let (obj, message) = (self.obj.clone(), message.to_vec());
+        let call = self.lp.call(
+            move |py| {
+                obj.bind(py)
+                    .call_method1("sign", (PyBytes::new(py, &message),))
+            },
+            |v| v.extract::<Vec<u8>>(),
+        );
+        Box::pin(async move { call.await.map_err(std::io::Error::other) })
     }
 }
 
-fn signer_of(v: &Bound<'_, PyAny>, locals: &TaskLocals) -> PyResult<Arc<dyn seal::Signer>> {
+fn signer_of(v: &Bound<'_, PyAny>, lp: &LoopRef) -> PyResult<Arc<dyn seal::Signer>> {
     if let Ok(k) = v.cast::<SigningKey>() {
         return Ok(k.get().0.clone());
     }
     let (key_alg, public): (u64, Vec<u8>) = v.getattr("proof_key")?.extract()?;
     Ok(Arc::new(PySigner {
-        obj: v.clone().unbind(),
-        locals: locals.clone(),
+        obj: Arc::new(v.clone().unbind()),
+        lp: lp.clone(),
         key_alg,
         public,
     }))
@@ -409,65 +432,61 @@ fn signer_of(v: &Bound<'_, PyAny>, locals: &TaskLocals) -> PyResult<Arc<dyn seal
 
 /// A host's verifier: an object with `verify(input)` returning a `VerifyVerdict`, or
 /// raising `VerifyRejectedError` or `VerifyUnavailableError`; any other exception rejects.
-struct PyVerifier(Py<PyAny>, TaskLocals);
+struct PyVerifier(Arc<Py<PyAny>>, LoopRef);
 
 impl seal::Verifier for PyVerifier {
     fn verify<'a>(
         &'a self,
         input: seal::VerifyInput<'a>,
     ) -> BoxFuture<'a, Result<seal::VerifyVerdict, VerifyError>> {
-        Box::pin(async move {
-            let r = call_method(&self.0, "verify", &self.1, |py| {
-                (verify_input_obj(py, &input)?,).into_pyobject(py)
-            })
-            .await
-            .map_err(verify_err)?;
-            rt::attach(|py| verdict_of(r.bind(py))).map_err(verify_err)
-        })
+        let input = Input::of(&input);
+        Box::pin(call_method(
+            &self.0,
+            "verify",
+            &self.1,
+            move |py| (verify_input_obj(py, &input)?,).into_pyobject(py),
+            verdict_of,
+        ))
     }
 }
 
-fn verifier_of(v: &Bound<'_, PyAny>, locals: &TaskLocals) -> Arc<dyn seal::Verifier> {
+fn verifier_of(v: &Bound<'_, PyAny>, lp: &LoopRef) -> Arc<dyn seal::Verifier> {
     if let Ok(a) = v.cast::<PinVerifier>() {
         return a.get().0.clone();
     }
-    Arc::new(PyVerifier(v.clone().unbind(), locals.clone()))
+    Arc::new(PyVerifier(Arc::new(v.clone().unbind()), lp.clone()))
 }
 
 /// An `app_data=` callable: `(message, peer, verdict)` returning `bytes` or `None`,
 /// synchronously or `async`; `peer` is the `VerifyInput` known by then, `None` for
 /// message 1, and `verdict` the client's verifier's on the server for message 3, `None`
 /// otherwise. An exception fails the handshake.
-fn app_data_of(f: &Bound<'_, PyAny>, locals: &TaskLocals) -> seal::AppDataSource {
+fn app_data_of(f: &Bound<'_, PyAny>, lp: &LoopRef) -> seal::AppDataSource {
     let f = Arc::new(f.clone().unbind());
-    let locals = locals.clone();
+    let lp = lp.clone();
     Arc::new(
         move |r: &seal::AppDataRequest<'_>| -> BoxFuture<'static, Result<Vec<u8>, VerifyError>> {
-            let started = rt::attach(|py| -> PyResult<_> {
-                let peer = r.peer.map(|i| verify_input_obj(py, i)).transpose()?;
-                let verdict = r.verdict.map(|v| verdict_obj(py, v)).transpose()?;
-                let out = f.bind(py).call1((r.message, peer, verdict))?;
-                if out.hasattr("__await__")? {
-                    Ok(Err(rt::into_future(&locals, out)?))
-                } else {
-                    Ok(Ok(out.unbind()))
-                }
-            });
-            Box::pin(async move {
-                let v = match started.map_err(verify_err)? {
-                    Ok(v) => v,
-                    Err(pending) => pending.await.map_err(verify_err)?,
-                };
-                rt::attach(|py| {
-                    let v = v.bind(py);
-                    if v.is_none() {
-                        Ok(Vec::new())
-                    } else {
-                        v.extract::<Vec<u8>>()
-                    }
-                })
-                .map_err(verify_err)
-            })
+            let (f, message) = (f.clone(), r.message);
+            let peer = r.peer.map(Input::of);
+            let verdict = r.verdict.cloned();
+            Box::pin(lp.settled(
+                move |py| {
+                    let peer = peer.as_ref().map(|i| verify_input_obj(py, i)).transpose()?;
+                    let verdict = verdict.as_ref().map(|v| verdict_obj(py, v)).transpose()?;
+                    f.bind(py).call1((message, peer, verdict))
+                },
+                |py, r| {
+                    r.and_then(|v| {
+                        if v.is_none() {
+                            Ok(Vec::new())
+                        } else {
+                            v.extract::<Vec<u8>>()
+                        }
+                    })
+                    .map_err(|e| verify_err(py, &e))
+                },
+                || Err(VerifyError::unavailable("the event loop dropped the call")),
+            ))
         },
     )
 }
@@ -477,7 +496,9 @@ fn static_secret(v: &Bound<'_, PyAny>) -> PyResult<seal::StaticSecret> {
     if crate::is_setting(v, "AUTO")? {
         return Ok(seal::StaticSecret::Process);
     }
-    Ok(seal::StaticSecret::Given(v.extract()?))
+    Ok(seal::StaticSecret::Given(seal::StaticKey::from(
+        v.extract::<[u8; 32]>()?,
+    )))
 }
 
 /// Runs the client's handshake on `pipe`: the carrier for `Session.connect`, with what it
@@ -513,15 +534,15 @@ fn establish<'p>(
     shaping_limits: Option<Bound<'p, PyAny>>,
     reply_timeout: Option<f64>,
 ) -> PyResult<Bound<'p, PyAny>> {
-    let locals = pyo3_async_runtimes::tokio::get_current_locals(py)?;
+    let lp = LoopRef::running(py, "establish")?;
     let reply_timeout = reply_timeout
         .map(|s| crate::seconds("reply_timeout", s))
         .transpose()?;
     let cfg = seal::ClientConfig {
-        verifier: verifier.map(|a| verifier_of(&a, &locals)),
+        verifier: verifier.map(|a| verifier_of(&a, &lp)),
         allow_psk_only,
         handle,
-        psk,
+        psk: psk.into(),
         static_secret: match &static_secret {
             Some(v) => self::static_secret(v)?,
             None => seal::StaticSecret::Process,
@@ -534,11 +555,11 @@ fn establish<'p>(
         },
         credential,
         local_context,
-        app_data: app_data.map(|f| app_data_of(&f, &locals)),
+        app_data: app_data.map(|f| app_data_of(&f, &lp)),
         max_app_data,
         require_pq_auth,
-        signer: signer.map(|s| signer_of(&s, &locals)).transpose()?,
-        shaper: shaper.as_ref().map(crate::shaping::hook_of),
+        signer: signer.map(|s| signer_of(&s, &lp)).transpose()?,
+        shaper: shaper.as_ref().map(crate::shaping::hook_of).transpose()?,
         shaping_limits: shaping_limits
             .as_ref()
             .map(crate::shaping::limits_of)
@@ -548,10 +569,10 @@ fn establish<'p>(
     let io = pipe.take()?;
     future_into_py(py, async move {
         let (io, peer) = seal::establish(io, &cfg).await.map_err(establish_err)?;
-        rt::attach(|py| -> PyResult<Py<PyAny>> {
+        Ok(rt::deferred(move |py| {
             let out = (Py::new(py, PipeIo::wrap(io))?, peer_obj(py, &peer)?);
             Ok(out.into_pyobject(py)?.into_any().unbind())
-        })
+        }))
     })
 }
 
@@ -560,7 +581,7 @@ fn establish<'p>(
 /// `None`, and `commit(handle, peer, source)` whose result is the session's `admitted`.
 /// Each raises `VerifyRejectedError` or `VerifyUnavailableError` to refuse; any other exception
 /// is a rejection.
-struct PyGate(Py<PyAny>, TaskLocals);
+struct PyGate(Arc<Py<PyAny>>, LoopRef);
 
 impl seal::Gate for PyGate {
     fn resolve<'a>(
@@ -568,14 +589,14 @@ impl seal::Gate for PyGate {
         handle: &'a [u8],
         source: Option<SocketAddr>,
     ) -> BoxFuture<'a, Result<Vec<u8>, VerifyError>> {
-        Box::pin(async move {
-            let r = call_method(&self.0, "resolve", &self.1, |py| {
-                (PyBytes::new(py, handle), source_obj(source)).into_pyobject(py)
-            })
-            .await
-            .map_err(verify_err)?;
-            rt::attach(|py| r.bind(py).extract::<Vec<u8>>()).map_err(verify_err)
-        })
+        let handle = handle.to_vec();
+        Box::pin(call_method(
+            &self.0,
+            "resolve",
+            &self.1,
+            move |py| (PyBytes::new(py, &handle), source_obj(source)).into_pyobject(py),
+            |v| v.extract::<Vec<u8>>(),
+        ))
     }
 
     fn credential<'a>(
@@ -585,20 +606,22 @@ impl seal::Gate for PyGate {
         local_context: &'a [u8],
         source: Option<SocketAddr>,
     ) -> BoxFuture<'a, Result<Option<seal::Credential>, VerifyError>> {
-        Box::pin(async move {
-            let r = call_method(&self.0, "credential", &self.1, |py| {
+        let (handle, local_context) = (handle.to_vec(), local_context.to_vec());
+        Box::pin(call_method(
+            &self.0,
+            "credential",
+            &self.1,
+            move |py| {
                 (
-                    PyBytes::new(py, handle),
+                    PyBytes::new(py, &handle),
                     profile.value(),
-                    PyBytes::new(py, local_context),
+                    PyBytes::new(py, &local_context),
                     source_obj(source),
                 )
                     .into_pyobject(py)
-            })
-            .await
-            .map_err(verify_err)?;
-            rt::attach(|py| r.bind(py).extract::<Option<seal::Credential>>()).map_err(verify_err)
-        })
+            },
+            |v| v.extract::<Option<seal::Credential>>(),
+        ))
     }
 
     fn commit<'a>(
@@ -606,19 +629,21 @@ impl seal::Gate for PyGate {
         admission: seal::Admission<'a>,
         source: Option<SocketAddr>,
     ) -> BoxFuture<'a, Result<zmux::AdmittedValue, VerifyError>> {
-        Box::pin(async move {
-            let r = call_method(&self.0, "commit", &self.1, |py| {
+        let (handle, peer) = (admission.handle.to_vec(), admission.peer.clone());
+        Box::pin(call_method(
+            &self.0,
+            "commit",
+            &self.1,
+            move |py| {
                 (
-                    PyBytes::new(py, admission.handle),
-                    peer_obj(py, admission.peer)?,
+                    PyBytes::new(py, &handle),
+                    peer_obj(py, &peer)?,
                     source_obj(source),
                 )
                     .into_pyobject(py)
-            })
-            .await
-            .map_err(verify_err)?;
-            Ok(Arc::new(r) as zmux::AdmittedValue)
-        })
+            },
+            |v| Ok(Arc::new(v.clone().unbind()) as zmux::AdmittedValue),
+        ))
     }
 }
 
@@ -707,7 +732,7 @@ impl SecureServer {
             accepted_profiles: accepted_profiles
                 .unwrap_or_else(|| seal::ServerOptions::default().accepted_profiles),
             allow_record_mode: allow_record_mode.map(Arc::new),
-            shaper: shaper.map(crate::shaping::hook_of),
+            shaper: shaper.map(crate::shaping::hook_of).transpose()?,
             shaping_limits: shaping_limits.map(crate::shaping::limits_of).transpose()?,
             client_verifier,
             local_context,
@@ -749,42 +774,35 @@ impl SecureServer {
     pub(crate) fn transform(
         &self,
         py: Python<'_>,
-        locals: TaskLocals,
+        lp: LoopRef,
     ) -> PyResult<zmux::InboundTransform> {
-        let check = self
-            .allow_record_mode
-            .clone()
-            .map(|f| -> Arc<seal::ModeCheck> {
-                Arc::new(move |mode, peer| {
-                    rt::attach(|py| {
-                        let asked = (|| -> PyResult<bool> {
-                            f.bind(py)
-                                .call1((record_mode_obj(py, mode)?, peer_obj(py, peer)?))?
-                                .extract()
-                        })();
-                        asked.unwrap_or_else(|e| {
-                            e.write_unraisable(py, Some(f.bind(py)));
-                            false
-                        })
-                    })
-                })
-            });
+        let check = self.allow_record_mode.clone().map(|f| {
+            let lp = lp.clone();
+            seal::ModeCheck::new_async(move |mode, peer| {
+                lp.decide(
+                    &f,
+                    move |f| {
+                        let py = f.py();
+                        f.call1((record_mode_obj(py, mode)?, peer_obj(py, &peer)?))
+                    },
+                    |v| v.extract::<bool>(),
+                    || false,
+                )
+            })
+        });
         let verifier = self
             .client_verifier
             .as_ref()
-            .map(|v| verifier_of(v.bind(py), &locals));
+            .map(|v| verifier_of(v.bind(py), &lp));
         let signer = self
             .signer
             .as_ref()
-            .map(|s| signer_of(s.bind(py), &locals))
+            .map(|s| signer_of(s.bind(py), &lp))
             .transpose()?;
-        let app_data = self
-            .app_data
-            .as_ref()
-            .map(|f| app_data_of(f.bind(py), &locals));
+        let app_data = self.app_data.as_ref().map(|f| app_data_of(f.bind(py), &lp));
         Ok(self
             .server(
-                Arc::new(PyGate(self.gate.clone_ref(py), locals)),
+                Arc::new(PyGate(Arc::new(self.gate.clone_ref(py)), lp)),
                 check,
                 verifier,
                 signer,
@@ -796,7 +814,7 @@ impl SecureServer {
     fn server(
         &self,
         gate: Arc<dyn seal::Gate>,
-        check: Option<Arc<seal::ModeCheck>>,
+        check: Option<seal::ModeCheck>,
         client_verifier: Option<Arc<dyn seal::Verifier>>,
         signer: Option<Arc<dyn seal::Signer>>,
         app_data: Option<seal::AppDataSource>,
@@ -817,12 +835,16 @@ impl SecureServer {
     }
 }
 
-/// The verdict of a Python `on_reject`; one that raises closes the carrier.
-pub(crate) fn on_reject(f: Py<PyAny>) -> zmux::proto::listener::OnReject {
+/// The verdict of a Python `on_reject`, asked on `lp`'s loop; one that
+/// raises closes the carrier.
+pub(crate) fn on_reject(f: Py<PyAny>, lp: LoopRef) -> zmux::proto::listener::OnReject {
     use zmux::proto::listener::RejectAction;
-    zmux::proto::listener::OnReject::new(move |info| {
-        rt::attach(|py| {
-            let asked = (|| -> PyResult<String> {
+    let f = Arc::new(f);
+    zmux::proto::listener::OnReject::new_async(move |info| {
+        lp.decide(
+            &f,
+            move |f| {
+                let py = f.py();
                 let mode = info
                     .record_mode
                     .map(|m| record_mode_obj(py, m))
@@ -833,52 +855,73 @@ pub(crate) fn on_reject(f: Py<PyAny>) -> zmux::proto::listener::OnReject {
                     info.reason,
                     source_obj(info.source),
                 ))?;
-                let r = f.bind(py).call1((i,))?;
-                r.str()?.extract()
-            })();
-            match asked.as_deref() {
-                Ok("stall") => RejectAction::Stall,
-                Ok(_) => RejectAction::Close,
-                Err(e) => {
-                    e.clone_ref(py).write_unraisable(py, Some(f.bind(py)));
+                f.call1((i,))
+            },
+            |v| {
+                Ok(if v.str()?.extract::<String>()? == "stall" {
+                    RejectAction::Stall
+                } else {
                     RejectAction::Close
-                }
-            }
-        })
+                })
+            },
+            || RejectAction::Close,
+        )
     })
 }
 
-/// `Config(record_policy=...)`: called with the carrier's description.
-pub(crate) fn record_policy(f: Py<PyAny>) -> zmux::RecordPolicy {
-    zmux::RecordPolicy::new(move |c| {
-        rt::attach(|py| {
-            let asked = (|| -> PyResult<RecordMode> {
-                record_mode_of(&f.bind(py).call1((description(py, c)?,))?)
-            })();
-            asked.unwrap_or_else(|e| {
-                e.write_unraisable(py, Some(f.bind(py)));
-                RecordMode::Sealed
-            })
-        })
-    })
+/// `Config(record_policy=...)`, a `zmux.RecordPolicy`: data, chosen from
+/// in Rust in the call that adds a pipe, so that no join asks Python on the
+/// runtime's threads. A pipe's label in `by_label` picks its mode, else a
+/// secure carrier takes `secure` when given, else `default`.
+pub(crate) fn record_policy(v: &Bound<'_, PyAny>) -> PyResult<zmux::RecordPolicy> {
+    let mode = |m: &Bound<'_, PyAny>| -> PyResult<RecordMode> {
+        let m = record_mode_of(m)?;
+        if !m.joinable() {
+            return Err(PyValueError::new_err(
+                "a record policy chooses no unmanaged mode",
+            ));
+        }
+        Ok(m)
+    };
+    let default = mode(&v.getattr("default")?)?;
+    let secure = Some(v.getattr("secure")?)
+        .filter(|m| !m.is_none())
+        .map(|m| mode(&m))
+        .transpose()?;
+    let mut by_label = std::collections::HashMap::<Arc<str>, RecordMode>::new();
+    for item in v
+        .getattr("by_label")?
+        .cast::<pyo3::types::PyMapping>()?
+        .items()?
+        .iter()
+    {
+        let (k, m): (String, Bound<'_, PyAny>) = item.extract()?;
+        by_label.insert(k.into(), mode(&m)?);
+    }
+    Ok(zmux::RecordPolicy::new(move |c| {
+        c.label
+            .as_ref()
+            .and_then(|l| by_label.get(l).copied())
+            .or(secure.filter(|_| c.secure))
+            .unwrap_or(default)
+    }))
 }
 
-/// `Config(allow_record_mode=...)`: called with the carrier, the mode and the session's
-/// host value.
-pub(crate) fn allow_record_mode(f: Py<PyAny>) -> zmux::AllowRecordMode {
-    zmux::AllowRecordMode::new(move |c, mode, admitted| {
-        rt::attach(|py| {
-            let asked = (|| -> PyResult<bool> {
-                let v = admission::admitted_obj(py, admitted);
-                f.bind(py)
-                    .call1((description(py, c)?, record_mode_obj(py, mode)?, v))?
-                    .extract()
-            })();
-            asked.unwrap_or_else(|e| {
-                e.write_unraisable(py, Some(f.bind(py)));
-                false
-            })
-        })
+/// `Config(allow_record_mode=...)`: called on `lp`'s loop with the carrier,
+/// the mode and the session's host value; an exception refuses.
+pub(crate) fn allow_record_mode(f: Py<PyAny>, lp: LoopRef) -> zmux::AllowRecordMode {
+    let f = Arc::new(f);
+    zmux::AllowRecordMode::new_async(move |c, mode, admitted| {
+        lp.decide(
+            &f,
+            move |f| {
+                let py = f.py();
+                let v = admission::admitted_obj(py, admitted.as_ref());
+                f.call1((description(py, &c)?, record_mode_obj(py, mode)?, v))
+            },
+            |v| v.extract::<bool>(),
+            || false,
+        )
     })
 }
 
