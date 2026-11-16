@@ -28,9 +28,12 @@ async def drains() -> AsyncIterator[None]:
     original = loop.add_reader
 
     def add_reader(fd: Any, cb: Any, *args: Any) -> Any:
+        result = original(fd, cb, *args)
+        # Recorded only once the loop took it: the proactor loop raises
+        # NotImplementedError and the native side falls back.
         if type(cb).__name__ == "Drain":
             READERS[fd] = cb
-        return original(fd, cb, *args)
+        return result
 
     setattr(loop, "add_reader", add_reader)  # noqa: B010
     yield
