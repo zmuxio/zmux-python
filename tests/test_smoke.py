@@ -12,6 +12,7 @@ Tls = tuple[zmux.TlsConfig, zmux.TlsConfig]
 
 @pytest.fixture(scope="module")
 def tls() -> Tls:
+    pytest.importorskip("cryptography")  # no 32-bit Windows wheels
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec
