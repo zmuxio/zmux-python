@@ -4,6 +4,7 @@ define them."""
 import asyncio
 import contextlib
 import math
+import sys
 from collections.abc import AsyncIterator
 
 import pytest
@@ -356,7 +357,7 @@ async def test_a_pipe_input_takes_its_carrier_inputs_when_built() -> None:
     )
     assert not hasattr(pipe, "unsent") and not hasattr(pipe, "exporter")
     zmux.adapter.pipe_pair(max_record=0)  # the carrier's default
-    zmux.adapter.pipe_pair(max_record=1 << 40)  # no upper bound
+    zmux.adapter.pipe_pair(max_record=sys.maxsize)  # no upper bound
     with pytest.raises(zmux.InvalidArgumentError) as e:
         zmux.adapter.pipe_pair(max_record=8191)
     assert e.value.kind is zmux.ErrorKind.INVALID_CONFIG

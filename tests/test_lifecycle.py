@@ -85,7 +85,7 @@ async def test_a_panic_reaches_the_awaiter() -> None:
     _, end = zmux.adapter.pipe_pair()
     try:
         # A length no allocation takes panics in the future.
-        await asyncio.wait_for(end.read(2**63 + 1), 10)
+        await asyncio.wait_for(end.read(sys.maxsize + 1), 10)
     except RuntimeError as e:
         assert "internal error" in str(e)
     else:
@@ -99,7 +99,7 @@ async def test_a_cancelled_long_read_keeps_what_it_read() -> None:
         await send.flush()
         _, recv = await s.accept_bi()
         with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(recv.read_exact(2**63 + 1), 0.05)
+            await asyncio.wait_for(recv.read_exact(sys.maxsize + 1), 0.05)
         assert await asyncio.wait_for(recv.read(1), 10) == b"x"
 
 
