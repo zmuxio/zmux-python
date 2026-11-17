@@ -453,5 +453,5 @@ async def test_huge_read_sizes_on_a_stream(
         await send.write(b"xy")
         await send.finish()
         with pytest.raises(zmux.IncompleteReadError) as e:
-            await recv.read_exact(1 << 62)
+            await recv.read_exact(sys.maxsize)
     assert e.value.partial == b"xy"
