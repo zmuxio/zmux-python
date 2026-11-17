@@ -699,6 +699,15 @@ fn pipe_liveness_obj<'p>(py: Python<'p>, l: &zmux::PipeLiveness) -> PyResult<Bou
     types(py)?.getattr("PipeLiveness")?.call((), Some(&d))
 }
 
+/// A future that panics, for the test of how a panic reaches its awaiter.
+#[pyfunction(name = "_panic")]
+fn panic_future(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+    future_into_py(py, async move {
+        std::hint::black_box(Err::<(), &str>("no value")).expect("deliberate");
+        Ok(())
+    })
+}
+
 /// The library's defaults of the `zmux.Config` fields that hold values,
 /// the one source of the Python defaults; `liveness` the defaults of
 /// `zmux.Liveness`.
@@ -1503,7 +1512,7 @@ impl PipeEnd {
                 if let Some(b) = unread_take(&unread, n) {
                     return Ok((rt::Bin(b), r));
                 }
-                let mut buf = bytes::BytesMut::with_capacity(n);
+                let mut buf = bytes::BytesMut::with_capacity(read_alloc(n));
                 r.read_buf(&mut buf).await.map_err(io_err)?;
                 Ok((rt::Bin(buf.freeze()), r))
             },
@@ -2613,7 +2622,11 @@ fn quality_band(b: &Bound<'_, PyAny>) -> PyResult<zmux::QualityBand> {
     let rtt: Option<f64> = b.getattr("rtt")?.extract()?;
     Ok(zmux::QualityBand {
         rtt: rtt.map(|v| seconds("rtt", v)).transpose()?,
-        rate_ratio: b.getattr("rate_ratio")?.extract()?,
+        // Python's "1 or less" is the native 1: every change (the native 0 is off).
+        rate_ratio: b
+            .getattr("rate_ratio")?
+            .extract::<Option<f64>>()?
+            .map(|r| r.max(1.0)),
         min_interval: seconds("min_interval", b.getattr("min_interval")?.extract()?)?,
     })
 }
@@ -4792,6 +4805,15 @@ where
     )
 }
 
+/// The most one stream read allocates up front. A read returns what is
+/// there, up to `n`, so a huge `n` must not size the buffer.
+const READ_ALLOC_MAX: usize = 1 << 20;
+
+/// The buffer size for a read of up to `n` bytes.
+pub(crate) fn read_alloc(n: usize) -> usize {
+    n.min(READ_ALLOC_MAX)
+}
+
 pub(crate) fn unread_take(unread: &Unread, max: usize) -> Option<Bytes> {
     let mut q = lock(unread);
     let front = q.front_mut()?;
@@ -5714,6 +5736,7 @@ fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     rt::register(m)?;
     m.add_class::<Config>()?;
     m.add_function(wrap_pyfunction!(config_defaults, m)?)?;
+    m.add_function(wrap_pyfunction!(panic_future, m)?)?;
     m.add_class::<shaping::ShapingBundle>()?;
     m.add_class::<shaping::InstalledShaper>()?;
     m.add_class::<TlsConfig>()?;

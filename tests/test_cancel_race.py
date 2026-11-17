@@ -5,6 +5,7 @@ just after the loop runs the completions, the call's among them."""
 
 import asyncio
 import random
+import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any
@@ -559,3 +560,13 @@ async def test_writable_after_reset_raises() -> None:
                     await send.writable()
                     send.try_write(b"x")
                     await asyncio.sleep(0.01)
+
+
+async def test_huge_read_size_allocates_nothing_up_front() -> None:
+    """A read returns what is there, up to `n`; a huge `n` sizes no buffer."""
+    pipe, end = zmux.adapter.pipe_pair()
+    stream = pipe.into_stream()
+    await stream.write(b"hello")
+    assert await asyncio.wait_for(end.read(sys.maxsize), 5) == b"hello"
+    await end.write(b"world")
+    assert await asyncio.wait_for(stream.read(sys.maxsize), 5) == b"world"

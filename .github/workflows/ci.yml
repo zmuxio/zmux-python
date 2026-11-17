@@ -18,12 +18,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Rust
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -34,13 +34,25 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets -- -D warnings
 
+  audit:
+    name: Security advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-audit
+      # Vulnerabilities fail the job; an unmaintained-crate warning does not.
+      - run: cargo audit
+
   types:
     name: Type check
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
       - run: python -m pip install "mypy>=2.4"
@@ -49,7 +61,7 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -72,7 +84,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-15-intel, windows-latest ]
+        os: [ ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest ]
         # 3.12 builds the abi3 wheel; 3.14t the free-threaded one. The abi3
         # wheel also runs on the newer CPython releases, checked on Linux.
         python: [ '3.12', '3.14t' ]
@@ -83,8 +95,8 @@ jobs:
           # x86 interpreter, so the wheel is tested natively.
           - { os: windows-latest, python: '3.12', arch: x86, target: i686-pc-windows-msvc }
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         id: py
         with:
           python-version: ${{ matrix.python }}
@@ -95,7 +107,7 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           if [[ -n "${{ matrix.target }}" ]]; then rustup target add "${{ matrix.target }}"; fi
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -117,24 +129,54 @@ jobs:
           if [[ "${{ matrix.arch }}" != x86 ]]; then python -m pip install "cryptography>=50.0.2"; fi
           python -m pytest -q -rs tests
 
+  macos-x86_64:
+    # GitHub is retiring its Intel macOS runners: the x86_64 wheel is
+    # cross-built on the arm64 runner, as the release builds it. It is built
+    # and checked for its platform tag, not run.
+    name: Build (macOS x86_64, cross-compiled)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        id: py312
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        id: py314t
+        with:
+          python-version: '3.14t'
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-apple-darwin
+          rustup default stable
+      - name: Build the wheels
+        run: |
+          python -m pip install "maturin>=1.16,<2"
+          maturin build --release --locked --target x86_64-apple-darwin --out dist \
+            -i "${{ steps.py312.outputs.python-path }}" -i "${{ steps.py314t.outputs.python-path }}"
+          wheels=(dist/*macosx*x86_64.whl)
+          printf '%s\n' "${wheels[@]}"
+          test "${#wheels[@]}" -eq 2
+
   interop:
     name: Interop (Go zmux peers)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: zmux-python
       - name: Checkout zmux-go
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: zmuxio/zmux-go
           path: zmux-go
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         id: py
         with:
           python-version: '3.12'
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: 'stable'
           cache-dependency-path: zmux-python/interop/shape-go-peer/go.sum
@@ -142,7 +184,7 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry

@@ -83,7 +83,7 @@ impl CarrierStream {
                 if let Some(b) = unread_take(&unread, n.max(1)) {
                     return Ok((rt::Bin(b), held));
                 }
-                let mut buf = bytes::BytesMut::with_capacity(n.max(1));
+                let mut buf = bytes::BytesMut::with_capacity(crate::read_alloc(n).max(1));
                 let r = held.as_mut().ok_or_else(released)?;
                 r.read_buf(&mut buf).await.map_err(io_err)?;
                 Ok((rt::Bin(buf.freeze()), held))

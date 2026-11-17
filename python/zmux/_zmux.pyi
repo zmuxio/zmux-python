@@ -104,6 +104,9 @@ _DEFAULT_RECOVERY_RATIO: float
 def _config_defaults() -> dict[str, Any]:
     """Internal: the library's defaults of the `zmux.Config` fields."""
 
+async def _panic() -> None:
+    """Internal: a future that panics (tests how a panic reaches its awaiter)."""
+
 def _listener_defaults() -> dict[str, Any]:
     """Internal: the library's defaults of the `zmux.ListenerConfig` fields."""
 

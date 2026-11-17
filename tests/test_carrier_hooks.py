@@ -6,6 +6,7 @@ import dataclasses
 import json
 import pathlib
 import socket
+import sys
 import time
 from collections.abc import AsyncIterator, Callable
 
@@ -434,3 +435,23 @@ def test_cache_queries_take_the_variant() -> None:
     cache.report("k", "split", "failed", variant="v")
     assert cache.is_failed("k", "split", variant="v")
     assert not cache.is_failed("k", "split")
+
+
+async def test_huge_read_sizes_on_a_stream(
+    sessions: tuple[zmux.Session, zmux.Session],
+) -> None:
+    """The size of a read bounds what it returns, never what it allocates."""
+    c, s = sessions
+    send, _ = await c.open_bi()
+    await send.write(b"hello")
+    await send.flush()
+    _, recv = await s.accept_bi()
+    async with asyncio.timeout(5):
+        assert await recv.read(sys.maxsize) == b"hello"
+        await send.write(b"world")
+        assert bytes(await recv.read_chunk(sys.maxsize)) == b"world"
+        await send.write(b"xy")
+        await send.finish()
+        with pytest.raises(zmux.IncompleteReadError) as e:
+            await recv.read_exact(1 << 62)
+    assert e.value.partial == b"xy"

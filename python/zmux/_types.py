@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import logging
+import math
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import (
@@ -1553,19 +1554,22 @@ class QualityBand:
     """When to report a pipe's quality (`PipeQualityChanged`): once its
     smoothed RTT moved by more than `rtt` seconds (0: every change; `None`:
     never by RTT), or its delivery rate by more than the factor
-    `rate_ratio` (1 or less: every change; `None`: never by rate), from
-    the last reported values, at most once per `min_interval` seconds. A
-    negative or NaN `rtt` or `rate_ratio` raises `ValueError`."""
+    `rate_ratio` (1 or less, including 0: every change; `None`: never by
+    rate), from the last reported values, at most once per `min_interval`
+    seconds. A negative, NaN or infinite `rtt`, `rate_ratio` or
+    `min_interval` raises `ValueError`."""
 
     rtt: float | None = None
     rate_ratio: float | None = None
     min_interval: float = 1.0
 
     def __post_init__(self) -> None:
-        for k in ("rtt", "rate_ratio"):
+        for k, limit in (("rtt", 2.0**64), ("rate_ratio", math.inf)):
             v = getattr(self, k)
-            if v is not None and not v >= 0:
-                raise ValueError(f"{k} is a non-negative number, or None")
+            if v is not None and not 0 <= v < limit:
+                raise ValueError(f"{k} is a finite non-negative number, or None")
+        if not 0 <= self.min_interval < 2.0**64:
+            raise ValueError("min_interval is a finite non-negative number")
 
 
 @dataclass(frozen=True, slots=True)

@@ -401,13 +401,55 @@ async def test_quality_band_and_capacity_floor() -> None:
             c.pipes()[0].update(quality_band=zmux.QualityBand(rtt=0.01))
         with pytest.raises(ValueError):
             c.quality_band = zmux.QualityBand(rtt=-1)
-    for bad in (float("nan"), -1.0):
+    for ok in (0, 0.5, 1.0, 2.0, None):  # 1 or less: every change
+        zmux.QualityBand(rate_ratio=ok)
+    for bad in (float("nan"), -1.0, math.inf):
         with pytest.raises(ValueError):
             zmux.QualityBand(rate_ratio=bad)
+        with pytest.raises(ValueError):
+            zmux.QualityBand(rtt=bad)
+        with pytest.raises(ValueError):
+            zmux.QualityBand(min_interval=bad)
+    with pytest.raises(ValueError):
+        zmux.QualityBand(rtt=1e30)
+    for bad in (float("nan"), -1.0):
         with pytest.raises(ValueError):
             zmux.CapacityFloor(rate=1, recovery_ratio=bad)
     with pytest.raises(ValueError):
         zmux.CapacityFloor(rate=1, recovery_ratio=0.5)
+
+
+async def test_quality_band_every_change_reports_every_change() -> None:
+    """With only the rate half set, a `rate_ratio` of 1 or less (0, 0.5, 1)
+    reports delivery-rate changes without a threshold, never turning it off."""
+    for ratio in (0, 0.5, 1.0):
+        async with pair() as (c, s, _l):
+            c.quality_band = zmux.QualityBand(rate_ratio=ratio, min_interval=0)
+            band = c.quality_band
+            assert band is not None and band.rate_ratio == 1.0 and band.rtt is None
+
+            async def drain() -> None:
+                _send, recv = await s.accept_bi()
+                while await recv.read(65536):
+                    pass
+
+            async def watch() -> None:
+                async for e in c.events():
+                    if isinstance(e, zmux.PipeQualityChanged):
+                        return
+
+            tasks = [asyncio.create_task(drain()), asyncio.create_task(watch())]
+            send, _recv = await c.open_bi()
+            try:
+                async with asyncio.timeout(15):
+                    while not tasks[1].done():
+                        await send.write(b"x" * 65536)
+                        await asyncio.sleep(0)
+                    await tasks[1]
+            finally:
+                for t in tasks:
+                    t.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def test_nested_session_over_a_carrier_stream() -> None:

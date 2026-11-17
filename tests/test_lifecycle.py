@@ -8,6 +8,7 @@ import sys
 import textwrap
 from collections.abc import AsyncIterator
 
+import pytest
 import zmux
 
 
@@ -82,14 +83,8 @@ def test_a_lent_buffer_is_released_clear_of_the_session() -> None:
 
 
 async def test_a_panic_reaches_the_awaiter() -> None:
-    _, end = zmux.adapter.pipe_pair()
-    try:
-        # A length no allocation takes panics in the future.
-        await asyncio.wait_for(end.read(sys.maxsize + 1), 10)
-    except RuntimeError as e:
-        assert "internal error" in str(e)
-    else:
-        raise AssertionError("no exception")
+    with pytest.raises(RuntimeError, match="internal error: deliberate"):
+        await asyncio.wait_for(zmux._zmux._panic(), 10)
 
 
 async def test_a_cancelled_long_read_keeps_what_it_read() -> None:
