@@ -17,7 +17,7 @@ async def serving_http(
         yield listener, await listener.serve_http("127.0.0.1", 0, **kwargs)  # type: ignore[arg-type]  # forwarded options
 
 
-async def test_requested_priority() -> None:
+async def test_preamble_priority() -> None:
     async with zmux.Listener() as listener:
         addr = await listener.serve_tcp("127.0.0.1", 0)
         async with (
@@ -27,12 +27,12 @@ async def test_requested_priority() -> None:
             send, recv = await c.open_bi(peer_priority=zmux.Priority(2, True))
             await send.write(b"x")
             _, remote = await asyncio.wait_for(s.accept_bi(), 5)
-            assert remote.requested_priority == zmux.Priority(2, True)
-            assert recv.requested_priority is None
+            assert remote.preamble_priority == zmux.Priority(2, True)
+            assert recv.preamble_priority is None
             plain, _ = await c.open_bi()
             await plain.write(b"x")
             _, remote = await asyncio.wait_for(s.accept_bi(), 5)
-            assert remote.requested_priority is None
+            assert remote.preamble_priority is None
 
 
 async def test_join_prefix_needs_a_hello() -> None:

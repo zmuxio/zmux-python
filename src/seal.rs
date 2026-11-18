@@ -14,6 +14,7 @@ use zmux_seal::{BoxFuture, VerifyError};
 
 use crate::rt::{self, LoopRef, future_into_py};
 use crate::{PipeIo, admission, types};
+use crate::{ranged, ranged_opt};
 
 /// A record mode a pipe can be given: sealed, bound or trusted.
 pub(crate) fn record_mode_of(v: &Bound<'_, PyAny>) -> PyResult<RecordMode> {
@@ -77,18 +78,42 @@ fn verify_err(py: Python<'_>, e: &PyErr) -> VerifyError {
     }
 }
 
+/// A secure carrier error as its exception: `CredentialsFailedError` for a failed
+/// verification or proof, `InvalidArgumentError` of kind `TooLarge` for a handshake message
+/// of this side above 8192 bytes, else `SecureCarrierError` whose `kind` is the error's class
+/// (`"random_failed"`, ...).
+fn secure_err(e: seal::Error) -> PyErr {
+    if matches!(e, seal::Error::TooLarge) {
+        return crate::raise("InvalidArgumentError", &e, false, None);
+    }
+    let name = if matches!(e, seal::Error::CredentialsFailed) {
+        "CredentialsFailedError"
+    } else {
+        "SecureCarrierError"
+    };
+    let class = e.class();
+    rt::decorate(crate::new_err(name, e.to_string()), move |_, v| {
+        let _ = v.setattr("kind", class);
+    })
+}
+
 /// The error of a failed Establish: `NoReplyError` (its `__cause__` the end or the
-/// timeout), `ValueError` for a configuration mistake, `InvalidArgumentError` of kind
-/// `TooLarge` for a handshake message of this side above 8192 bytes (such as
-/// application data too large for the room left), or the carrier's error.
+/// timeout), `ValueError` for a configuration mistake, `CredentialsFailedError` when the
+/// verifier rejected the server or could not decide, a proof failed or the required
+/// post-quantum authentication did not hold, `InvalidArgumentError` of kind `TooLarge`
+/// for a handshake message of this side above 8192 bytes (such as application data too large
+/// for the room left), another `SecureCarrierError`, or the carrier's error.
 fn establish_err(e: std::io::Error) -> PyErr {
     let Some(inner) = e.get_ref() else {
         return crate::io_err(e);
     };
-    if e.kind() == std::io::ErrorKind::InvalidInput
-        && let Some(seal::Error::TooLarge) = inner.downcast_ref::<seal::Error>()
-    {
-        return crate::raise("InvalidArgumentError", &seal::Error::TooLarge, false, None);
+    if let Some(s) = inner.downcast_ref::<seal::Error>() {
+        return secure_err(*s);
+    }
+    // The client judged the server: a rejection and a temporary failure of the verifier
+    // both fail the establishment with `credentials failed`.
+    if inner.downcast_ref::<VerifyError>().is_some() {
+        return secure_err(seal::Error::CredentialsFailed);
     }
     if let Some(c) = inner.downcast_ref::<seal::ConfigError>() {
         return PyValueError::new_err(c.to_string());
@@ -260,7 +285,7 @@ fn join_role(role: &Bound<'_, PyAny>) -> PyResult<zmux::proto::seal::JoinRole> {
 #[pyo3(signature = (suite, epoch_secret, *, role, session_crypto))]
 fn derive_join_psk<'p>(
     py: Python<'p>,
-    suite: u64,
+    #[pyo3(from_py_with = ranged)] suite: u64,
     epoch_secret: &[u8],
     role: &Bound<'p, PyAny>,
     session_crypto: &[u8],
@@ -278,11 +303,11 @@ fn derive_join_psk<'p>(
 #[pyo3(signature = (suite, epoch_secret, *, role, session_crypto, length))]
 fn expand_join_psk<'p>(
     py: Python<'p>,
-    suite: u64,
+    #[pyo3(from_py_with = ranged)] suite: u64,
     epoch_secret: &[u8],
     role: &Bound<'p, PyAny>,
     session_crypto: &[u8],
-    length: usize,
+    #[pyo3(from_py_with = ranged)] length: usize,
 ) -> PyResult<Bound<'p, PyBytes>> {
     let k = zmux::proto::seal::expand_join_psk(
         suite,
@@ -314,15 +339,54 @@ fn static_key_id<'p>(py: Python<'p>, key: &[u8]) -> Bound<'p, PyBytes> {
     PyBytes::new(py, &seal::static_key_id(key))
 }
 
-/// The X25519 public key of a 32-byte static secret, as `static_key_id` names it.
-#[pyfunction]
-fn static_public(py: Python<'_>, secret: [u8; 32]) -> Bound<'_, PyBytes> {
-    PyBytes::new(py, &seal::static_public(&secret))
+/// A node's X25519 static private key (`establish(static_key=...)`,
+/// `SecureServer(gate, static_key)`).
+#[pyclass(frozen, module = "zmux")]
+pub(crate) struct StaticKey(seal::StaticKey);
+
+#[pymethods]
+impl StaticKey {
+    /// A new random key from the operating system's random source. When that fails (early
+    /// boot, a sandbox without it) there is no fallback: `SecureCarrierError` with the kind
+    /// `"random_failed"`.
+    #[staticmethod]
+    fn generate() -> PyResult<Self> {
+        seal::StaticKey::generate().map(Self).map_err(secure_err)
+    }
+
+    /// The key of this 32-byte X25519 private scalar (`ValueError` for another length).
+    #[staticmethod]
+    fn from_scalar(scalar: &[u8]) -> PyResult<Self> {
+        let scalar: [u8; 32] = scalar
+            .try_into()
+            .map_err(|_| PyValueError::new_err("a static key scalar is 32 bytes"))?;
+        Ok(Self(seal::StaticKey::from_scalar(scalar)))
+    }
+
+    /// The X25519 public key, which `static_key_id` names for a peer's pin.
+    #[getter]
+    fn public_key<'p>(&self, py: Python<'p>) -> Bound<'p, PyBytes> {
+        PyBytes::new(py, &self.0.public_key())
+    }
+
+    /// The private scalar, 32 bytes.
+    #[getter]
+    fn scalar<'p>(&self, py: Python<'p>) -> Bound<'p, PyBytes> {
+        PyBytes::new(py, self.0.scalar())
+    }
+
+    fn __repr__(&self) -> &'static str {
+        "StaticKey(..)"
+    }
 }
 
 /// The `KeyId` of a key of `key_alg`: what a pin and a verdict name it by.
 #[pyfunction]
-fn key_id<'p>(py: Python<'p>, key_alg: u64, key: &[u8]) -> Bound<'p, PyBytes> {
+fn key_id<'p>(
+    py: Python<'p>,
+    #[pyo3(from_py_with = ranged)] key_alg: u64,
+    key: &[u8],
+) -> Bound<'p, PyBytes> {
     PyBytes::new(py, &seal::key_id(key_alg, key))
 }
 
@@ -352,14 +416,14 @@ impl SigningKey {
     /// A new key of `key_alg`; an algorithm that cannot sign raises `ValueError`.
     #[staticmethod]
     #[pyo3(signature = (key_alg=seal::KEYALG_MLDSA44))]
-    fn generate(key_alg: u64) -> PyResult<Self> {
+    fn generate(#[pyo3(from_py_with = ranged)] key_alg: u64) -> PyResult<Self> {
         let k = seal::SigningKey::generate(key_alg).map_err(crate::value_err)?;
         Ok(Self(Arc::new(seal::KeySigner(k))))
     }
 
     /// The key of `key_alg` from its seed.
     #[staticmethod]
-    fn from_seed(key_alg: u64, seed: &[u8]) -> PyResult<Self> {
+    fn from_seed(#[pyo3(from_py_with = ranged)] key_alg: u64, seed: &[u8]) -> PyResult<Self> {
         let k = seal::SigningKey::from_seed(key_alg, seed).map_err(crate::value_err)?;
         Ok(Self(Arc::new(seal::KeySigner(k))))
     }
@@ -491,26 +555,16 @@ fn app_data_of(f: &Bound<'_, PyAny>, lp: &LoopRef) -> seal::AppDataSource {
     )
 }
 
-/// The client's static secret: `zmux.AUTO` the process's key, else 32 bytes.
-fn static_secret(v: &Bound<'_, PyAny>) -> PyResult<seal::StaticSecret> {
-    if crate::is_setting(v, "AUTO")? {
-        return Ok(seal::StaticSecret::Process);
-    }
-    Ok(seal::StaticSecret::Given(seal::StaticKey::from(
-        v.extract::<[u8; 32]>()?,
-    )))
-}
-
 /// Runs the client's handshake on `pipe`: the carrier for `Session.connect`, with what it
 /// learned of the server. On a failure the carrier is closed; nothing is retried.
 #[pyfunction]
 #[pyo3(signature = (pipe, *, verifier=None, allow_psk_only=false, handle=b"".to_vec(), psk=b"".to_vec(),
-    static_secret=None, allowed_profiles=None, record_mode=None, credential=None,
+    static_key=None, allowed_profiles=None, record_mode=None, credential=None,
     local_context=b"".to_vec(), app_data=None, max_app_data=Some(seal::DEFAULT_MAX_APP_DATA),
     require_pq_auth=false, signer=None, shaper=None,
     shaping_limits=None, reply_timeout=Some(10.0)),
     text_signature = "(pipe, *, verifier=None, allow_psk_only=False, handle=b'', psk=b'', \
-        static_secret=None, allowed_profiles=None, record_mode=None, credential=None, \
+        static_key=..., allowed_profiles=None, record_mode=None, credential=None, \
         local_context=b'', app_data=None, max_app_data=256, require_pq_auth=False, \
         signer=None, shaper=None, shaping_limits=None, reply_timeout=10.0)")]
 #[allow(clippy::too_many_arguments)]
@@ -521,7 +575,7 @@ fn establish<'p>(
     allow_psk_only: bool,
     handle: Vec<u8>,
     psk: Vec<u8>,
-    static_secret: Option<Bound<'p, PyAny>>,
+    static_key: Option<PyRef<'p, StaticKey>>,
     allowed_profiles: Option<Vec<u64>>,
     record_mode: Option<Bound<'p, PyAny>>,
     credential: Option<(u64, Vec<u8>)>,
@@ -543,9 +597,9 @@ fn establish<'p>(
         allow_psk_only,
         handle,
         psk: psk.into(),
-        static_secret: match &static_secret {
-            Some(v) => self::static_secret(v)?,
-            None => seal::StaticSecret::Process,
+        static_key: match &static_key {
+            Some(k) => seal::StaticKeySource::Given(k.0.clone()),
+            None => seal::StaticKeySource::Process,
         },
         allowed_profiles: allowed_profiles
             .unwrap_or_else(|| seal::ClientConfig::default().allowed_profiles),
@@ -651,7 +705,7 @@ impl seal::Gate for PyGate {
 #[pyclass(frozen, module = "zmux")]
 pub(crate) struct SecureServer {
     gate: Py<PyAny>,
-    static_key: [u8; 32],
+    static_key: seal::StaticKey,
     accepted_profiles: Vec<u64>,
     allow_record_mode: Option<Arc<Py<PyAny>>>,
     shaper: Option<zmux::shaping::HandshakeShaper>,
@@ -708,7 +762,7 @@ impl SecureServer {
     fn new(
         py: Python<'_>,
         gate: Py<PyAny>,
-        static_key: [u8; 32],
+        static_key: PyRef<'_, StaticKey>,
         accepted_profiles: Option<Vec<u64>>,
         allow_record_mode: Option<Py<PyAny>>,
         shaper: Option<&Bound<'_, PyAny>>,
@@ -718,7 +772,7 @@ impl SecureServer {
         require_pq_auth: bool,
         signer: Option<Py<PyAny>>,
         app_data: Option<Py<PyAny>>,
-        max_app_data: Option<usize>,
+        #[pyo3(from_py_with = ranged_opt)] max_app_data: Option<usize>,
     ) -> PyResult<Self> {
         if let Some(s) = &signer
             && !s.bind(py).is_instance_of::<SigningKey>()
@@ -728,7 +782,7 @@ impl SecureServer {
         }
         let this = Self {
             gate,
-            static_key,
+            static_key: static_key.0.clone(),
             accepted_profiles: accepted_profiles
                 .unwrap_or_else(|| seal::ServerOptions::default().accepted_profiles),
             allow_record_mode: allow_record_mode.map(Arc::new),
@@ -831,7 +885,7 @@ impl SecureServer {
             app_data,
             max_app_data: self.max_app_data,
         };
-        seal::ServerConfig::new(gate, self.static_key, o).map_err(crate::value_err)
+        seal::ServerConfig::new(gate, self.static_key.clone(), o).map_err(crate::value_err)
     }
 }
 
@@ -941,7 +995,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("_KEYALG_MLDSA44", seal::KEYALG_MLDSA44)?;
     m.add("DEFAULT_MAX_APP_DATA", seal::DEFAULT_MAX_APP_DATA)?;
     m.add_function(wrap_pyfunction!(key_id, m)?)?;
-    m.add_function(wrap_pyfunction!(static_public, m)?)?;
+    m.add_class::<StaticKey>()?;
     m.add_class::<SecureServer>()?;
     m.add_function(wrap_pyfunction!(static_key_id, m)?)?;
     m.add_function(wrap_pyfunction!(derive_handle_psk, m)?)?;

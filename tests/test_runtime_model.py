@@ -64,7 +64,7 @@ async def test_limited_splice_and_a_busy_thread_leave_other_sessions_alive() -> 
         pair() as (x, _y),
     ):
 
-        async def relay() -> zmux.helpers.Spliced:
+        async def relay() -> zmux.helpers.SpliceResult:
             a = await relay_in.accept_bi()
             b = await relay_out.open_bi()
             return await zmux.helpers.splice(a, b, chunk=4096, a_to_b=Slow())
@@ -242,7 +242,7 @@ async def test_metadata_while_a_read_waits() -> None:
         assert recv.stats().bytes_read == 1
         assert recv.preamble.info == b"meta"
         assert not recv.is_replayable
-        assert recv.requested_priority is None
+        assert recv.preamble_priority is None
         assert out.stats().bytes_written == 0
         await writing
         reading.cancel()

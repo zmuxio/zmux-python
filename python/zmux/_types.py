@@ -86,6 +86,10 @@ PipeId = NewType("PipeId", int)
 """The identifier of a pipe, unique for the life of its session (0 for the
 bootstrap pipe)."""
 
+SessionId = NewType("SessionId", int)
+"""The identifier of a session, unique in the process while it runs and
+never reused (`Session.id`, and what a `Tracer` is told). It is not sent."""
+
 _DEFAULTS: Final[dict[str, Any]] = _zmux._config_defaults()
 
 
@@ -324,11 +328,27 @@ class StreamDatagram(NamedTuple):
     payload: bytes
 
 
-class Priority(NamedTuple):
-    """Stream scheduling priority: `urgency` 0 (highest) to 7, `incremental` interleaves equal urgencies."""
-
-    urgency: int = 3
+class _PriorityFields(NamedTuple):
+    urgency: int
     incremental: bool = False
+
+
+class Priority(_PriorityFields):
+    """Stream scheduling priority: `urgency` 0 (highest) to 7, `incremental`
+    interleaves equal urgencies (default: not incremental, as on the wire). A
+    `(urgency, incremental)` tuple is accepted wherever a `Priority` is. There
+    is no default priority without a name, so `urgency` is required:
+    `LOCAL_DEFAULT` (3, incremental) is the local priority of a new sending
+    part, `WIRE_DEFAULT` (3, not incremental) what the wire means when no
+    priority was signalled."""
+
+    __slots__ = ()
+    LOCAL_DEFAULT: ClassVar[Priority]
+    WIRE_DEFAULT: ClassVar[Priority]
+
+
+Priority.LOCAL_DEFAULT = Priority(3, True)
+Priority.WIRE_DEFAULT = Priority(3, False)
 
 
 class Tlv(NamedTuple):
@@ -377,7 +397,13 @@ SessionCrypto.LOCAL = SessionCrypto(
 @dataclass(frozen=True, slots=True)
 class RejectInfo:
     """An unauthenticated carrier that was refused: `profile` is 2 for a join and `None`
-    when its first bytes named none; `reason` an error class or `unknown_locator`."""
+    when its first bytes named none. `reason` is the local reason, which the peer never
+    sees. A secure carrier server's judgement of the client gives `"credentials_failed"`
+    (its verifier rejected the client), `"proof"` (a required proof is missing or wrong)
+    or `"pq_auth_required"` (the required post-quantum authentication does not hold);
+    `"auth"` is for a failed AEAD or Confirm only. A verifier that could not decide
+    closes the carrier without an `on_reject` call. Other reasons are an error class of
+    the handshake or the refusal's name, for example `"unknown_locator"`."""
 
     profile: int | None
     record_mode: RecordMode | None
@@ -390,7 +416,7 @@ class RecordPolicy:
     """How a joiner chooses the record mode of a pipe it adds
     (`Config.record_policy`), when the pipe's options name none: the mode
     `by_label` gives the pipe's label, else `secure` for a carrier declared
-    secure (`PipeIo.declare_secure`) when given, else `default`. It is data,
+    secure (`PipeIo.declare_carrier_secure`) when given, else `default`. It is data,
     chosen in the call that adds the pipe; an unmanaged mode raises
     `ValueError` when the `Config` is made."""
 
@@ -626,7 +652,7 @@ class StreamStats:
     send_buffered: int
     recv_buffered: int
     recv_window: int
-    pipe_id: int | None
+    pipe: PipeId | None
     """The pipe the sending direction is bound to under `affinity`."""
 
 
@@ -1506,6 +1532,123 @@ class PipeLiveness:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class PoolMember:
+    """A member of a pipe pool in a `PoolView`: a dialled pipe, or the group of
+    pipes a `join` function joined. Durations in seconds. A policy's tests
+    build one directly."""
+
+    pipe: PipeId = PipeId(0)
+    """The ID of its first pipe (0 included), which identifies the member: what
+    `PoolDecision.retire_pipes` names."""
+    age: float = 0.0
+    """Seconds since its oldest pipe was attached."""
+    idle: float = 0.0
+    """The least seconds since a traffic frame on any of its pipes (since
+    attachment for a pipe without traffic)."""
+    pipes: int = 0
+    """Its pipes: 1 for a dialled pipe, the group's size for a joined member."""
+    bytes_sent: int = 0
+    bytes_received: int = 0
+    usable: bool = False
+    """Every pipe serves its direction and the peer attached it."""
+    replacing: bool = False
+    """A replacement of it is being dialled or joined."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PoolView:
+    """What a pool's policy is asked about (`PoolPolicy.decide`): the pool's
+    state at one look, as durations and counts, so that a policy reads no
+    clock of its own. A policy's tests build one directly."""
+
+    members: tuple[PoolMember, ...] = ()
+    """The pool's members; a replacement being joined is not one until it
+    replaces its member."""
+    failures: int = 0
+    """Consecutive failed dial attempts of the pool (redials and replacements
+    alike); 0 once a dial gives a usable member."""
+    since_last_dial: float | None = None
+    """Seconds since the start of the pool's last dial attempt; `None` before
+    the first."""
+    dialing: int = 0
+    """Dial attempts in progress that would add a member (redials and first
+    dials; replacements are not counted)."""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "members", tuple(self.members))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PoolDecision:
+    """What a pool's policy decides at one look; every field left at its default
+    keeps the pool's own behaviour, so `PoolDecision()` changes nothing.
+    Durations are seconds. A value out of range raises `ValueError`.
+
+    `count`: the members to keep (at least 1; `INHERIT`: the pool's). Above
+    it, the pool shrinks: dials that would add a member are cancelled first,
+    the latest first, then members close gracefully, those in `retire_pipes`
+    first, then the longest `idle`, ties broken by the fewest `pipes`, the
+    least `age`, the highest `pipe`. `dial_after`: the wait from the start of
+    the last dial attempt (of the pool before the first) to the next dial, in
+    place of the backoff's wait, at most the backoff's `max` (0 or more;
+    `INHERIT`: the backoff). `retire_pipes`: members to replace now, make
+    before break, by `PoolMember.pipe`; one that is not usable or already
+    being replaced is skipped. `recheck`: look again no later than this after
+    the decision even when nothing happens (at least 1 ns and `MIN_RECHECK`
+    in effect, no upper bound; `None`: no extra look). `liveness`: the
+    `PipeLiveness` of the pipes the pool dials after this decision; a field
+    left to `INHERIT` keeps the pool's options, else the session's."""
+
+    count: int | Inherit = INHERIT
+    dial_after: float | Inherit = INHERIT
+    retire_pipes: Sequence[PipeId] = ()
+    recheck: float | None = None
+    liveness: PipeLiveness = field(default_factory=lambda: PipeLiveness())
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "retire_pipes", tuple(self.retire_pipes))
+        _zmux._check_pool_decision(self)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PoolEvaluation:
+    """What a `MachinePoolPolicy` evaluates for a `PoolView`
+    (`MachinePoolPolicy.evaluate`), its values as the policy file gives them,
+    out of range ones included (`MachinePoolPolicy.decide` builds a
+    `PoolDecision` from them, which refuses such a value). `None` is unset.
+    Durations in seconds: `probe_interval` is the idle-probe interval of the
+    pipes added from now on (0: none), `probe_jitter` a fraction."""
+
+    count: int | None = None
+    dial_after: float | None = None
+    retire: tuple[int, ...] = ()
+    recheck: float | None = None
+    probe_interval: float | None = None
+    probe_jitter: float | None = None
+
+
+class PoolPolicy(Protocol):
+    """A pool's policy (`PipePool(policy=...)`): an object, not a bare function,
+    so that it can keep state between looks. `decide(view)` runs on the event
+    loop that runs `maintain_pipes`, at each look of the pool: at once when a
+    pipe of the session changes state or the session is suspended or resumed,
+    after each dial attempt, no later than the `recheck` of the last decision,
+    and every 100 ms. The pool waits for the answer without a bound and holds
+    no thread while it waits (one that does not return holds the looks of its
+    own pool and nothing else; stopping the pool ends the wait and cancels the
+    call), so `decide` should return promptly; it must not
+    call into the session. It returns a `PoolDecision`; an exception, or a
+    decision that is not one, rejects the look: the pool applies the default
+    decision for it, hands the exception to `PipePool(decision_rejected=...)`,
+    or without one logs it at warning level through the session's logger. A
+    `MachinePoolPolicy` is one the binding runs natively."""
+
+    def decide(self, view: PoolView, /) -> PoolDecision | Awaitable[PoolDecision]:
+        """The decision for `view`; a coroutine function is awaited on the loop."""
+        ...
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class PipeOptions:
     """Every option of a pipe (`Session.add_pipe`, `PipePool`); durations in
     seconds. Invalid values raise `ValueError` where the options are used.
@@ -1517,59 +1660,80 @@ class PipeOptions:
     for the pipe (`None`: none); `fate_group` (0: independent), pipes that
     fail together; `return_on_reply` (`False`): `add_pipe` returns once the
     Reply is verified instead of once the peer attached the pipe (then wait
-    with `Pipe.attached()` before closing the session's other pipes).
+    with `Pipe.wait_attached()` before closing the session's other pipes).
 
-    Changeable on a live pipe with `Pipe.update`, each in the form `update`
-    takes: a value, or `CLEAR`, the default here, which is the setting
-    `update(field=CLEAR)` returns it to. `send_priority`, the tier of the
-    local outbound direction, lower preferred (`CLEAR`: the peer's request,
-    else 0); `receive_priority`, the tier requested for the peer's outbound
-    direction (`CLEAR`: 0); `send_standby`, the local outbound direction
-    takes data only on failover (`CLEAR`: the peer's request, else
-    available); `receive_standby`, asks the peer to do so (`CLEAR`: no);
-    `weight`, its share among the pipes of a tier (`CLEAR`: 1; 0 excludes
-    the pipe); `probation` (`CLEAR`: the session's; `AUTO`: derived from the
-    pipe's RTT; `None` off; else the base in seconds); `liveness` (a
-    `PipeLiveness`; `CLEAR`: the session's); `quality_band` (a
-    `QualityBand`; `CLEAR`: the session's)."""
+    Changeable on a live pipe with `Pipe.update`: each is `INHERIT`, the
+    default, which is the unset setting (`Pipe.update(field=CLEAR)` returns a
+    field to it, and `Pipe.options` reads it back as `INHERIT`), or a value.
+    `CLEAR` belongs to `Pipe.update`; in a `PipeOptions` it raises
+    `TypeError`. `send_priority`, the tier of the local outbound direction,
+    lower preferred (`INHERIT`: the peer's request, else 0);
+    `receive_priority`, the tier requested for the peer's outbound direction
+    (`INHERIT`: 0); `send_standby`, the local outbound direction takes data
+    only on failover (`INHERIT`: the peer's request, else available);
+    `receive_standby`, asks the peer to do so (`INHERIT`: no); `weight`, its
+    share among the pipes of a tier (`INHERIT`: 1; 0 excludes the pipe);
+    `probation` (`INHERIT`: the session's; `AUTO`: derived from the pipe's
+    RTT; `None` off; else the base in seconds); `liveness` (a `PipeLiveness`,
+    each of whose fields is `INHERIT` or a value; `INHERIT`: the session's);
+    `quality_band` (a `QualityBand`; `INHERIT`: the session's; `None`: no
+    reports for this pipe whatever the session's band is)."""
 
     direction: Direction = Direction.BIDI
     record_mode: RecordMode | str | Inherit = INHERIT
     key_group: KeyGroup | int | Inherit = INHERIT
-    send_priority: int | Clear = CLEAR
-    receive_priority: int | Clear = CLEAR
-    send_standby: bool | Clear = CLEAR
-    receive_standby: bool | Clear = CLEAR
-    weight: int | Clear = CLEAR
-    probation: float | Auto | Clear | None = CLEAR
-    liveness: PipeLiveness | Clear = CLEAR
-    quality_band: QualityBand | Clear = CLEAR
+    send_priority: int | Inherit = INHERIT
+    receive_priority: int | Inherit = INHERIT
+    send_standby: bool | Inherit = INHERIT
+    receive_standby: bool | Inherit = INHERIT
+    weight: int | Inherit = INHERIT
+    probation: float | Auto | Inherit | None = INHERIT
+    liveness: PipeLiveness | Inherit = INHERIT
+    quality_band: QualityBand | Inherit | None = INHERIT
     label: str | None = None
     fate_group: int = 0
     return_on_reply: bool = False
+
+    def __post_init__(self) -> None:
+        for name in _PIPE_UPDATABLE:
+            if getattr(self, name) is CLEAR:
+                raise TypeError(
+                    f"{name}=CLEAR is for Pipe.update; a PipeOptions leaves a "
+                    "field unset with INHERIT"
+                )
+
+
+_PIPE_UPDATABLE = (
+    "send_priority",
+    "receive_priority",
+    "send_standby",
+    "receive_standby",
+    "weight",
+    "probation",
+    "liveness",
+    "quality_band",
+)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class QualityBand:
     """When to report a pipe's quality (`PipeQualityChanged`): once its
-    smoothed RTT moved by more than `rtt` seconds (0: every change; `None`:
-    never by RTT), or its delivery rate by more than the factor
-    `rate_ratio` (1 or less, including 0: every change; `None`: never by
-    rate), from the last reported values, at most once per `min_interval`
-    seconds. A negative, NaN or infinite `rtt`, `rate_ratio` or
-    `min_interval` raises `ValueError`."""
+    smoothed RTT moved by more than `rtt` seconds (at least 1 ns), or its delivery
+    rate by more than the factor `rate_ratio` (finite, at least 1; 1 reports
+    every change), from the last reported values, at most once per
+    `min_interval` seconds (at least 1 ns; `None`: no minimum; default
+    `DEFAULT_MIN_INTERVAL`, 1 s). A half left at `None` reports nothing; a
+    band with both halves `None` is not a band (to report nothing, set the
+    session's band to `None`, or a pipe's). An `rtt` or `min_interval` below
+    1 ns (zero and negative values included), a `rate_ratio` below 1, and a NaN or infinite value raise
+    `ValueError`."""
 
     rtt: float | None = None
     rate_ratio: float | None = None
-    min_interval: float = 1.0
+    min_interval: float | None = _zmux.DEFAULT_MIN_INTERVAL
 
     def __post_init__(self) -> None:
-        for k, limit in (("rtt", 2.0**64), ("rate_ratio", math.inf)):
-            v = getattr(self, k)
-            if v is not None and not 0 <= v < limit:
-                raise ValueError(f"{k} is a finite non-negative number, or None")
-        if not 0 <= self.min_interval < 2.0**64:
-            raise ValueError("min_interval is a finite non-negative number")
+        _zmux._check_quality_band(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1590,19 +1754,20 @@ class Backoff:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CapacityFloor:
     """The floor under the session's outbound capacity in bytes per second:
-    `CapacityBelow` once below `rate`, `CapacityRestored` once back above
-    `rate * recovery_ratio` (0 for the default, 1.25; else at least 1: any
-    other value, NaN included, raises `ValueError`)."""
+    `CapacityBelow` once below `rate` (at least 1), `CapacityRestored` once
+    back at `rate * recovery_ratio` or more (a finite number of at least 1;
+    1 is no hysteresis; default `DEFAULT_RECOVERY_RATIO`, 1.25). A zero
+    `rate`, a `recovery_ratio` below 1 (0 included), and a NaN or infinite
+    one raise `ValueError`."""
 
     rate: int
-    recovery_ratio: float = _zmux._DEFAULT_RECOVERY_RATIO
+    recovery_ratio: float = _zmux.DEFAULT_RECOVERY_RATIO
 
     def __post_init__(self) -> None:
-        # `inf` passes on purpose, as in the Rust crate: a floor that, once
-        # crossed, is never reported restored. The default reads 1.25, the
-        # value 0 stands for, so both mean the same.
-        if not (self.recovery_ratio == 0 or self.recovery_ratio >= 1):
-            raise ValueError("recovery_ratio is 0 (the default) or at least 1")
+        if self.rate < 1:
+            raise ValueError("rate is at least 1 byte per second")
+        if not 1 <= self.recovery_ratio < math.inf:
+            raise ValueError("recovery_ratio is a finite number of at least 1")
 
 
 class Limiter(Protocol):
@@ -1653,14 +1818,14 @@ class SpliceEnd(_Enum):
     UPSTREAM_LOST = "upstream_lost"
     DOWNSTREAM_LOST = "downstream_lost"
     CANCELLED = "cancelled"
-    """Aborted with `SpliceAbort`; `Forwarded.code` is its code."""
+    """Aborted with `SpliceAbort`; `SpliceDirection.code` is its code."""
     LIMITER_FAILED = "limiter_failed"
     """The direction's limiter failed (see `Limiter`): the downstream part
     was reset and the upstream part stopped with `ZMUX_CANCELLED`."""
 
 
 @dataclass(frozen=True, slots=True)
-class Forwarded:
+class SpliceDirection:
     """What one direction of a splice forwarded, and how it ended; `code` is
     the reset, stop or abort code with `SpliceEnd.RESET`, `SpliceEnd.STOPPED`
     and `SpliceEnd.CANCELLED`."""
@@ -1670,8 +1835,12 @@ class Forwarded:
     datagrams_dropped: int
     """Stream datagrams not forwarded, for any cause."""
     datagrams_too_large: int
-    """Not forwarded: too large for the downstream stream's datagrams (a
-    packet relay drops one only when its capsule queue is full)."""
+    """Not forwarded for their size: larger than a datagram of the downstream
+    stream (`splice`), or, in a packet relay, which writes such a datagram as
+    a capsule instead, larger than `DEFAULT_MAX_PACKET`. A datagram whose
+    capsule could not be written for another reason (the downstream stream
+    ended or was reset, the splice ended, or its capsule queue was full) is
+    counted only in `datagrams_dropped`."""
     datagrams_limited: int
     """Not forwarded: refused by a limiter."""
     datagrams_as_capsules: int
@@ -1685,11 +1854,11 @@ class Forwarded:
 
 
 @dataclass(frozen=True, slots=True)
-class Spliced:
+class SpliceResult:
     """The two directions of a finished splice."""
 
-    a_to_b: Forwarded
-    b_to_a: Forwarded
+    a_to_b: SpliceDirection
+    b_to_a: SpliceDirection
 
 
 class SendPolicy(_Enum):
@@ -1797,21 +1966,23 @@ class Tracer:
     (every session of the `Config` tells the one tracer, each session's
     calls in its own order), and an exception is reported as unraisable.
     The calls wait for the loop in a queue of `Config.hook_queue` entries:
-    past it the oldest are dropped and counted in the next `dropped`."""
+    past it the call that arrives is dropped and counted in the next
+    `dropped`; `established` and `closed` are never dropped."""
 
-    def established(self, session: int) -> None:
+    def established(self, session: SessionId) -> None:
         """The session `session` (its `Session.id`) was established."""
 
-    def event(self, session: int, event: Event) -> None:
+    def event(self, session: SessionId, event: Event) -> None:
         """A session event."""
 
-    def dropped(self, session: int | None, count: int) -> None:
-        """`count` calls were dropped before the next one delivered: of the
-        session `session` (its tracer backlog was full), or, for `None`,
-        of any session and the logger's messages (the queue to the event
-        loop was full, or the loop closed)."""
+    def dropped(self, session: SessionId | None, count: int) -> None:
+        """`count` calls to the tracer or the logger were dropped before the
+        next one delivered (the queue to the event loop was full, or the loop
+        closed). The count belongs to no single session, so `session` is
+        always `None`. A `logger` set as well gets a warning with the same
+        count."""
 
-    def closed(self, session: int, reason: BaseException) -> None:
+    def closed(self, session: SessionId, reason: BaseException) -> None:
         """The session ended, with the reason (the error `Session` calls
         raise from then on); nothing of it follows."""
 
@@ -1868,7 +2039,7 @@ class Config:
     then waits for it. Once that loop closes (the end of an `asyncio.run`),
     what reaches a hook is answered at once without it: a deciding hook
     refuses, a call such as `redial` fails, and the events of `logger` and
-    `tracer` are dropped and counted (`Tracer.dropped(None, n)`, or a
+    `tracer` are dropped and counted (`Tracer.dropped(None, n)` and a
     warning to the logger, before the next event delivered). The next use
     from a running loop binds the `Config` to that loop.
 
@@ -1901,8 +2072,9 @@ class Config:
     receives every event in order beside the event stream. Both run on the
     `Config`'s event loop, never on the library's threads: what
     they are told waits for the loop in a queue of `hook_queue` (1024, at
-    least 1) entries, past which the oldest is dropped (`Tracer.dropped`,
-    or a warning to `logger`);
+    least 1) entries, past which the item that arrives is dropped (`Tracer.dropped`,
+    or a warning to `logger`; a session's `established` and `closed` are never
+    dropped);
     `shaping_limits`, `shaping_budget`, `shaping` (definitions by carrier
     kind, `None` key the default), `shaping_by_variant` (by carrier variant,
     first), `handshake_shaper` and `shaping_bundle`. A hook left at `None`
@@ -2074,7 +2246,7 @@ class ListenerConfig:
     the listener's own callbacks that it contains; its sessions log through
     their `Config.logger`. `logger` and `on_memory_pressure` run on the
     listener's event loop, through a queue of `hook_queue` (1024,
-    at least 1) entries past which the oldest is dropped."""
+    at least 1) entries past which the item that arrives is dropped."""
 
     max_pending: int | None = _LISTENER["max_pending"]
     max_pending_per_source: int = _LISTENER["max_pending_per_source"]

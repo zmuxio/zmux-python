@@ -11,6 +11,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple};
 
+use crate::ranged;
 use crate::rt::LoopRef;
 use crate::seconds;
 
@@ -70,7 +71,7 @@ impl CarrierInfo {
         py: Python<'p>,
         label: &str,
         context: Vec<u8>,
-        length: usize,
+        #[pyo3(from_py_with = ranged)] length: usize,
     ) -> Option<Bound<'p, PyBytes>> {
         let value = self.0.export(label, &context, length)?;
         Some(PyBytes::new(py, &value))
@@ -136,7 +137,7 @@ impl AdmissionVerdict {
     /// (`Session.admitted`, `Pipe.admitted`, `PipeHint.admitted`).
     #[staticmethod]
     #[pyo3(signature = (skip=0, value=None))]
-    fn accept(skip: usize, value: Option<Py<PyAny>>) -> Self {
+    fn accept(#[pyo3(from_py_with = ranged)] skip: usize, value: Option<Py<PyAny>>) -> Self {
         AdmissionVerdict(V::Accept {
             skip,
             value: value.map(Arc::new),
@@ -160,7 +161,7 @@ impl AdmissionVerdict {
     /// Reads until the prefix holds `need` bytes in all, then decides again
     /// with the longer prefix.
     #[staticmethod]
-    fn more(need: usize) -> Self {
+    fn more(#[pyo3(from_py_with = ranged)] need: usize) -> Self {
         AdmissionVerdict(V::More { need })
     }
     /// A `Decision` of this verdict with the carrier's label `variant`.
@@ -389,8 +390,8 @@ impl Admission {
     fn new(
         py: Python<'_>,
         decide: Py<PyAny>,
-        peek: usize,
-        max_peek: usize,
+        #[pyo3(from_py_with = ranged)] peek: usize,
+        #[pyo3(from_py_with = ranged)] max_peek: usize,
         peek_timeout: Option<Bound<'_, PyAny>>,
         stall: Option<Bound<'_, PyAny>>,
         fallback_on_peek_timeout: bool,
@@ -408,8 +409,8 @@ impl Admission {
         fallback_on_peek_timeout=false))]
     fn prefix_auth(
         auth: PyRef<'_, PrefixAuth>,
-        skew: u32,
-        max_nonces: usize,
+        #[pyo3(from_py_with = ranged)] skew: u32,
+        #[pyo3(from_py_with = ranged)] max_nonces: usize,
         peek_timeout: Option<Bound<'_, PyAny>>,
         stall: Option<Bound<'_, PyAny>>,
         fallback_on_peek_timeout: bool,
@@ -456,7 +457,12 @@ pub(crate) struct PrefixAuth(zmux::PrefixAuth);
 impl PrefixAuth {
     #[new]
     #[pyo3(signature = (psk, *, slot, bind_tls=false, header=None))]
-    fn new(psk: Vec<u8>, slot: u64, bind_tls: bool, header: Option<String>) -> PyResult<Self> {
+    fn new(
+        psk: Vec<u8>,
+        #[pyo3(from_py_with = ranged)] slot: u64,
+        bind_tls: bool,
+        header: Option<String>,
+    ) -> PyResult<Self> {
         let auth =
             zmux::PrefixAuth::new(&psk, Duration::from_secs(slot), bind_tls).map_err(|_| {
                 PyValueError::new_err("prefix authentication needs a non-empty psk and slot > 0")

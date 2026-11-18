@@ -114,8 +114,10 @@ def test_events_of_a_closed_loop_are_dropped_and_counted() -> None:
 
 def test_min_recheck() -> None:
     assert zmux.helpers.MIN_RECHECK == 0.01
-    # As in the crate: shorter is lengthened by the pool, not refused.
-    assert zmux.helpers.PoolPolicyDecision(recheck=0).recheck == 0
+    # As in the crate: shorter is lengthened by the pool, not refused; zero is.
+    assert zmux.helpers.PoolDecision(recheck=0.001).recheck == 0.001
+    with pytest.raises(ValueError):
+        zmux.helpers.PoolDecision(recheck=0)
 
 
 def test_hooks_outside_a_running_loop_say_so() -> None:

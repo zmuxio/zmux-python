@@ -13,33 +13,9 @@ Tls = tuple[zmux.TlsConfig, zmux.TlsConfig]
 @pytest.fixture(scope="module")
 def tls() -> Tls:
     pytest.importorskip("cryptography")  # no 32-bit Windows wheels
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import ec
-    from cryptography.x509.oid import NameOID
+    from certs import self_signed
 
-    key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
-    now = datetime.datetime.now(datetime.UTC)
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(name)
-        .public_key(key.public_key())
-        .serial_number(1)
-        .not_valid_before(now)
-        .not_valid_after(now + datetime.timedelta(days=1))
-        .add_extension(
-            x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False
-        )
-        .sign(key, hashes.SHA256())
-    )
-    cert_pem = cert.public_bytes(serialization.Encoding.PEM)
-    key_pem = key.private_bytes(
-        serialization.Encoding.PEM,
-        serialization.PrivateFormat.PKCS8,
-        serialization.NoEncryption(),
-    )
+    cert_pem, key_pem = self_signed()
     return zmux.TlsConfig(cert=cert_pem, key=key_pem), zmux.TlsConfig(ca=cert_pem)
 
 
@@ -532,6 +508,51 @@ async def test_cancellation() -> None:
             assert await client.ping() >= 0  # the session is still healthy
 
 
+async def test_a_pipes_quality_band_follows_is_own_or_off() -> None:
+    config = zmux.Config(
+        max_pipes=8, pipe_auth=zmux.PipeAuth.psk(b"k" * 32).with_end_to_end()
+    )
+    own = zmux.QualityBand(rtt=0.1)
+    async with zmux.Listener(
+        config=config,
+        listener_config=zmux.ListenerConfig(instance_id=b"instance", max_suspended=16),
+    ) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
+        server = asyncio.create_task(echo(listener))
+        async with await zmux.connect_tcp(*addr, config=config) as session:
+            session.quality_band = zmux.QualityBand(rate_ratio=2.0)
+
+            async def added(**options: Any) -> zmux.Pipe:
+                p = await session.add_pipe(
+                    await zmux.dial_tcp(*addr), options=zmux.PipeOptions(**options)
+                )
+                await p.joined()
+                return p
+
+            def band(p: zmux.Pipe) -> object:
+                o = p.options
+                assert o is not None
+                return o.quality_band
+
+            follows, off, mine = (
+                await added(),
+                await added(quality_band=None),
+                await added(quality_band=own),
+            )
+            assert band(follows) is zmux.INHERIT
+            assert band(off) is None
+            assert band(mine) == own
+            # An update sets an own band, off for the pipe, or clears to the
+            # session's; a band that is not one is refused.
+            for value in (own, None, zmux.CLEAR):
+                follows.update(quality_band=value)
+            for bad in (zmux.INHERIT, 0.5, "off"):
+                with pytest.raises(TypeError):
+                    follows.update(quality_band=bad)  # type: ignore[arg-type]
+            assert band(mine) == own
+        server.cancel()
+
+
 async def test_multipath() -> None:
     config = zmux.Config(
         max_pipes=8, pipe_auth=zmux.PipeAuth.psk(b"k" * 32).with_end_to_end()
@@ -551,7 +572,6 @@ async def test_multipath() -> None:
             stats = session.pipe_stats()
             assert len(stats) == 2 and all(isinstance(s, zmux.PipeStats) for s in stats)
             o = pipe.options
-            assert o is not None
             assert (o.send_priority, o.receive_priority, o.send_standby, o.label) == (
                 1,
                 1,
@@ -561,13 +581,12 @@ async def test_multipath() -> None:
             # update: left out keeps, CLEAR clears, a value sets.
             pipe.update(weight=3, receive_standby=True, send_priority=zmux.CLEAR)
             o = pipe.options
-            assert o is not None
             assert (
                 o.send_priority,
                 o.receive_priority,
                 o.weight,
                 o.receive_standby,
-            ) == (zmux.CLEAR, 1, 3, True)
+            ) == (zmux.INHERIT, 1, 3, True)
             bad: dict[str, Any]
             for bad in (
                 {"label": "x"},
@@ -582,7 +601,7 @@ async def test_multipath() -> None:
             with pytest.raises(ValueError):
                 pipe.update(weight=2, receive_priority=-1)
             o = pipe.options
-            assert o is not None and o.weight == 3
+            assert o.weight == 3
             with pytest.raises(ValueError):
                 await session.add_pipe(
                     await zmux.dial_tcp(*addr),
@@ -806,8 +825,6 @@ async def test_typed_surface() -> None:
 
 
 def test_config() -> None:
-    import datetime
-
     c = zmux.Config(max_idle_timeout=5, protocols=["a"])  # type: ignore[arg-type]  # a list, to check its conversion
     # Durations are float seconds only.
     with pytest.raises((TypeError, ValueError)):
@@ -941,7 +958,7 @@ async def test_shaping_limits_and_seed() -> None:
     assert zmux.DEFAULT_STANDBY_PROBE == 1
     assert (
         zmux.DEFAULT_KEEP_ALIVE_PERIOD,
-        zmux.DEFAULT_IDLE_TIMEOUT,
+        zmux.DEFAULT_MAX_IDLE_TIMEOUT,
         zmux.DEFAULT_PROBE_JITTER,
     ) == (15, 30, 0.25)
     assert (

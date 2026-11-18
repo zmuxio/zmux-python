@@ -8,6 +8,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use crate::Host;
+use crate::ranged;
 
 use crate::rt::future_into_py;
 use crate::{
@@ -62,7 +63,7 @@ impl Candidate {
     #[pyo3(signature = (host, port, *, path="/zmux", carrier_credential=None, pair_field=None))]
     fn streaming(
         host: Host,
-        port: u16,
+        #[pyo3(from_py_with = ranged)] port: u16,
         path: &str,
         carrier_credential: Option<Bound<'_, PyAny>>,
         pair_field: Option<String>,
@@ -79,7 +80,7 @@ impl Candidate {
     #[pyo3(signature = (host, port, *, path="/zmux", carrier_credential=None, pair_field=None))]
     fn split(
         host: Host,
-        port: u16,
+        #[pyo3(from_py_with = ranged)] port: u16,
         path: &str,
         carrier_credential: Option<Bound<'_, PyAny>>,
         pair_field: Option<String>,
@@ -97,7 +98,11 @@ impl Candidate {
     /// `dial_exchange`); it authenticates with the options' PSK.
     #[staticmethod]
     #[pyo3(signature = (host, port, *, options=None))]
-    fn exchange(host: Host, port: u16, options: Option<PyRef<'_, ExchangeOptions>>) -> Self {
+    fn exchange(
+        host: Host,
+        #[pyo3(from_py_with = ranged)] port: u16,
+        options: Option<PyRef<'_, ExchangeOptions>>,
+    ) -> Self {
         let o = options.map_or_else(Default::default, |o| o.0.clone());
         let addr = hostport(&host, port);
         Self(zmux_http::candidate_exchange(connect(&addr), &addr, &o))
@@ -141,10 +146,10 @@ impl Candidate {
     #[pyo3(signature = (host, port, *, tls=None, server_name=None, lanes=zmux_quinn::LaneWindows::default().lanes, carrier_credential=None))]
     fn quic(
         host: Host,
-        port: u16,
+        #[pyo3(from_py_with = ranged)] port: u16,
         tls: Option<PyRef<'_, TlsConfig>>,
         server_name: Option<String>,
-        lanes: u32,
+        #[pyo3(from_py_with = ranged)] lanes: u32,
         carrier_credential: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let addr = hostport(&host, port);
@@ -200,7 +205,7 @@ impl Candidate {
     fn webtransport(
         url: String,
         tls: Option<PyRef<'_, TlsConfig>>,
-        lanes: u32,
+        #[pyo3(from_py_with = ranged)] lanes: u32,
         carrier_credential: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let d = WebTransportDial::new(

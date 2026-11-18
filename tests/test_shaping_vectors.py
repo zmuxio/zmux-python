@@ -86,33 +86,88 @@ def test_budget(case: dict[str, Any]) -> None:
         assert b.no_injection == d["no_injection"]
 
 
-def seconds(m: dict[str, int]) -> dict[str, float]:
-    return {k: v / 1e6 if k in ("age", "idle") else v for k, v in m.items()}
+def member(m: dict[str, int]) -> zmux.helpers.PoolMember:
+    return zmux.helpers.PoolMember(
+        pipe=zmux.PipeId(m["id"]),
+        age=m.get("age", 0) / 1e6,
+        idle=m.get("idle", 0) / 1e6,
+        pipes=m.get("pipes", 0),
+        bytes_sent=m.get("bytes_sent", 0),
+        bytes_received=m.get("bytes_received", 0),
+    )
 
 
-@pytest.mark.parametrize("case", POOL["decide"], ids=by_name)
-def test_pool_decide(case: dict[str, Any]) -> None:
-    p = zmux.helpers.PoolPolicy(case["policy"])
-    exact = (
+def pool_view(step: dict[str, Any]) -> zmux.helpers.PoolView:
+    since = step.get("since_dial")
+    return zmux.helpers.PoolView(
+        members=tuple(member(m) for m in step.get("members", [])),
+        failures=step.get("failures", 0),
+        since_last_dial=None if since is None else since / 1e6,
+    )
+
+
+def is_exact(case: dict[str, Any]) -> bool:
+    """No step of the case draws a random number."""
+    return (
         all(s["consumed"] == 0 for s in case["steps"])
         and not case["compile"]["consumed"]
     )
+
+
+@pytest.mark.parametrize("case", POOL["decide"], ids=by_name)
+def test_pool_evaluate(case: dict[str, Any]) -> None:
+    """The shared vectors test the evaluation: its values as the policy gives
+    them, a probe interval below 1 s included."""
+    p = zmux.helpers.MachinePoolPolicy(case["policy"])
     for step in case["steps"]:
-        since = step.get("since_dial")
-        d = p.decide(
-            step.get("failures", 0),
-            [seconds(m) for m in step.get("members", [])],
-            since_dial=None if since is None else since / 1e6,
-        )
+        got = p.evaluate(pool_view(step))
         want = step["want"]
         for key in ("count", "dial_after", "recheck", "probe_interval", "probe_jitter"):
-            assert (getattr(d, key) is None) == (want[key] is None), key
-        if exact:
-            assert d.retire == want["retire"]
+            assert (getattr(got, key) is not None) == (want[key] is not None), key
+        if not is_exact(case):
+            continue
+        assert list(got.retire) == want["retire"]
+        if want["count"] is not None:
+            assert got.count == want["count"]
+        for key in ("dial_after", "recheck", "probe_interval", "probe_jitter"):
+            if want[key] is not None:
+                assert getattr(got, key) == pytest.approx(want[key] / 1e6, abs=1e-6), (
+                    key
+                )
+
+
+@pytest.mark.parametrize(
+    "case", [c for c in POOL["decide"] if is_exact(c)], ids=by_name
+)
+def test_pool_decide_builds_the_evaluated_values(case: dict[str, Any]) -> None:
+    """`decide` builds a `PoolDecision` from the evaluated values, and the
+    construction refuses the one out of range: a probe interval between 0 and
+    1 s is a `ValueError`, which is the pool's rejection of the look."""
+    p = zmux.helpers.MachinePoolPolicy(case["policy"])
+    for step in case["steps"]:
+        view = pool_view(step)
+        want = step["want"]
+        probe = want["probe_interval"]
+        if probe is not None and 0 < probe < 1_000_000:
+            with pytest.raises(ValueError):
+                p.decide(view)
+            continue
+        d = p.decide(view)
+        live = d.liveness
+        assert (d.count is not zmux.INHERIT) == (want["count"] is not None)
+        assert (d.dial_after is not zmux.INHERIT) == (want["dial_after"] is not None)
+        assert (d.recheck is not None) == (want["recheck"] is not None)
+        assert (live.probe_interval is not zmux.INHERIT) == (probe is not None)
+        assert (live.probe_jitter is not zmux.INHERIT) == (
+            want["probe_jitter"] is not None
+        )
+        assert list(d.retire_pipes) == want["retire"]
+        if want["count"] is not None:
             assert d.count == want["count"]
-            for key in ("dial_after", "recheck", "probe_interval", "probe_jitter"):
-                if want[key] is not None:
-                    assert getattr(d, key) == pytest.approx(want[key] / 1e6, abs=1e-6)
+        if probe == 0:
+            assert live.probe_interval is None
+        elif probe:
+            assert live.probe_interval == pytest.approx(probe / 1e6, abs=1e-6)
 
 
 def test_max_slots() -> None:

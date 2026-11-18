@@ -1,18 +1,21 @@
-//! Keeping pipes up: `PipePool`, `PoolPolicy`, `MaintainHandle`.
+//! Keeping pipes up: `PipePool`, `MachinePoolPolicy`, `MaintainHandle`.
 
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use pyo3::exceptions::{PyTypeError, PyValueError};
+use pyo3::intern;
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyString};
-use zmux::helpers::{PoolDecision, PoolView};
-
-use zmux_shaping::{MachinePoolPolicy, MemberDecision, PoolMember};
+use pyo3::types::{PyBytes, PyDict, PyString, PyTuple};
+use zmux::helpers::{
+    AsyncPoolPolicy, OwnedPoolView, PolicyError, PolicyFuture, PoolDecision, PoolMember, PoolView,
+};
+use zmux_shaping::MachinePoolPolicy as Machine;
 
 use crate::helpers::lock;
 use crate::rt::LoopRef;
-use crate::{Pipe, Session, options_obj, pipe_options};
+use crate::{Pipe, Session, options_obj, pipe_options, seconds, types};
+use crate::{ranged, ranged_opt};
 
 /// The JSON text of `json`: `str`, `bytes` or a `dict` (serialised).
 fn json_bytes(json: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
@@ -31,191 +34,368 @@ fn json_bytes(json: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     ))
 }
 
-/// A pool policy read from JSON; its decisions run natively. Pools given
-/// the same object share its state.
+/// A pool policy read from JSON, run natively: `decide(view)` answers a `PoolView` with a
+/// `PoolDecision` without calling Python. Pools given the same object share its state.
 #[pyclass(frozen, module = "zmux")]
-pub(crate) struct PoolPolicy(Arc<StdMutex<MachinePoolPolicy>>);
+pub(crate) struct MachinePoolPolicy(Arc<StdMutex<Machine>>);
 
-impl PoolPolicy {
-    fn parse(json: &Bound<'_, PyAny>) -> PyResult<Self> {
-        let b = json_bytes(json)?;
+#[pymethods]
+impl MachinePoolPolicy {
+    /// Reads a policy from its JSON `definition` (`str`, `bytes` or `dict`); an invalid one
+    /// raises `ValueError`.
+    #[new]
+    fn new(definition: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let b = json_bytes(definition)?;
         let p = zmux_shaping::pool_policy(&b, zmux_shaping::Options::default())
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Self(Arc::new(StdMutex::new(p))))
     }
 
-    /// `p` itself when it is a `PoolPolicy`, else `p` read as JSON.
-    fn of(p: &Bound<'_, PyAny>) -> PyResult<Shared> {
-        if let Ok(p) = p.cast::<PoolPolicy>() {
-            return Ok(Shared(p.get().0.clone()));
+    /// The decision for `view`, a `PoolView`: the policy's values, as `PoolDecision` takes
+    /// them. A policy of a pool is asked this way at each look. `ValueError` for a value
+    /// that `PoolDecision` refuses (a probe interval between 0 and 1 s), which rejects the
+    /// look of a pool.
+    fn decide<'p>(&self, py: Python<'p>, view: &Bound<'p, PyAny>) -> PyResult<Bound<'p, PyAny>> {
+        let members = view_members(view)?;
+        let mut v = PoolView::default();
+        v.members = &members;
+        v.failures = view.getattr("failures")?.extract()?;
+        v.since_last_dial = view
+            .getattr("since_last_dial")?
+            .extract::<Option<f64>>()?
+            .map(|s| seconds("since_last_dial", s))
+            .transpose()?;
+        v.dialing = view.getattr("dialing")?.extract()?;
+        let mut out = PoolDecision::default();
+        zmux::helpers::PoolPolicy::decide(&mut *lock(&self.0), &v, &mut out)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        decision_obj(py, &out)
+    }
+
+    /// The policy's values for `view` as it evaluates them, unchanged: a
+    /// `PoolEvaluation`, out of range values included. How a policy file is tested;
+    /// `decide` builds the `PoolDecision` from the same values and refuses one out of
+    /// range.
+    fn evaluate<'p>(&self, py: Python<'p>, view: &Bound<'p, PyAny>) -> PyResult<Bound<'p, PyAny>> {
+        let micros = |d: Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+        let members = view_members(view)?
+            .iter()
+            .map(|m| {
+                let mut n = zmux_shaping::PoolMember::new(m.pipe.get());
+                n.age = micros(m.age);
+                n.idle = micros(m.idle);
+                n.pipes = m.pipes as u64;
+                n.bytes_sent = m.bytes_sent;
+                n.bytes_received = m.bytes_received;
+                n
+            })
+            .collect::<Vec<_>>();
+        let since = view
+            .getattr("since_last_dial")?
+            .extract::<Option<f64>>()?
+            .map(|s| seconds("since_last_dial", s))
+            .transpose()?
+            .map(micros);
+        let mut out = zmux_shaping::MemberDecision::default();
+        lock(&self.0).decide_members(
+            view.getattr("failures")?.extract()?,
+            since,
+            &members,
+            &mut out,
+        );
+        let secs = |us: u64| us as f64 / 1e6;
+        let d = PyDict::new(py);
+        d.set_item("count", out.count)?;
+        d.set_item("dial_after", out.dial_after.map(secs))?;
+        d.set_item("retire", out.retire)?;
+        d.set_item("recheck", out.recheck.map(secs))?;
+        d.set_item("probe_interval", out.probe_interval.map(secs))?;
+        d.set_item("probe_jitter", out.probe_jitter.map(|j| f64::from(j) / 1e6))?;
+        types(py)?.getattr("PoolEvaluation")?.call((), Some(&d))
+    }
+}
+
+/// The native members of a `PoolView`'s `members`.
+fn view_members(view: &Bound<'_, PyAny>) -> PyResult<Vec<PoolMember>> {
+    let mut out = Vec::new();
+    for m in view.getattr("members")?.try_iter()? {
+        let m = m?;
+        let mut n = PoolMember::default();
+        n.pipe = zmux::PipeId::new(m.getattr("pipe")?.extract()?);
+        n.age = seconds("age", m.getattr("age")?.extract()?)?;
+        n.idle = seconds("idle", m.getattr("idle")?.extract()?)?;
+        n.pipes = m.getattr("pipes")?.extract()?;
+        n.bytes_sent = m.getattr("bytes_sent")?.extract()?;
+        n.bytes_received = m.getattr("bytes_received")?.extract()?;
+        n.usable = m.getattr("usable")?.extract()?;
+        n.replacing = m.getattr("replacing")?.extract()?;
+        out.push(n);
+    }
+    Ok(out)
+}
+
+/// The `PoolView` of a native one, built on the event loop.
+fn view_obj<'p>(py: Python<'p>, v: &OwnedPoolView) -> PyResult<Bound<'p, PyAny>> {
+    let t = types(py)?;
+    let member = t.getattr("PoolMember")?;
+    let mut members = Vec::with_capacity(v.members.len());
+    for m in &v.members {
+        let d = PyDict::new(py);
+        d.set_item("pipe", m.pipe.get())?;
+        d.set_item("age", m.age.as_secs_f64())?;
+        d.set_item("idle", m.idle.as_secs_f64())?;
+        d.set_item("pipes", m.pipes)?;
+        d.set_item("bytes_sent", m.bytes_sent)?;
+        d.set_item("bytes_received", m.bytes_received)?;
+        d.set_item("usable", m.usable)?;
+        d.set_item("replacing", m.replacing)?;
+        members.push(member.call((), Some(&d))?);
+    }
+    let d = PyDict::new(py);
+    d.set_item("members", PyTuple::new(py, members)?)?;
+    d.set_item("failures", v.failures)?;
+    d.set_item(
+        "since_last_dial",
+        v.since_last_dial.map(|s| s.as_secs_f64()),
+    )?;
+    d.set_item("dialing", v.dialing)?;
+    t.getattr("PoolView")?.call((), Some(&d))
+}
+
+/// The `PoolDecision` of a native one.
+fn decision_obj<'p>(py: Python<'p>, o: &PoolDecision) -> PyResult<Bound<'p, PyAny>> {
+    let t = types(py)?;
+    let d = PyDict::new(py);
+    if let Some(c) = o.count() {
+        d.set_item("count", c.get())?;
+    }
+    if let Some(a) = o.dial_after() {
+        d.set_item("dial_after", a.as_secs_f64())?;
+    }
+    d.set_item(
+        "retire_pipes",
+        o.retire_pipes()
+            .iter()
+            .map(|p| p.get())
+            .collect::<Vec<u64>>(),
+    )?;
+    d.set_item("recheck", o.recheck().map(|r| r.as_secs_f64()))?;
+    if let Some(l) = o.liveness() {
+        d.set_item("liveness", crate::pipe_liveness_obj(py, &l)?)?;
+    }
+    t.getattr("PoolDecision")?.call((), Some(&d))
+}
+
+/// The answer of a Python policy, read on the event loop.
+#[derive(Default)]
+struct Answer {
+    count: Option<std::num::NonZeroUsize>,
+    dial_after: Option<Duration>,
+    retire_pipes: Vec<zmux::PipeId>,
+    recheck: Option<Duration>,
+    liveness: Option<zmux::PipeLiveness>,
+}
+
+impl Answer {
+    /// Reads a `PoolDecision`; anything else, and a value out of range, is an error.
+    fn of(d: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let py = d.py();
+        if !d.is_instance(&types(py)?.getattr("PoolDecision")?)? {
+            return Err(PyTypeError::new_err(format!(
+                "decide returns a PoolDecision, not {}",
+                d.get_type().name()?
+            )));
         }
-        Ok(Shared(Self::parse(p)?.0))
-    }
-}
-
-/// A member metric, absent 0; negative or not finite raises `ValueError`.
-fn metric(d: &Bound<'_, PyDict>, k: &str) -> PyResult<f64> {
-    let x: f64 = match d.get_item(k)? {
-        Some(v) => v.extract()?,
-        None => return Ok(0.0),
-    };
-    if !x.is_finite() || x < 0.0 {
-        return Err(PyValueError::new_err(format!(
-            "member {k} is a finite non-negative number"
-        )));
-    }
-    Ok(x)
-}
-
-/// Seconds as microseconds.
-fn micros(x: f64) -> u64 {
-    (x * 1e6).round().clamp(0.0, u64::MAX as f64) as u64
-}
-
-fn secs(x: u64) -> f64 {
-    x as f64 / 1e6
-}
-
-fn count(x: f64) -> u64 {
-    x.clamp(0.0, u64::MAX as f64) as u64
-}
-
-#[pymethods]
-impl PoolPolicy {
-    /// Reads a policy from its JSON `definition` (`str`, `bytes` or
-    /// `dict`).
-    #[new]
-    fn new(definition: &Bound<'_, PyAny>) -> PyResult<Self> {
-        Self::parse(definition)
-    }
-
-    /// One decision for a pool whose dials failed `failures` times in a
-    /// row, whose members are `members` (dicts with `id` and optional
-    /// `age`, `idle` in seconds, `pipes`, `bytes_sent`, `bytes_received`)
-    /// and whose last dial started `since_dial` seconds ago (`None`: none).
-    #[pyo3(signature = (failures=0, members=Vec::new(), *, since_dial=None))]
-    fn decide(
-        &self,
-        failures: u32,
-        members: Vec<Bound<'_, PyDict>>,
-        since_dial: Option<f64>,
-    ) -> PyResult<PoolPolicyDecision> {
-        let mut ms = Vec::with_capacity(members.len());
-        for d in &members {
-            let id: u64 = d
-                .get_item("id")?
-                .ok_or_else(|| PyValueError::new_err("member without an id"))?
-                .extract()?;
-            let mut m = PoolMember::new(id);
-            m.age = micros(metric(d, "age")?);
-            m.idle = micros(metric(d, "idle")?);
-            m.pipes = count(metric(d, "pipes")?);
-            m.bytes_sent = count(metric(d, "bytes_sent")?);
-            m.bytes_received = count(metric(d, "bytes_received")?);
-            ms.push(m);
-        }
-        let since = match since_dial {
-            Some(s) if !s.is_finite() || s < 0.0 => {
-                return Err(PyValueError::new_err(
-                    "since_dial is a finite non-negative number",
-                ));
-            }
-            s => s.map(micros),
+        let unset = |v: &Bound<'_, PyAny>| crate::is_setting(v, "INHERIT");
+        let count = d.getattr("count")?;
+        let count = if unset(&count)? {
+            None
+        } else {
+            // A `bool` is no count, whatever `int` it is.
+            let n = if count.is_instance_of::<pyo3::types::PyBool>() {
+                None
+            } else {
+                match count.extract::<usize>() {
+                    Ok(n) => Some(n),
+                    // No upper bound is documented: beyond the native
+                    // range it is as large as a count gets.
+                    Err(e) if e.is_instance_of::<pyo3::exceptions::PyOverflowError>(py) => {
+                        count.gt(0)?.then_some(usize::MAX)
+                    }
+                    Err(_) => None,
+                }
+            };
+            Some(n.and_then(std::num::NonZeroUsize::new).ok_or_else(|| {
+                PyValueError::new_err("count is an integer of at least 1, or INHERIT")
+            })?)
         };
-        let mut out = MemberDecision::default();
-        lock(&self.0).decide_members(failures, since, &ms, &mut out);
-        Ok(PoolPolicyDecision {
-            count: out.count.map(|c| usize::try_from(c).unwrap_or(usize::MAX)),
-            dial_after: out.dial_after.map(secs),
-            retire: out.retire,
-            recheck: out.recheck.map(secs),
-            probe_interval: out.probe_interval.map(secs),
-            probe_jitter: out.probe_jitter.map(|j| f64::from(j) / 1e6),
-        })
-    }
-}
-
-/// One answer of `PoolPolicy.decide`.
-#[pyclass(frozen, eq, get_all, module = "zmux")]
-#[derive(Clone, PartialEq)]
-pub(crate) struct PoolPolicyDecision {
-    count: Option<usize>,
-    dial_after: Option<f64>,
-    retire: Vec<u64>,
-    recheck: Option<f64>,
-    probe_interval: Option<f64>,
-    probe_jitter: Option<f64>,
-}
-
-#[pymethods]
-impl PoolPolicyDecision {
-    /// A decision of its own; `probe_interval` neither 0 nor at least 1 s, `probe_jitter`
-    /// outside [0, 1) or a negative time raise `ValueError`.
-    #[new]
-    #[pyo3(signature = (*, count=None, dial_after=None, retire=Vec::new(), recheck=None,
-        probe_interval=None, probe_jitter=None))]
-    fn new(
-        count: Option<usize>,
-        dial_after: Option<f64>,
-        retire: Vec<u64>,
-        recheck: Option<f64>,
-        probe_interval: Option<f64>,
-        probe_jitter: Option<f64>,
-    ) -> PyResult<Self> {
-        for (name, v) in [("dial_after", dial_after), ("recheck", recheck)] {
-            if v.is_some_and(|v| !v.is_finite() || v < 0.0) {
-                return Err(PyValueError::new_err(format!(
-                    "{name} is a non-negative number of seconds"
-                )));
-            }
-        }
-        // As in a policy file, a probe interval of 0 turns the idle probes off.
-        let mut l = zmux::PipeLiveness::default();
-        if let Some(i) = probe_interval {
-            let bad = || PyValueError::new_err("probe_interval is 0 or at least 1 s");
-            let i = Duration::try_from_secs_f64(i).map_err(|_| bad())?;
-            l.probe_interval = zmux::Inherit::Set((!i.is_zero()).then_some(i));
-            l.validate().map_err(|_| bad())?;
-        }
-        if let Some(j) = probe_jitter {
-            l.probe_jitter = zmux::Inherit::Set(j);
-            l.validate()
-                .map_err(|_| PyValueError::new_err("probe_jitter is in [0, 1)"))?;
-        }
+        let dial_after = d.getattr("dial_after")?;
+        let dial_after = if unset(&dial_after)? {
+            None
+        } else {
+            Some(seconds("dial_after", dial_after.extract()?)?)
+        };
+        let retire_pipes = d
+            .getattr("retire_pipes")?
+            .try_iter()?
+            .map(|p| Ok(zmux::PipeId::new(p?.extract()?)))
+            .collect::<PyResult<_>>()?;
+        let recheck = d
+            .getattr("recheck")?
+            .extract::<Option<f64>>()?
+            .map(|r| seconds("recheck", r))
+            .transpose()?;
+        let liveness = crate::pipe_liveness(&d.getattr("liveness")?)?;
         Ok(Self {
             count,
             dial_after,
-            retire,
+            retire_pipes,
             recheck,
-            probe_interval,
-            probe_jitter,
+            liveness: (liveness != zmux::PipeLiveness::default()).then_some(liveness),
         })
     }
 
-    fn __repr__(&self) -> String {
-        fn opt<T: std::fmt::Display>(v: Option<&T>) -> String {
-            v.map_or("None".into(), ToString::to_string)
+    /// Writes the answer into `out`; a setter's refusal rejects the look.
+    fn apply(self, out: &mut PoolDecision) -> Result<(), PolicyFailure> {
+        if let Some(c) = self.count {
+            out.set_count(c);
         }
-        format!(
-            "PoolPolicyDecision(count={}, dial_after={}, retire={:?}, recheck={}, \
-             probe_interval={}, probe_jitter={})",
-            opt(self.count.as_ref()),
-            opt(self.dial_after.as_ref()),
-            self.retire,
-            opt(self.recheck.as_ref()),
-            opt(self.probe_interval.as_ref()),
-            opt(self.probe_jitter.as_ref())
-        )
+        if let Some(a) = self.dial_after {
+            out.set_dial_after(a);
+        }
+        out.set_retire_pipes(self.retire_pipes);
+        if let Some(r) = self.recheck {
+            out.set_recheck(r).map_err(PolicyFailure::value)?;
+        }
+        if let Some(l) = self.liveness {
+            out.set_liveness(l).map_err(PolicyFailure::value)?;
+        }
+        Ok(())
+    }
+}
+
+/// Whether `d`, a `PoolDecision`, is in range, as the pool applies it:
+/// `ValueError` if not. The one check of the type, which its constructor runs.
+#[pyfunction(name = "_check_pool_decision")]
+pub(crate) fn check_pool_decision(d: &Bound<'_, PyAny>) -> PyResult<()> {
+    Answer::of(d)?
+        .apply(&mut PoolDecision::default())
+        .map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+/// Why a look was rejected: the exception that `decision_rejected` is handed, and its text
+/// for the logger.
+#[derive(Debug)]
+struct PolicyFailure {
+    err: Arc<PyErr>,
+    text: String,
+}
+
+impl PolicyFailure {
+    fn value(e: impl std::fmt::Display) -> Self {
+        let text = e.to_string();
+        Self {
+            err: Arc::new(PyValueError::new_err(text.clone())),
+            text,
+        }
+    }
+
+    /// An exception of the policy, named for its type.
+    fn of(py: Python<'_>, e: PyErr) -> Self {
+        let v = e.value(py);
+        let text = match v.str() {
+            Ok(s) => format!(
+                "{}: {s}",
+                v.get_type()
+                    .name()
+                    .map_or_else(|_| "Exception".into(), |n| n.to_string())
+            ),
+            Err(_) => "an exception".to_owned(),
+        };
+        Self {
+            err: Arc::new(e),
+            text,
+        }
+    }
+}
+
+impl std::fmt::Display for PolicyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
+impl std::error::Error for PolicyFailure {}
+
+/// A policy of an object in Python, asked on the event loop. The pool polls the future of
+/// `decide` on its own maintainer task, so an answer that is slow, or never comes, occupies
+/// no thread and no executor slot: only the look of its own pool waits for it, without a
+/// bound. It is the loop, never a runtime thread, that runs the policy. A loop that closes
+/// answers at once, as a rejection; a pool that stops drops the future, which cancels the
+/// call on the loop.
+struct PyPolicy {
+    object: Arc<Py<PyAny>>,
+    lp: LoopRef,
+}
+
+impl AsyncPoolPolicy for PyPolicy {
+    fn decide(&self, view: OwnedPoolView) -> PolicyFuture {
+        let object = self.object.clone();
+        let asked = self.lp.settled(
+            move |py| {
+                object
+                    .bind(py)
+                    .call_method1(intern!(py, "decide"), (view_obj(py, &view)?,))
+            },
+            move |py, r| {
+                // Read on the loop, where the answer's objects live.
+                r.and_then(|v| Answer::of(&v))
+                    .map_err(|e| PolicyFailure::of(py, e))
+            },
+            || {
+                Err(PolicyFailure::value(
+                    "the event loop of the pool's hooks closed",
+                ))
+            },
+        );
+        Box::pin(async move {
+            let mut out = PoolDecision::default();
+            asked.await?.apply(&mut out)?;
+            Ok(out)
+        })
     }
 }
 
 /// A policy shared between the Python object and its pools.
-struct Shared(Arc<StdMutex<MachinePoolPolicy>>);
+struct Shared(Arc<StdMutex<Machine>>);
 
 impl zmux::helpers::PoolPolicy for Shared {
-    fn decide(&mut self, view: &PoolView<'_>, out: &mut PoolDecision) {
+    fn decide(&mut self, view: &PoolView<'_>, out: &mut PoolDecision) -> Result<(), PolicyError> {
         let mut p = lock(&self.0);
-        zmux::helpers::PoolPolicy::decide(&mut *p, view, out);
+        // An invalid decision of the machine policy is a rejection with a `ValueError`.
+        zmux::helpers::PoolPolicy::decide(&mut *p, view, out)
+            .map_err(|e| Box::new(PolicyFailure::value(e)) as PolicyError)
+    }
+}
+
+/// The policy of a pool: a `MachinePoolPolicy`, run natively, or an object with `decide`.
+#[derive(Clone)]
+enum Policy {
+    Machine(Arc<StdMutex<Machine>>),
+    Object(Arc<Py<PyAny>>),
+}
+
+impl Policy {
+    fn of(p: &Bound<'_, PyAny>) -> PyResult<Self> {
+        if let Ok(m) = p.cast::<MachinePoolPolicy>() {
+            return Ok(Self::Machine(m.get().0.clone()));
+        }
+        if !p.getattr("decide").is_ok_and(|d| d.is_callable()) {
+            return Err(PyTypeError::new_err(
+                "policy is a MachinePoolPolicy or an object with decide(view)",
+            ));
+        }
+        Ok(Self::Object(Arc::new(p.clone().unbind())))
     }
 }
 
@@ -234,9 +414,9 @@ pub(crate) struct PipePool {
     /// Members dialed through a carrier choice, under its policy.
     choice: Option<(zmux::CarrierChoice, zmux::CarrierChoicePolicy)>,
     options: zmux::PipeOptions,
-    rotate: Option<zmux::helpers::RotatePolicy>,
+    rotate: Option<zmux::helpers::Rotation>,
     backoff: Option<zmux::Backoff>,
-    policy: Option<Arc<StdMutex<MachinePoolPolicy>>>,
+    policy: Option<Policy>,
     decision_rejected: Option<Arc<Py<PyAny>>>,
 }
 
@@ -251,19 +431,19 @@ impl PipePool {
     #[new]
     #[pyo3(signature = (count=1, dial=None, *, join=None, choice=None, choice_policy=None,
         rotate_max_bytes=None, rotate_max_age=None, rotate_jitter=0.0, backoff=None,
-        pool_policy=None, options=None, decision_rejected=None))]
+        policy=None, options=None, decision_rejected=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
-        count: usize,
+        #[pyo3(from_py_with = ranged)] count: usize,
         dial: Option<Py<PyAny>>,
         join: Option<Py<PyAny>>,
         choice: Option<PyRef<'_, crate::choice::CarrierChoice>>,
         choice_policy: Option<PyRef<'_, crate::choice::CarrierChoicePolicy>>,
-        rotate_max_bytes: Option<u64>,
+        #[pyo3(from_py_with = ranged_opt)] rotate_max_bytes: Option<u64>,
         rotate_max_age: Option<f64>,
         rotate_jitter: f64,
         backoff: Option<Bound<'_, PyAny>>,
-        pool_policy: Option<Bound<'_, PyAny>>,
+        policy: Option<Bound<'_, PyAny>>,
         options: Option<Bound<'_, PyAny>>,
         decision_rejected: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
@@ -297,7 +477,7 @@ impl PipePool {
             rotate_max_age,
             rotate_jitter,
             backoff,
-            pool_policy,
+            policy,
             options,
             decision_rejected,
         )
@@ -321,7 +501,7 @@ impl PipePool {
         rotate_max_age: Option<f64>,
         rotate_jitter: f64,
         backoff: Option<Bound<'_, PyAny>>,
-        pool_policy: Option<Bound<'_, PyAny>>,
+        policy: Option<Bound<'_, PyAny>>,
         options: Option<Bound<'_, PyAny>>,
         decision_rejected: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
@@ -336,7 +516,7 @@ impl PipePool {
             })
             .transpose()?;
         let rotate = (rotate_max_bytes.is_some() || rotate_max_age.is_some()).then(|| {
-            let mut r = zmux::helpers::RotatePolicy::new().with_jitter(rotate_jitter);
+            let mut r = zmux::helpers::Rotation::new().with_jitter(rotate_jitter);
             if let Some(b) = rotate_max_bytes {
                 r = r.with_max_bytes(b);
             }
@@ -353,10 +533,7 @@ impl PipePool {
             options: pipe_options(options)?,
             backoff: backoff.as_ref().map(crate::backoff_of).transpose()?,
             rotate,
-            policy: pool_policy
-                .map(|p| PoolPolicy::of(&p))
-                .transpose()?
-                .map(|s| s.0),
+            policy: policy.as_ref().map(Policy::of).transpose()?,
             decision_rejected: decision_rejected.map(Arc::new),
         })
     }
@@ -400,15 +577,30 @@ impl PipePool {
         if let Some(b) = self.backoff {
             p = p.with_backoff(b);
         }
-        if let Some(s) = &self.policy {
-            p = p.with_policy(Shared(s.clone()));
+        match &self.policy {
+            Some(Policy::Machine(m)) => p = p.with_policy(Shared(m.clone())),
+            Some(Policy::Object(o)) => {
+                p = p.with_async_policy(Arc::new(PyPolicy {
+                    object: o.clone(),
+                    lp: report.clone(),
+                }));
+            }
+            None => {}
         }
         if let Some(f) = self.decision_rejected.clone() {
             // Called on the event loop, as `dial` and `join` are.
-            p = p.with_decision_rejected(move |reason: &str| {
-                let (f, reason) = (f.clone(), reason.to_owned());
+            p = p.with_decision_rejected(move |e: &(dyn std::error::Error + 'static)| {
+                let f = f.clone();
+                let why = e
+                    .downcast_ref::<PolicyFailure>()
+                    .map(|p| p.err.clone())
+                    .ok_or_else(|| e.to_string());
                 report.post(move |py| {
-                    if let Err(e) = f.call1(py, (reason,)) {
+                    let exc = match why {
+                        Ok(err) => err.clone_ref(py),
+                        Err(text) => pyo3::exceptions::PyRuntimeError::new_err(text),
+                    };
+                    if let Err(e) = f.call1(py, (exc.into_value(py),)) {
                         e.write_unraisable(py, Some(f.bind(py)));
                     }
                 });
@@ -454,8 +646,7 @@ pub(crate) fn maintain(py: Python<'_>, s: &Session, pool: &PipePool) -> PyResult
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<PoolPolicy>()?;
-    m.add_class::<PoolPolicyDecision>()?;
+    m.add_class::<MachinePoolPolicy>()?;
     m.add_class::<PipePool>()?;
     m.add_class::<MaintainHandle>()?;
     Ok(())

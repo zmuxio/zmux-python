@@ -46,12 +46,12 @@ class Recording:
 
 async def relay_one(
     limiter: object, payload: bytes, chunk: int = 256, packets: bool = False
-) -> zmux.helpers.Spliced:
+) -> zmux.helpers.SpliceResult:
     """Sends `payload` through a splice limited by `limiter` from client to
     server; the server answers with nothing."""
     async with pair() as (c, relay_in, _l1), pair() as (relay_out, server, _l2):
 
-        async def relay() -> zmux.helpers.Spliced:
+        async def relay() -> zmux.helpers.SpliceResult:
             a = await relay_in.accept_bi()
             b = await relay_out.open_bi()
             await b[0].flush()  # the server sees the stream before any reset
@@ -72,7 +72,7 @@ async def relay_one(
         with contextlib.suppress(zmux.ZmuxError):
             await asyncio.wait_for(recv.read_to_end(), 10)
         done, got = await asyncio.wait_for(tasks, 10)
-        assert isinstance(done, zmux.helpers.Spliced)
+        assert isinstance(done, zmux.helpers.SpliceResult)
         if done.a_to_b.end is SpliceEnd.FINISHED:
             assert got == payload
         return done
@@ -99,7 +99,7 @@ async def test_packet_splice_takes_each_capsule_whole() -> None:
     lim = Recording()
     async with pair() as (c, relay_in, _l1), pair() as (relay_out, server, _l2):
 
-        async def relay() -> zmux.helpers.Spliced:
+        async def relay() -> zmux.helpers.SpliceResult:
             a = await relay_in.accept_bi()
             b = await relay_out.open_bi()
             return await zmux.helpers.splice_packets(a, b, chunk=1024, a_to_b=lim)
@@ -125,7 +125,7 @@ async def test_burst_grant_below_min_still_forwards_the_capsule() -> None:
     lim = Recording(grant=lambda lo, hi: 1)
     async with pair() as (c, relay_in, _l1), pair() as (relay_out, server, _l2):
 
-        async def relay() -> zmux.helpers.Spliced:
+        async def relay() -> zmux.helpers.SpliceResult:
             a = await relay_in.accept_bi()
             b = await relay_out.open_bi()
             return await zmux.helpers.splice_packets(a, b, a_to_b=lim)
@@ -197,7 +197,7 @@ async def test_raising_try_acquire_grants_nothing() -> None:
         pair(DGRAM, DGRAM) as (relay_out, server, _l2),
     ):
 
-        async def relay() -> zmux.helpers.Spliced:
+        async def relay() -> zmux.helpers.SpliceResult:
             a = await relay_in.accept_bi()
             b = await relay_out.open_bi()
             return await zmux.helpers.splice_packets(a, b, a_to_b=lim)
@@ -265,7 +265,7 @@ async def test_shared_limiter_never_over_grants() -> None:
     received = [0, 0]
     async with pair() as (c, relay_in, _l1), pair() as (relay_out, server, _l2):
 
-        async def relay() -> zmux.helpers.Spliced:
+        async def relay() -> zmux.helpers.SpliceResult:
             a = await relay_in.accept_bi()
             b = await relay_out.open_bi()
             return await zmux.helpers.splice(a, b, chunk=128, a_to_b=budget)

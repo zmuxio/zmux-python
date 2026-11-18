@@ -10,18 +10,14 @@ matrix driver's contract.
 from __future__ import annotations
 
 import asyncio
-import datetime
 import os
 import sys
 
+import certs
 import zmux
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import NameOID
 
-SERVER_SECRET = b"\x5a" * 32
-CLIENT_SECRET = b"\x6b" * 32
+SERVER_SECRET = zmux.StaticKey.from_scalar(b"\x5a" * 32)
+CLIENT_SECRET = zmux.StaticKey.from_scalar(b"\x6b" * 32)
 HANDLE, PSK = zmux.adapter.derive_handle_psk(
     b"zmux interop pre-shared key 0123", b"interop", b""
 )
@@ -74,8 +70,8 @@ def pattern(n: int) -> bytes:
     return (period * (n // 256 + 1))[:n]
 
 
-def pin_of(secret: bytes) -> bytes:
-    return zmux.static_key_id(zmux.static_public(secret))
+def pin_of(secret: zmux.StaticKey) -> bytes:
+    return zmux.static_key_id(secret.public_key)
 
 
 def config(scenario: str) -> zmux.Config:
@@ -97,30 +93,8 @@ def print_app_data(peer: zmux.Peer) -> None:
 
 
 def self_signed() -> zmux.TlsConfig:
-    key = ec.generate_private_key(ec.SECP256R1())
-    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
-    now = datetime.datetime.now(datetime.UTC)
-    cert = (
-        x509.CertificateBuilder()
-        .subject_name(name)
-        .issuer_name(name)
-        .public_key(key.public_key())
-        .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(minutes=1))
-        .not_valid_after(now + datetime.timedelta(days=1))
-        .add_extension(
-            x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False
-        )
-        .sign(key, hashes.SHA256())
-    )
-    return zmux.TlsConfig(
-        cert=cert.public_bytes(serialization.Encoding.PEM),
-        key=key.private_bytes(
-            serialization.Encoding.PEM,
-            serialization.PrivateFormat.PKCS8,
-            serialization.NoEncryption(),
-        ),
-    )
+    cert, key = certs.self_signed()
+    return zmux.TlsConfig(cert=cert, key=key)
 
 
 async def echo_one(session: zmux.Session) -> None:
@@ -243,7 +217,9 @@ async def client(scenario: str, args: list[str]) -> int:
         verifier=zmux.PinVerifier(pin_of(SERVER_SECRET), proof_key=proof_key),
         handle=HANDLE if profile in (1, 3) else b"",
         psk=PSK if profile in (1, 3) else b"",
-        static_secret=CLIENT_SECRET if scenario == "appdata" else zmux.AUTO,
+        static_key=(
+            CLIENT_SECRET if scenario == "appdata" else zmux.StaticKey.generate()
+        ),
         allowed_profiles=[profile],
         app_data=(
             (lambda m, i, v: b"cli-msg3" if m == 3 else None)
@@ -281,7 +257,7 @@ async def client(scenario: str, args: list[str]) -> int:
             ),
             options=zmux.PipeOptions(record_mode="bound"),
         )
-        await extra.attached()
+        await extra.wait_attached()
         n = len(session.pipes())
         say(f"PIPES {n}")
         if n < 2:
@@ -294,7 +270,7 @@ async def client(scenario: str, args: list[str]) -> int:
             await zmux.dial_tcp(host, port),
             options=zmux.PipeOptions(record_mode="sealed"),
         )
-        await extra.attached()
+        await extra.wait_attached()
     await send_and_check(session, SIZE_A, "A")
     if scenario == "close-idle":
         send, recv = await session.accept_bi()

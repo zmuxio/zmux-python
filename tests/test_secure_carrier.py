@@ -9,7 +9,7 @@ from collections.abc import Callable
 import pytest
 import zmux
 
-NODE = hashlib.sha256(b"node").digest()
+NODE = zmux.StaticKey.from_scalar(hashlib.sha256(b"node").digest())
 HANDLE, PSK = zmux.adapter.derive_handle_psk(b"s" * 32, b"tests")
 CONFIG = zmux.Config(max_pipes=4)
 
@@ -96,7 +96,7 @@ async def test_establish_join_and_modes() -> None:
             assert verifier.seen.role is zmux.Role.SERVER
             assert verifier.seen.psk_identity == HANDLE
             assert peer.static_key == verifier.seen.peer_static
-            assert peer.static_key == zmux.static_public(NODE)
+            assert peer.static_key == NODE.public_key
             assert peer.record_mode is zmux.RecordMode.SEALED
             assert peer.pq_confidential and not peer.pq_authenticated
             # A pin of what was seen passes, and a wrong one does not.
@@ -107,13 +107,16 @@ async def test_establish_join_and_modes() -> None:
                 psk=PSK,
             )
             del again
-            with pytest.raises(zmux.ZmuxError):
+            with pytest.raises(zmux.CredentialsFailedError) as refused:
                 await zmux.establish(
                     await zmux.dial_tcp(*addr),
                     verifier=zmux.PinVerifier(bytes(32)),
                     handle=HANDLE,
                     psk=PSK,
                 )
+            assert isinstance(refused.value, zmux.SecureCarrierError)
+            assert refused.value.kind == "credentials_failed"
+            assert refused.value.code is None
             async with await zmux.Session.connect(pipe, config=CONFIG) as session:
                 assert session.weakest_record_mode is zmux.RecordMode.SEALED
                 await round_trip(session)
@@ -176,7 +179,7 @@ async def test_a_websocket_join_takes_over_from_the_first_pipe(
                 # pipe before that
                 # loses the session.
                 async with asyncio.timeout(5):
-                    await extra.attached()
+                    await extra.wait_attached()
                 assert listener.stats().joins == 1
                 first.abort()
                 await round_trip(session, b"x" * 100_000)
@@ -384,7 +387,7 @@ async def test_a_secure_carrier_authorized_join_and_tracer() -> None:
                 session.declare_end_to_end()
                 reader, writer = await asyncio.open_connection(*addr)
                 carrier = zmux.pipe_from_streams(reader, writer, max_record=16384)
-                carrier.declare_secure()
+                carrier.declare_carrier_secure()
                 extra = await session.add_pipe(carrier)
                 await extra.joined()
                 await round_trip(session)
@@ -413,7 +416,7 @@ def test_a_secure_server_is_checked_when_made() -> None:
     with pytest.raises(ValueError, match="unknown or reserved"):
         zmux.SecureServer(Gate(), NODE, accepted_profiles=[1, 6])
     with pytest.raises(ValueError):
-        zmux.SecureServer(Gate(), bytes(32))
+        zmux.SecureServer(Gate(), zmux.StaticKey.from_scalar(bytes(32)))
 
 
 async def test_a_profile_without_a_key_is_accepted_only_when_listed() -> None:
@@ -781,7 +784,7 @@ async def test_an_epoch_advance_is_reported() -> None:
     for bad in ({"period": 0}, {"joins": 0}):
         with pytest.raises(ValueError):
             zmux.EpochPolicy(**bad)  # type: ignore[arg-type]
-    with pytest.raises((ValueError, OverflowError)):
+    with pytest.raises(ValueError):
         zmux.Config(epoch_policy=zmux.EpochPolicy(joins=-1))
 
 
@@ -851,12 +854,29 @@ async def test_replace_pipes_replaces_every_pipe() -> None:
         server.cancel()
 
 
-def test_static_public_matches_the_handshake() -> None:
-    public = zmux.static_public(NODE)
-    assert len(public) == 32 and public != zmux.static_public(bytes(31) + b"\x01")
+def test_secure_carrier_errors() -> None:
+    assert issubclass(zmux.SecureCarrierError, zmux.ZmuxError)
+    assert issubclass(zmux.CredentialsFailedError, zmux.SecureCarrierError)
+    assert zmux.CredentialsFailedError.kind == "credentials_failed"
+    assert zmux.SecureCarrierError().code is None
+    # A duplicate that cannot be decided is an argument error the caller mends.
+    assert issubclass(zmux.DuplicateUndecidedError, zmux.ZmuxError)
+    assert issubclass(zmux.DuplicateUndecidedError, ValueError)
+
+
+def test_static_key() -> None:
+    public = NODE.public_key
+    other = zmux.StaticKey.from_scalar(bytes(31) + b"\x01")
+    assert len(public) == 32 and public != other.public_key
+    assert NODE.scalar == hashlib.sha256(b"node").digest()
     assert zmux.static_key_id(public) == zmux.key_id(zmux.KeyAlg.X25519, public)
-    with pytest.raises(ValueError):
-        zmux.static_public(b"short")
+    assert repr(NODE) == "StaticKey(..)"
+    for bad in (b"short", bytes(33)):
+        with pytest.raises(ValueError):
+            zmux.StaticKey.from_scalar(bad)
+    generated = zmux.StaticKey.generate()
+    assert generated.public_key != generated.__class__.generate().public_key
+    assert not hasattr(zmux, "static_public")
 
 
 async def test_a_single_pipe_session_has_no_epoch() -> None:
@@ -865,3 +885,85 @@ async def test_a_single_pipe_session_has_no_epoch() -> None:
         async with asyncio.timeout(10):
             async with await zmux.connect_tcp(*addr) as session:
                 assert session.epoch is None
+
+
+@pytest.mark.parametrize(
+    ("server_args", "reason"),
+    [
+        # The verdict names a proof key and the client proves nothing.
+        ("proof", "proof"),
+        # The verifier passes the client without a proof, and the server
+        # requires the post-quantum authentication a proof gives.
+        ("pq", "pq_auth_required"),
+    ],
+)
+async def test_the_server_names_a_credential_refusal_by_its_own_reason(
+    server_args: str, reason: str
+) -> None:
+    """A server judging a client closes that carrier and reports the reason to
+    `on_reject` and its statistics; it raises nothing to the application, and
+    the client learns nothing from the wire."""
+    reasons: list[str] = []
+
+    def on_reject(info: zmux.RejectInfo) -> str:
+        reasons.append(info.reason)
+        return "close"
+
+    client_key = zmux.SigningKey.generate(zmux.KeyAlg.MLDSA44)
+    if server_args == "proof":
+        server = zmux.SecureServer(
+            Gate(), NODE, client_verifier=Judge(proof_key=client_key.key_id)
+        )
+    else:
+        server = zmux.SecureServer(
+            Gate(),
+            NODE,
+            client_verifier=Judge(),
+            signer=zmux.SigningKey.generate(),
+            require_pq_auth=True,
+        )
+    async with zmux.Listener(
+        config=CONFIG,
+        listener_config=zmux.ListenerConfig(secure_server=server, on_reject=on_reject),
+    ) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
+        async with asyncio.timeout(10):
+            pipe, _ = await zmux.establish(
+                await zmux.dial_tcp(*addr),
+                verifier=Judge(),
+                handle=HANDLE,
+                psk=PSK,
+            )
+            with pytest.raises(zmux.ZmuxError):
+                async with await zmux.Session.connect(pipe, config=CONFIG) as session:
+                    await round_trip(session)
+            await until(lambda: reasons)
+        assert reasons == [reason]
+        await until(lambda: listener.stats().rejected == 1)
+        # Nothing reached the application: no session was accepted.
+        assert listener.stats().sessions == 0
+
+
+async def test_credentials_failed_is_raised_by_the_side_that_judged() -> None:
+    """A client whose verifier rejects the server or cannot decide, or whose
+    `require_pq_auth` does not hold, fails with `CredentialsFailedError`."""
+    server = zmux.SecureServer(Gate(), NODE)
+    async with zmux.Listener(
+        config=CONFIG, listener_config=zmux.ListenerConfig(secure_server=server)
+    ) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
+        for verifier, pq in (
+            (Judge(zmux.VerifyRejectedError), False),
+            (Judge(zmux.VerifyUnavailableError), False),
+            (Judge(), True),
+        ):
+            async with asyncio.timeout(10):
+                with pytest.raises(zmux.CredentialsFailedError) as e:
+                    await zmux.establish(
+                        await zmux.dial_tcp(*addr),
+                        verifier=verifier,
+                        handle=HANDLE,
+                        psk=PSK,
+                        require_pq_auth=pq,
+                    )
+            assert e.value.kind == "credentials_failed" and e.value.code is None

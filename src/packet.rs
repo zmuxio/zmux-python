@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 use zmux::helpers as h;
 
 use crate::helpers::lock;
+use crate::ranged;
 use crate::rt::{deferred, future_into_py, undoable_future_into_py};
 use crate::{Part, RecvStream, Returned, SendStream, held, raise, typed, types};
 
@@ -273,7 +274,7 @@ impl PacketStream {
         send: &Bound<'_, SendStream>,
         recv: &Bound<'_, RecvStream>,
         policy: &str,
-        max_packet: usize,
+        #[pyo3(from_py_with = ranged)] max_packet: usize,
     ) -> PyResult<Self> {
         let opts = options(policy, max_packet)?;
         let (s, r) = crate::helpers::pair(send, recv)?;
@@ -285,7 +286,7 @@ impl PacketStream {
         &self,
         py: Python<'p>,
         payload: PyBackedBytes,
-        context: u64,
+        #[pyo3(from_py_with = ranged)] context: u64,
     ) -> PyResult<Bound<'p, PyAny>> {
         send(py, &self.tx, payload, context)
     }
@@ -345,7 +346,7 @@ impl PacketSender {
         &self,
         py: Python<'p>,
         payload: PyBackedBytes,
-        context: u64,
+        #[pyo3(from_py_with = ranged)] context: u64,
     ) -> PyResult<Bound<'p, PyAny>> {
         send(py, &self.0, payload, context)
     }

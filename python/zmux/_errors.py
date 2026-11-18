@@ -14,9 +14,11 @@ __all__ = [
     "ApplicationClosedError",
     "CarrierChoiceError",
     "ConnectError",
+    "CredentialsFailedError",
     "DatagramBlockedError",
     "DatagramError",
     "DeadlineExceededError",
+    "DuplicateUndecidedError",
     "EarlyDataRejectedError",
     "ExportError",
     "GoingAwayError",
@@ -37,6 +39,7 @@ __all__ = [
     "NotNegotiatedError",
     "PacketError",
     "PacketTooLargeError",
+    "PipeAbortedError",
     "PipeError",
     "PipeGoneError",
     "PipeUsedError",
@@ -44,6 +47,7 @@ __all__ = [
     "PreambleTooLargeError",
     "ResumeFailedError",
     "ResumeTimeoutError",
+    "SecureCarrierError",
     "SessionClosedError",
     "StreamBusyError",
     "StreamClosedError",
@@ -192,6 +196,31 @@ class PreambleTooLargeError(ZmuxError, ValueError):
     max: int = 0
 
 
+class DuplicateUndecidedError(ZmuxError, ValueError):
+    """`resolve_duplicate` could not decide between the two sessions: the
+    dialers are the same and no identity was given for the tie. An argument
+    error, which the caller can mend by passing `local_identity` and
+    `peer_identity`."""
+
+
+class SecureCarrierError(ZmuxError):
+    """The secure carrier failed. `kind` names the failure: the secure
+    carrier's error class as a string, for example `"random_failed"` when the
+    operating system's random source failed, which `StaticKey.generate`
+    reports. A class is not on the wire, so `code` is `None`."""
+
+
+class CredentialsFailedError(SecureCarrierError):
+    """The establishment failed with `credentials failed`: the verifier
+    rejected the server or could not decide, a proof the verdict requires was
+    wrong, or `require_pq_auth` did not hold. Only the side that judged the
+    peer raises it, so only `establish` does: a server closes the carrier,
+    reports it to `on_reject` and the statistics, and raises nothing. `kind` is
+    `"credentials_failed"`."""
+
+    kind = "credentials_failed"
+
+
 class NotNegotiatedError(ZmuxError):
     """The peer did not negotiate what the operation needs: multipath, or a
     preamble or priority extension it does not speak."""
@@ -254,6 +283,12 @@ class JoinSecretSetError(PipeError):
 
 class PipeGoneError(PipeError):
     """No such pipe: it was retired."""
+
+
+class PipeAbortedError(PipeError):
+    """This endpoint removed the pipe abruptly (`Pipe.abort()`, a resource
+    limit, or room made for a new join): how the pipe's `wait_closed()`
+    reports its end."""
 
 
 class ExportError(ZmuxError):

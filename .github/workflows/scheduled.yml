@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: [ '3.12', '3.x' ]
+        python: [ '3.12', '3.x', '3.14t' ]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -38,11 +38,11 @@ jobs:
       - name: Update to the newest compatible dependencies
         run: |
           cargo update
-          python -m pip install -U pip maturin pytest pytest-asyncio cryptography mypy
+          python -m pip install -U pip maturin pytest pytest-asyncio hypothesis cryptography mypy
       - run: cargo clippy --all-targets -- -D warnings
       - name: Build and install the module
         run: |
-          maturin build --release --out dist -i "${{ steps.py.outputs.python-path }}"
+          maturin build --release --features test-hooks --out dist -i "${{ steps.py.outputs.python-path }}"
           python -m pip install --find-links dist --no-index zmuxio
       - run: python -m pytest -q -rs tests
       - run: python -m mypy --strict python/zmux

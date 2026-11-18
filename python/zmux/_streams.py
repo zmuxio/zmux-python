@@ -274,7 +274,7 @@ async def _read(recv: RecvStream, n: int, view: bool) -> bytes | memoryview:
         b = recv._take(n, view)
         if b is not None:
             return b
-        await recv._readable()
+        await recv.wait_readable()
 
 
 async def _collect(recv: RecvStream, want: int) -> list[bytes]:
@@ -286,7 +286,7 @@ async def _collect(recv: RecvStream, want: int) -> list[bytes]:
         while have < want:
             b = recv._take(want - have, False)
             if b is None:
-                await recv._readable()
+                await recv.wait_readable()
                 continue
             if not b:
                 break

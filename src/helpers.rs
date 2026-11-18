@@ -9,6 +9,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+use crate::ranged;
 use crate::rt::{LoopRef, future_into_py};
 use crate::{PipeIo, RecvStream, SendStream, Session, kind_of, types};
 
@@ -81,6 +82,26 @@ impl Held {
         let mut st = lock(&self.st);
         st.bytes = st.bytes.saturating_add(n);
         st.topping = false;
+    }
+}
+
+/// The claim of a `try_acquire` of the shortfall on the loop. A loop that
+/// never runs the call (not bound, closed, or closing with it queued) drops
+/// it: the claim is then released, so the next datagram asks again.
+struct Topping(Option<Arc<Held>>);
+
+impl Topping {
+    /// The call runs: its answer releases the claim.
+    fn finish(mut self) -> Arc<Held> {
+        self.0.take().expect("a claim is finished once")
+    }
+}
+
+impl Drop for Topping {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            lock(&h.st).topping = false;
+        }
     }
 }
 
@@ -200,8 +221,10 @@ impl zmux::Limiter for PyLimiter {
         }
         if !st.topping {
             st.topping = true;
-            let (lo, hi, h) = (min - st.bytes, max - st.bytes, held.clone());
+            let (lo, hi) = (min - st.bytes, max - st.bytes);
+            let top = Topping(Some(held.clone()));
             held.lp.post(move |py| {
+                let h = top.finish();
                 let r = h.obj.bind(py).call_method1("try_acquire", (lo, hi));
                 let n = grant(py, &h.obj, r, hi).unwrap_or_else(|e| {
                     e.write_unraisable(py, Some(h.obj.bind(py)));
@@ -235,7 +258,7 @@ impl SpliceAbort {
     }
 
     /// Aborts with `code` (< 2**62, 0 included); later calls change nothing.
-    fn abort(&self, code: u64) -> PyResult<()> {
+    fn abort(&self, #[pyo3(from_py_with = ranged)] code: u64) -> PyResult<()> {
         self.0.abort(crate::varint(code)?);
         Ok(())
     }
@@ -284,7 +307,7 @@ fn stream_pipe(send: &Bound<'_, SendStream>, recv: &Bound<'_, RecvStream>) -> Py
     Ok(PipeIo::wrap(zmux::PipeIo::from_stream(s, r)))
 }
 
-fn forwarded<'p>(py: Python<'p>, f: &zmux::helpers::Forwarded) -> PyResult<Bound<'p, PyAny>> {
+fn direction<'p>(py: Python<'p>, f: &zmux::helpers::SpliceDirection) -> PyResult<Bound<'p, PyAny>> {
     use zmux::helpers::SpliceEnd as E;
     let (end, code) = match f.end {
         E::Finished => ("finished", None),
@@ -296,7 +319,7 @@ fn forwarded<'p>(py: Python<'p>, f: &zmux::helpers::Forwarded) -> PyResult<Bound
         E::LimiterFailed => ("limiter_failed", None),
         other => return Err(PyValueError::new_err(format!("{other:?}"))),
     };
-    types(py)?.getattr("Forwarded")?.call1((
+    types(py)?.getattr("SpliceDirection")?.call1((
         f.bytes,
         f.datagram_bytes,
         f.datagrams_dropped,
@@ -381,8 +404,8 @@ fn splice_with<'p>(
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(crate::rt::deferred(move |py| {
             Ok(types(py)?
-                .getattr("Spliced")?
-                .call1((forwarded(py, &r.a_to_b)?, forwarded(py, &r.b_to_a)?))?
+                .getattr("SpliceResult")?
+                .call1((direction(py, &r.a_to_b)?, direction(py, &r.b_to_a)?))?
                 .unbind())
         }))
     })
@@ -420,7 +443,8 @@ where
 /// Resolves two sessions between the same endpoints that raced (both
 /// dialed at once): keeps one, drains the other, and optionally starts a
 /// rejoin of the loser's route into the survivor. `ValueError` when the
-/// rule does not apply; nothing is changed then.
+/// rule does not apply (`DuplicateUndecidedError`, a `ValueError`); nothing
+/// is changed then.
 #[pyfunction]
 #[pyo3(signature = (s1, s2, *, local_identity=None, peer_identity=None, rejoin=None))]
 fn resolve_duplicate<'p>(
@@ -447,7 +471,7 @@ fn resolve_duplicate<'p>(
         let _g = crate::rt::runtime()?.enter();
         zmux::helpers::resolve_duplicate(&s1.get().0, &s2.get().0, &opts)
     }
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    .map_err(|e| crate::new_err("DuplicateUndecidedError", e.to_string()))?;
     let d = PyDict::new(py);
     // The caller's own objects (with their returned-result queues and
     // 0-RTT state), not new wrappers.

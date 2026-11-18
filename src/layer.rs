@@ -15,6 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, Rea
 use tokio::sync::{Mutex, mpsc};
 
 use crate::helpers::lock;
+use crate::ranged;
 use crate::rt::{self, LoopRef, future_into_py};
 use crate::{PipeIo, Returned, admission, io_err, unread_take};
 
@@ -72,7 +73,11 @@ impl CarrierStream {
     /// Up to `n` bytes; `b""` at the end of the stream (also without a
     /// receiving half).
     #[pyo3(signature = (n=65536))]
-    fn read<'p>(&self, py: Python<'p>, n: usize) -> PyResult<Bound<'p, PyAny>> {
+    fn read<'p>(
+        &self,
+        py: Python<'p>,
+        #[pyo3(from_py_with = ranged)] n: usize,
+    ) -> PyResult<Bound<'p, PyAny>> {
         let (r, unread) = (self.r.clone(), self.unread.queue());
         let undo = self.unread.undo(py)?;
         rt::undoable_future_into_py(

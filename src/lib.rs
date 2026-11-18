@@ -163,6 +163,7 @@ fn stream_err(e: zmux::StreamError) -> PyErr {
         zmux::StreamError::ClosedLocally => raise("StreamClosedError", &e, false, None),
         zmux::StreamError::NotNegotiated => raise("NotNegotiatedError", &e, false, None),
         zmux::StreamError::NotEstablished => raise("NotEstablishedError", &e, false, None),
+        zmux::StreamError::InvalidArgument => raise("InvalidArgumentError", &e, false, None),
         _ => raise("StreamError", &e, e.is_retryable(), None),
     }
 }
@@ -217,6 +218,9 @@ fn pipe_err(e: zmux::PipeError) -> PyErr {
         }
         zmux::PipeError::Failed(F::JoinTimedOut) => {
             raise("DeadlineExceededError", &e, e.is_retryable(), None)
+        }
+        zmux::PipeError::Failed(F::Aborted) => {
+            raise("PipeAbortedError", &e, e.is_retryable(), None)
         }
         _ => raise("PipeError", &e, e.is_retryable(), None),
     }
@@ -441,6 +445,34 @@ fn positive(name: &str, v: usize) -> PyResult<usize> {
     Ok(v)
 }
 
+/// An integer argument: a value outside the Rust type's range (negative for
+/// an unsigned one, or too large) is `ValueError`, as every out-of-range
+/// argument is, where `PyO3` raises `OverflowError`.
+pub(crate) fn ranged<T>(obj: &Bound<'_, PyAny>) -> PyResult<T>
+where
+    T: for<'a, 'py> FromPyObject<'a, 'py, Error = PyErr>,
+{
+    obj.extract::<T>().map_err(|e| {
+        if e.is_instance_of::<pyo3::exceptions::PyOverflowError>(obj.py()) {
+            PyValueError::new_err(format!("{obj} is out of range"))
+        } else {
+            e
+        }
+    })
+}
+
+/// [`ranged`] for an argument that may be `None`.
+pub(crate) fn ranged_opt<T>(obj: &Bound<'_, PyAny>) -> PyResult<Option<T>>
+where
+    T: for<'a, 'py> FromPyObject<'a, 'py, Error = PyErr>,
+{
+    if obj.is_none() {
+        Ok(None)
+    } else {
+        ranged(obj).map(Some)
+    }
+}
+
 /// zmux's log level as `logging`'s.
 fn log_level(level: zmux::LogLevel) -> u8 {
     match level {
@@ -502,20 +534,21 @@ impl Observers {
                             ],
                         )
                     }),
-                    T::Dropped(n) => tell(t, "dropped", || (Some(id), n).into_pyobject(py)),
                     T::Closed(reason) => tell(t, "closed", || {
                         (id, session_err(reason).into_value(py)).into_pyobject(py)
                     }),
                     _ => {}
                 }
             }
-            (H::Overflowed(n), Some(t)) => {
-                tell(t, "dropped", || (None::<u64>, n).into_pyobject(py));
-            }
-            (H::Overflowed(n), None) => {
+            (H::Overflowed(n), tracer) => {
+                // One count serves both observers: the tracer is told
+                // `dropped(None, n)` and the logger gets a warning.
+                if let Some(t) = tracer {
+                    tell(t, "dropped", || (None::<u64>, n).into_pyobject(py));
+                }
                 if let Some(l) = &self.logger {
                     let text = format!(
-                        "{n} zmux log messages dropped: the event loop fell behind or closed"
+                        "{n} zmux observer calls dropped: the event loop fell behind or closed"
                     );
                     tell(l.bind(py), "log", || (30u8, text).into_pyobject(py));
                 }
@@ -634,7 +667,7 @@ fn liveness_obj<'p>(py: Python<'p>, l: &zmux::Liveness) -> PyResult<Bound<'p, Py
 fn epoch_policy(v: &Bound<'_, PyAny>) -> PyResult<zmux::EpochPolicy> {
     Ok(zmux::EpochPolicy {
         period: field_opt_secs("epoch_policy.period", &v.getattr("period")?)?,
-        joins: v.getattr("joins")?.extract()?,
+        joins: ranged_opt(&v.getattr("joins")?)?,
         after_first_pipe: v.getattr("after_first_pipe")?.extract()?,
         after_resume: v.getattr("after_resume")?.extract()?,
     })
@@ -664,7 +697,7 @@ fn inherit_obj<'p, T>(
 }
 
 /// The native settings of a `zmux.PipeLiveness`.
-fn pipe_liveness(v: &Bound<'_, PyAny>) -> PyResult<zmux::PipeLiveness> {
+pub(crate) fn pipe_liveness(v: &Bound<'_, PyAny>) -> PyResult<zmux::PipeLiveness> {
     let get = |n: &str| v.getattr(n);
     let l = zmux::PipeLiveness {
         suspect_floor: inherit(&get("suspect_floor")?, |x| field_secs("suspect_floor", x))?,
@@ -681,7 +714,10 @@ fn pipe_liveness(v: &Bound<'_, PyAny>) -> PyResult<zmux::PipeLiveness> {
 }
 
 /// The `zmux.PipeLiveness` of native settings.
-fn pipe_liveness_obj<'p>(py: Python<'p>, l: &zmux::PipeLiveness) -> PyResult<Bound<'p, PyAny>> {
+pub(crate) fn pipe_liveness_obj<'p>(
+    py: Python<'p>,
+    l: &zmux::PipeLiveness,
+) -> PyResult<Bound<'p, PyAny>> {
     let secs = |d: Duration| Ok(d.as_secs_f64().into_pyobject(py)?.into_any());
     let d = PyDict::new(py);
     d.set_item("suspect_floor", inherit_obj(py, l.suspect_floor, secs)?)?;
@@ -699,7 +735,14 @@ fn pipe_liveness_obj<'p>(py: Python<'p>, l: &zmux::PipeLiveness) -> PyResult<Bou
     types(py)?.getattr("PipeLiveness")?.call((), Some(&d))
 }
 
+/// Whether `liveness`, a `PipeLiveness`, is in range: `ValueError` if not.
+#[pyfunction(name = "_check_pipe_liveness")]
+fn check_pipe_liveness(liveness: &Bound<'_, PyAny>) -> PyResult<()> {
+    pipe_liveness(liveness).map(|_| ())
+}
+
 /// A future that panics, for the test of how a panic reaches its awaiter.
+#[cfg(feature = "test-hooks")]
 #[pyfunction(name = "_panic")]
 fn panic_future(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
     future_into_py(py, async move {
@@ -1261,7 +1304,7 @@ impl UnsentCount {
     /// tell.
     #[new]
     #[pyo3(signature = (n=None))]
-    fn new(n: Option<u64>) -> Self {
+    fn new(#[pyo3(from_py_with = ranged_opt)] n: Option<u64>) -> Self {
         Self(Arc::new(std::sync::atomic::AtomicU64::new(
             n.map_or(u64::MAX, |n| n.min(u64::MAX - 1)),
         )))
@@ -1270,7 +1313,7 @@ impl UnsentCount {
     /// Sets the count: the bytes the carrier took and has not yet
     /// transmitted, or `None`.
     #[pyo3(signature = (n))]
-    fn set(&self, n: Option<u64>) {
+    fn set(&self, #[pyo3(from_py_with = ranged_opt)] n: Option<u64>) {
         self.0.store(
             n.map_or(u64::MAX, |n| n.min(u64::MAX - 1)),
             std::sync::atomic::Ordering::Relaxed,
@@ -1391,7 +1434,7 @@ impl PipeIo {
     }
 
     #[setter]
-    fn set_write_overhead(&self, overhead: i64) -> PyResult<()> {
+    fn set_write_overhead(&self, #[pyo3(from_py_with = ranged)] overhead: i64) -> PyResult<()> {
         let n = u16::try_from(overhead)
             .map_err(|_| PyValueError::new_err("write_overhead is between 0 and 65535"))?;
         self.modify(|io| io.with_write_overhead(n))
@@ -1405,7 +1448,7 @@ impl PipeIo {
     /// (never clamped). There is no upper bound. A pipe whose limit, less a
     /// Sealed transform's overhead, is below 8192 is refused when it is
     /// added or joined.
-    fn set_max_record(&self, max: usize) -> PyResult<()> {
+    fn set_max_record(&self, #[pyo3(from_py_with = ranged)] max: usize) -> PyResult<()> {
         // `with_max_record` consumes the input on an error: check `max`
         // first so that a refused value leaves this one usable.
         zmux::check_max_record(max).map_err(config_err)?;
@@ -1416,7 +1459,7 @@ impl PipeIo {
     /// contract, record confidentiality and integrity included (an
     /// exporter alone is no such declaration), so a record policy may
     /// choose Bound on it.
-    fn declare_secure(&self) -> PyResult<()> {
+    fn declare_carrier_secure(&self) -> PyResult<()> {
         self.modify(zmux::PipeIo::with_carrier_secure)
     }
 
@@ -1501,7 +1544,11 @@ struct PipeEnd {
 impl PipeEnd {
     /// Up to `n` bytes the session wrote; `b""` once the session side closed.
     #[pyo3(signature = (n=65536))]
-    fn read<'p>(&self, py: Python<'p>, n: usize) -> PyResult<Bound<'p, PyAny>> {
+    fn read<'p>(
+        &self,
+        py: Python<'p>,
+        #[pyo3(from_py_with = ranged)] n: usize,
+    ) -> PyResult<Bound<'p, PyAny>> {
         let (r, unread) = (self.r.clone(), self.unread.queue());
         let undo = self.unread.undo(py)?;
         rt::undoable_future_into_py(
@@ -1545,7 +1592,7 @@ fn pipe_pair(
     py: Python<'_>,
     carrier_kind: Option<Bound<'_, PyAny>>,
     unsent: Option<PyRef<'_, UnsentCount>>,
-    max_record: Option<usize>,
+    #[pyo3(from_py_with = ranged_opt)] max_record: Option<usize>,
     exporter: Option<Py<PyAny>>,
 ) -> PyResult<(PipeIo, PipeEnd)> {
     if let Some(size) = max_record {
@@ -1599,7 +1646,7 @@ async fn lookup(addr: &str) -> std::io::Result<SocketAddr> {
 fn dial_tcp<'p>(
     py: Python<'p>,
     host: Host,
-    port: u16,
+    #[pyo3(from_py_with = ranged)] port: u16,
     carrier_credential: Option<Bound<'p, PyAny>>,
 ) -> PyResult<Bound<'p, PyAny>> {
     let addr = hostport(&host, port);
@@ -1809,7 +1856,7 @@ impl Http2Connection {
     fn dial<'p>(
         py: Python<'p>,
         host: Host,
-        port: u16,
+        #[pyo3(from_py_with = ranged)] port: u16,
         path: &str,
         tls: Option<PyRef<'_, TlsConfig>>,
         server_name: Option<String>,
@@ -2136,9 +2183,9 @@ impl QuicClient {
     #[pyo3(signature = (tls=None, *, lanes=zmux_quinn::LaneWindows::default().lanes, zero_rtt=false, memory_capacity=None, bind=(Host("0.0.0.0".to_owned()), 0), carrier_credential=None))]
     fn new(
         tls: Option<PyRef<'_, TlsConfig>>,
-        lanes: u32,
+        #[pyo3(from_py_with = ranged)] lanes: u32,
         zero_rtt: bool,
-        memory_capacity: Option<usize>,
+        #[pyo3(from_py_with = ranged_opt)] memory_capacity: Option<usize>,
         bind: (Host, u16),
         carrier_credential: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
@@ -2168,7 +2215,7 @@ impl QuicClient {
         &self,
         py: Python<'p>,
         host: Host,
-        port: u16,
+        #[pyo3(from_py_with = ranged)] port: u16,
         server_name: Option<String>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let addr = hostport(&host, port);
@@ -2191,7 +2238,7 @@ impl QuicClient {
         &self,
         py: Python<'p>,
         host: Host,
-        port: u16,
+        #[pyo3(from_py_with = ranged)] port: u16,
         server_name: Option<String>,
         config: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Bound<'p, PyAny>> {
@@ -2329,7 +2376,7 @@ fn dial_streaming<'p>(
 fn dial_split<'p>(
     py: Python<'p>,
     host: Host,
-    port: u16,
+    #[pyo3(from_py_with = ranged)] port: u16,
     path: &str,
     carrier_credential: Option<Bound<'p, PyAny>>,
     pair_field: Option<String>,
@@ -2415,8 +2462,8 @@ impl ExchangeOptions {
         path: String,
         down_path: Option<Bound<'_, PyAny>>,
         query: String,
-        down_requests: usize,
-        up_requests: usize,
+        #[pyo3(from_py_with = ranged)] down_requests: usize,
+        #[pyo3(from_py_with = ranged)] up_requests: usize,
         up_piece: Option<Bound<'_, PyAny>>,
         max_down_piece: Option<Bound<'_, PyAny>>,
         backoff: Option<Bound<'_, PyAny>>,
@@ -2425,14 +2472,14 @@ impl ExchangeOptions {
         hold: f64,
         coalesce: f64,
         down_piece: Option<Bound<'_, PyAny>>,
-        down_window: u64,
+        #[pyo3(from_py_with = ranged)] down_window: u64,
         max_up_piece: Option<Bound<'_, PyAny>>,
-        up_store: usize,
+        #[pyo3(from_py_with = ranged)] up_store: usize,
         idle_timeout: f64,
         gone_memory: f64,
-        max_carriers: Option<usize>,
+        #[pyo3(from_py_with = ranged_opt)] max_carriers: Option<usize>,
         time_window: f64,
-        max_recorded: usize,
+        #[pyo3(from_py_with = ranged)] max_recorded: usize,
     ) -> PyResult<Self> {
         // AUTO, or a fixed value.
         fn auto<'py, T: FromPyObjectOwned<'py>>(
@@ -2602,9 +2649,8 @@ fn preamble(
 struct Prios(Option<zmux::Priority>, Option<zmux::Priority>);
 
 impl Prios {
-    fn new(local: Option<(u8, bool)>, peer: Option<(u8, bool)>) -> PyResult<Self> {
-        let p = |v: Option<(u8, bool)>| v.map(|(u, i)| priority(u, i)).transpose();
-        Ok(Prios(p(local)?, p(peer)?))
+    fn new(local: Option<Prio>, peer: Option<Prio>) -> Self {
+        Prios(local.map(|p| p.0), peer.map(|p| p.0))
     }
     fn apply(&self, (send, recv): &(zmux::SendStream, zmux::RecvStream)) -> PyResult<()> {
         if let Some(p) = self.0 {
@@ -2617,18 +2663,28 @@ impl Prios {
     }
 }
 
-/// A `zmux.QualityBand`.
+/// A `zmux.QualityBand`; an invalid one raises `ValueError`.
 fn quality_band(b: &Bound<'_, PyAny>) -> PyResult<zmux::QualityBand> {
-    let rtt: Option<f64> = b.getattr("rtt")?.extract()?;
-    Ok(zmux::QualityBand {
-        rtt: rtt.map(|v| seconds("rtt", v)).transpose()?,
-        // Python's "1 or less" is the native 1: every change (the native 0 is off).
-        rate_ratio: b
-            .getattr("rate_ratio")?
+    let secs = |name: &str| -> PyResult<Option<Duration>> {
+        b.getattr(name)?
             .extract::<Option<f64>>()?
-            .map(|r| r.max(1.0)),
-        min_interval: seconds("min_interval", b.getattr("min_interval")?.extract()?)?,
-    })
+            .map(|v| seconds(name, v))
+            .transpose()
+    };
+    let band = zmux::QualityBand {
+        rtt: secs("rtt")?,
+        rate_ratio: b.getattr("rate_ratio")?.extract()?,
+        min_interval: secs("min_interval")?,
+    };
+    band.validate().map_err(config_err)?;
+    Ok(band)
+}
+
+/// Whether `b`, a `QualityBand`, is in range: `ValueError` if not. The one
+/// check of the type, which its constructor runs.
+#[pyfunction(name = "_check_quality_band")]
+fn check_quality_band(b: &Bound<'_, PyAny>) -> PyResult<()> {
+    quality_band(b).map(|_| ())
 }
 
 /// The `zmux.QualityBand` of a native band.
@@ -2636,8 +2692,35 @@ fn quality_band_obj(py: Python<'_>, b: zmux::QualityBand) -> PyResult<Bound<'_, 
     let d = PyDict::new(py);
     d.set_item("rtt", dur(b.rtt))?;
     d.set_item("rate_ratio", b.rate_ratio)?;
-    d.set_item("min_interval", b.min_interval.as_secs_f64())?;
+    d.set_item("min_interval", dur(b.min_interval))?;
     types(py)?.getattr("QualityBand")?.call((), Some(&d))
+}
+
+/// A pipe's band setting: `None` is off for the pipe, else a `QualityBand`.
+fn pipe_band(v: &Bound<'_, PyAny>) -> PyResult<Option<zmux::QualityBand>> {
+    if v.is_none() {
+        return Ok(None);
+    }
+    if !v.is_instance(&types(v.py())?.getattr("QualityBand")?)? {
+        return Err(PyTypeError::new_err(
+            "quality_band is a QualityBand, None (off for the pipe) or CLEAR \
+             (in update; INHERIT in PipeOptions follows the session)",
+        ));
+    }
+    quality_band(v).map(Some)
+}
+
+/// The Python value of a pipe's band setting: `INHERIT` while it follows
+/// the session, `None` off, else the band.
+fn pipe_band_obj(
+    py: Python<'_>,
+    v: zmux::Change<Option<zmux::QualityBand>>,
+) -> PyResult<Bound<'_, PyAny>> {
+    match v {
+        zmux::Change::Set(Some(b)) => quality_band_obj(py, b),
+        zmux::Change::Set(None) => Ok(py.None().into_bound(py)),
+        _ => setting(py, "INHERIT"),
+    }
 }
 
 /// The `zmux.CapacityFloor` of a native floor.
@@ -2651,16 +2734,27 @@ fn capacity_floor_obj(py: Python<'_>, f: zmux::CapacityFloor) -> PyResult<Bound<
 /// A `zmux.CapacityFloor`.
 fn capacity_floor(f: &Bound<'_, PyAny>) -> PyResult<zmux::CapacityFloor> {
     let floor = zmux::CapacityFloor {
-        rate: f.getattr("rate")?.extract()?,
+        rate: ranged(&f.getattr("rate")?)?,
         recovery_ratio: f.getattr("recovery_ratio")?.extract()?,
     };
     floor.validate().map_err(config_err)?;
     Ok(floor)
 }
 
-fn priority(urgency: u8, incremental: bool) -> PyResult<zmux::Priority> {
-    zmux::Priority::new(urgency, incremental)
-        .ok_or_else(|| PyValueError::new_err("urgency out of range"))
+/// A `Priority` or an `(urgency, incremental)` pair; an urgency outside 0..=7,
+/// of any size, is `ValueError`.
+struct Prio(zmux::Priority);
+
+impl<'a, 'py> FromPyObject<'a, 'py> for Prio {
+    type Error = PyErr;
+    fn extract(obj: Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        let (urgency, incremental) = obj.extract::<(Bound<'py, PyAny>, bool)>()?;
+        let range = || PyValueError::new_err("urgency out of range");
+        let urgency = ranged::<u8>(&urgency)?;
+        zmux::Priority::new(urgency, incremental)
+            .map(Prio)
+            .ok_or_else(range)
+    }
 }
 
 /// A listener's source prefix length: 1 to `max` bits.
@@ -2778,12 +2872,12 @@ impl Session {
         info: Option<Vec<u8>>,
         tlvs: Option<Vec<(u64, Vec<u8>)>>,
         pipe_carrier: bool,
-        priority: Option<(u8, bool)>,
-        peer_priority: Option<(u8, bool)>,
+        priority: Option<Prio>,
+        peer_priority: Option<Prio>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let s = self.0.clone();
         let p = preamble(info, tlvs, pipe_carrier);
-        let prios = Prios::new(priority, peer_priority)?;
+        let prios = Prios::new(priority, peer_priority);
         future_into_py(py, async move {
             let pair = match p {
                 Some(p) => s.open_bi_with(&p).await,
@@ -2830,14 +2924,14 @@ impl Session {
         py: Python<'p>,
         info: Option<Vec<u8>>,
         tlvs: Option<Vec<(u64, Vec<u8>)>>,
-        priority: Option<(u8, bool)>,
-        peer_priority: Option<(u8, bool)>,
+        priority: Option<Prio>,
+        peer_priority: Option<Prio>,
         high_water: usize,
         limit: usize,
     ) -> PyResult<Bound<'p, PyAny>> {
         let s = self.0.clone();
         let p = preamble(info, tlvs, false);
-        let prios = Prios::new(priority, peer_priority)?;
+        let prios = Prios::new(priority, peer_priority);
         future_into_py(py, async move {
             let pair = match p {
                 Some(p) => s.open_bi_with(&p).await,
@@ -2870,10 +2964,10 @@ impl Session {
         info: Option<Vec<u8>>,
         tlvs: Option<Vec<(u64, Vec<u8>)>>,
         pipe_carrier: bool,
-        priority: Option<(u8, bool)>,
-        peer_priority: Option<(u8, bool)>,
+        priority: Option<Prio>,
+        peer_priority: Option<Prio>,
     ) -> PyResult<Py<PyAny>> {
-        let prios = Prios::new(priority, peer_priority)?;
+        let prios = Prios::new(priority, peer_priority);
         let pair = match preamble(info, tlvs, pipe_carrier) {
             Some(p) => self.0.try_open_bi_with(&p),
             None => self.0.try_open_bi(),
@@ -2956,7 +3050,7 @@ impl Session {
         py: Python<'p>,
         label: &str,
         context: Vec<u8>,
-        length: usize,
+        #[pyo3(from_py_with = ranged)] length: usize,
     ) -> PyResult<Bound<'p, PyBytes>> {
         let v = self
             .0
@@ -3048,11 +3142,11 @@ impl Session {
         py: Python<'p>,
         info: Option<Vec<u8>>,
         tlvs: Option<Vec<(u64, Vec<u8>)>>,
-        priority: Option<(u8, bool)>,
+        priority: Option<Prio>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let s = self.0.clone();
         let p = preamble(info, tlvs, false);
-        let prio = priority.map(|(u, i)| self::priority(u, i)).transpose()?;
+        let prio = priority.map(|p| p.0);
         future_into_py(py, async move {
             let send = match p {
                 Some(p) => s.open_uni_with(&p).await,
@@ -3073,9 +3167,9 @@ impl Session {
         &self,
         info: Option<Vec<u8>>,
         tlvs: Option<Vec<(u64, Vec<u8>)>>,
-        priority: Option<(u8, bool)>,
+        priority: Option<Prio>,
     ) -> PyResult<SendStream> {
-        let prio = priority.map(|(u, i)| self::priority(u, i)).transpose()?;
+        let prio = priority.map(|p| p.0);
         let send = match preamble(info, tlvs, false) {
             Some(p) => self.0.try_open_uni_with(&p),
             None => self.0.try_open_uni(),
@@ -3141,7 +3235,7 @@ impl Session {
     /// is sent, code and reason included; an `abort` while the close is
     /// still flushing ends it at once.
     #[pyo3(signature = (code=0, reason=b"".to_vec()))]
-    fn close(&self, code: u64, reason: Vec<u8>) -> PyResult<()> {
+    fn close(&self, #[pyo3(from_py_with = ranged)] code: u64, reason: Vec<u8>) -> PyResult<()> {
         // The close starts with the call; its future only waits.
         drop(self.0.close_with_error(varint(code)?, &reason));
         Ok(())
@@ -3152,7 +3246,7 @@ impl Session {
     /// `CONNECTION_CLOSE` goes in the background. Returns at once. An abort
     /// while a close is still flushing discards what remains unsent.
     #[pyo3(signature = (code, reason=b"".to_vec()))]
-    fn abort(&self, code: u64, reason: Vec<u8>) -> PyResult<()> {
+    fn abort(&self, #[pyo3(from_py_with = ranged)] code: u64, reason: Vec<u8>) -> PyResult<()> {
         self.0.abort(varint(code)?, &reason);
         Ok(())
     }
@@ -3162,7 +3256,7 @@ impl Session {
     fn shutdown<'p>(
         &self,
         py: Python<'p>,
-        code: u64,
+        #[pyo3(from_py_with = ranged)] code: u64,
         reason: Vec<u8>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let s = self.0.clone();
@@ -3848,24 +3942,24 @@ pub(crate) fn pipe_options(options: Option<Bound<'_, PyAny>>) -> PyResult<zmux::
     o.direction = direction_of(&get("direction")?)?;
     o.record_mode = inherit(&get("record_mode")?, seal::record_mode_of)?;
     o.key_group = inherit(&get("key_group")?, |x| field_count("key_group", x))?;
-    o.send_priority = change(&get("send_priority")?, |x| field_count("send_priority", x))?;
-    o.receive_priority = change(&get("receive_priority")?, |x| {
+    o.send_priority = unset_or(&get("send_priority")?, |x| field_count("send_priority", x))?;
+    o.receive_priority = unset_or(&get("receive_priority")?, |x| {
         field_count("receive_priority", x)
     })?;
-    o.send_standby = change(&get("send_standby")?, |x| {
+    o.send_standby = unset_or(&get("send_standby")?, |x| {
         required("send_standby", x)?.extract()
     })?;
-    o.receive_standby = change(&get("receive_standby")?, |x| {
+    o.receive_standby = unset_or(&get("receive_standby")?, |x| {
         required("receive_standby", x)?.extract()
     })?;
-    o.weight = change(&get("weight")?, |x| field_count("weight", x))?;
-    o.probation = change(&get("probation")?, |x| probation_of("probation", x))?;
+    o.weight = unset_or(&get("weight")?, |x| field_count("weight", x))?;
+    o.probation = unset_or(&get("probation")?, |x| probation_of("probation", x))?;
     o.label = get("label")?.extract::<Option<String>>()?.map(Into::into);
     o.fate_group = field_count("fate_group", &get("fate_group")?)?;
-    o.liveness = change(&get("liveness")?, |x| {
+    o.liveness = unset_or(&get("liveness")?, |x| {
         pipe_liveness(required("liveness", x)?)
     })?;
-    o.quality_band = change(&get("quality_band")?, quality_band)?;
+    o.quality_band = unset_or(&get("quality_band")?, pipe_band)?;
     o.return_on_reply = required("return_on_reply", &get("return_on_reply")?)?.extract()?;
     o.validate().map_err(pipe_err)?;
     Ok(o)
@@ -3908,10 +4002,7 @@ pub(crate) fn options_obj<'p>(py: Python<'p>, o: &zmux::PipeOptions) -> PyResult
         "liveness",
         change_obj(py, o.liveness, |l| pipe_liveness_obj(py, &l))?,
     )?;
-    d.set_item(
-        "quality_band",
-        change_obj(py, o.quality_band, |b| quality_band_obj(py, b))?,
-    )?;
+    d.set_item("quality_band", pipe_band_obj(py, o.quality_band)?)?;
     d.set_item("return_on_reply", o.return_on_reply)?;
     types(py)?.getattr("PipeOptions")?.call((), Some(&d))
 }
@@ -3948,6 +4039,7 @@ const FIXED: [&str; 6] = [
 ];
 
 /// One field of `Pipe.update`: `zmux.CLEAR` clears, a value sets.
+/// `zmux.INHERIT` belongs to `PipeOptions`, where `zmux.CLEAR` is refused.
 fn change<T>(
     v: &Bound<'_, PyAny>,
     set: impl FnOnce(&Bound<'_, PyAny>) -> PyResult<T>,
@@ -3955,11 +4047,29 @@ fn change<T>(
     if is_setting(v, "CLEAR")? {
         return Ok(zmux::Change::Clear);
     }
+    if is_setting(v, "INHERIT")? {
+        return Err(PyTypeError::new_err(
+            "zmux.INHERIT is a PipeOptions value; pipe.update clears with zmux.CLEAR",
+        ));
+    }
     set(v).map(zmux::Change::Set)
 }
 
-/// The Python value of a pipe setting: `zmux.CLEAR` when it is the
-/// default, else its value.
+/// One field of a `PipeOptions`: `zmux.INHERIT` is the unset setting (it
+/// follows the session, or the peer's request, or is the default), a value
+/// sets. `zmux.CLEAR` is refused by `PipeOptions` itself.
+fn unset_or<T>(
+    v: &Bound<'_, PyAny>,
+    set: impl FnOnce(&Bound<'_, PyAny>) -> PyResult<T>,
+) -> PyResult<zmux::Change<T>> {
+    if is_setting(v, "INHERIT")? {
+        return Ok(zmux::Change::Keep);
+    }
+    set(v).map(zmux::Change::Set)
+}
+
+/// The Python value of a pipe setting in `PipeOptions`: `zmux.INHERIT` when
+/// it is unset (kept or cleared), else its value.
 fn change_obj<'p, T>(
     py: Python<'p>,
     v: zmux::Change<T>,
@@ -3967,7 +4077,7 @@ fn change_obj<'p, T>(
 ) -> PyResult<Bound<'p, PyAny>> {
     match v {
         zmux::Change::Set(t) => set(t),
-        _ => setting(py, "CLEAR"),
+        _ => setting(py, "INHERIT"),
     }
 }
 
@@ -4000,7 +4110,7 @@ fn pipe_update(kw: Option<&Bound<'_, PyDict>>) -> PyResult<zmux::PipeUpdate> {
             "weight" => u.weight = change(v, |x| field_count(&k, x))?,
             "probation" => u.probation = change(v, |x| probation_of(&k, x))?,
             "liveness" => u.liveness = change(v, |x| pipe_liveness(required(&k, x)?))?,
-            _ => u.quality_band = change(v, quality_band)?,
+            _ => u.quality_band = change(v, pipe_band)?,
         }
     }
     Ok(u)
@@ -4176,7 +4286,7 @@ impl Pipe {
         future_into_py(py, async move { p.joined().await.map_err(pipe_err) })
     }
     /// Waits until the peer attached the pipe.
-    fn attached<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+    fn wait_attached<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let p = self.0.clone();
         future_into_py(py, async move { p.attached().await.map_err(pipe_err) })
     }
@@ -4203,11 +4313,14 @@ impl Pipe {
         let u = pipe_update(fields)?;
         self.0.update(&u).map_err(pipe_err)
     }
-    /// The options in force, with the fields `update` set; `None` once the
-    /// pipe's state is released.
+    /// Every option as the pipe holds it: those it was added with, the
+    /// fields `update` set, and for a pipe the peer added what the join
+    /// made. A field that follows the session (or is unset) reads as
+    /// `zmux.INHERIT`; after the pipe ended, the options held last. Never
+    /// fails.
     #[getter]
-    fn options<'p>(&self, py: Python<'p>) -> PyResult<Option<Bound<'p, PyAny>>> {
-        self.0.options().map(|o| options_obj(py, &o)).transpose()
+    fn options<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+        options_obj(py, &self.0.options())
     }
     /// The outbound direction's state (else the inbound one's).
     #[getter]
@@ -4421,7 +4534,7 @@ fn stream_stats<'p>(py: Python<'p>, st: &zmux::StreamStats) -> PyResult<Bound<'p
         recv_buffered,
         recv_window
     );
-    d.set_item("pipe_id", st.pipe_id.map(zmux::PipeId::get))?;
+    d.set_item("pipe", st.pipe.map(zmux::PipeId::get))?;
     types(py)?.getattr("StreamStats")?.call((), Some(&d))
 }
 
@@ -4503,7 +4616,7 @@ impl SendStream {
     /// returns or is cancelled. During the read drain after the peer's
     /// close it raises the session's error; the exit of `async with`
     /// ignores it.
-    fn reset(&self, code: u64) -> PyResult<()> {
+    fn reset(&self, #[pyo3(from_py_with = ranged)] code: u64) -> PyResult<()> {
         let code = varint(code)?;
         later(&self.0, move |s| s.reset(code))
     }
@@ -4518,16 +4631,14 @@ impl SendStream {
     /// `(urgency, incremental)` pair) changes it.
     #[getter]
     fn priority<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
-        let p = held_now(&self.0)?.priority().map_err(stream_err)?;
+        let p = self.1.priority();
         types(py)?
             .getattr("Priority")?
             .call1((p.urgency(), p.incremental()))
     }
     #[setter]
-    fn set_priority(&self, priority: (u8, bool)) -> PyResult<()> {
-        held_now(&self.0)?
-            .set_priority(self::priority(priority.0, priority.1)?)
-            .map_err(stream_err)
+    fn set_priority(&self, priority: Prio) -> PyResult<()> {
+        self.1.set_priority(priority.0).map_err(stream_err)
     }
     /// Waits until `try_write` takes bytes (room in the send buffer, not
     /// credit) and returns how many it takes now; the stream's error once
@@ -4548,7 +4659,11 @@ impl SendStream {
     /// Waits until the send capacity (the credit statistic, not write
     /// readiness; see `writable`) is at least `minimum` (or above 0 while
     /// nothing is unsent) and returns it.
-    fn wait_send_capacity<'p>(&self, py: Python<'p>, minimum: u64) -> PyResult<Bound<'p, PyAny>> {
+    fn wait_send_capacity<'p>(
+        &self,
+        py: Python<'p>,
+        #[pyo3(from_py_with = ranged)] minimum: u64,
+    ) -> PyResult<Bound<'p, PyAny>> {
         if minimum == 0 {
             return Err(PyValueError::new_err("minimum is at least 1"));
         }
@@ -4564,46 +4679,52 @@ impl SendStream {
     /// The bytes written and not yet released that the part may hold: the
     /// last assignment, else the session's `Config.send_buffer`.
     #[getter]
-    fn send_buffer(&self) -> PyResult<u64> {
-        held_now(&self.0)?.send_buffer().map_err(stream_err)
+    fn send_buffer(&self) -> PyResult<usize> {
+        Ok(self.1.send_buffer())
     }
     #[setter]
-    fn set_send_buffer(&self, n: u64) -> PyResult<()> {
-        held_now(&self.0)?.set_send_buffer(n).map_err(stream_err)
+    fn set_send_buffer(&self, #[pyo3(from_py_with = ranged)] n: u64) -> PyResult<()> {
+        self.1.set_send_buffer(n).map_err(stream_err)
     }
     /// The part's scheduling policy; `None` follows the session's.
     #[getter]
     fn scheduler<'p>(&self, py: Python<'p>) -> PyResult<Option<Bound<'p, PyAny>>> {
-        let p = held_now(&self.0)?.scheduler().map_err(stream_err)?;
+        let p = self.1.scheduler();
         Ok(p.map(|p| typed(py, "Scheduler", policy_name(&p).to_owned())))
     }
     #[setter]
     fn set_scheduler(&self, scheduler: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
         let p = scheduler_of(scheduler)?;
-        held_now(&self.0)?.set_scheduler(p).map_err(stream_err)
+        self.1.set_scheduler(p).map_err(stream_err)
     }
     /// Sends the part's chunks redundantly on a second pipe (multipath):
     /// `True` on, `False` off, `None` following the session's `redundancy`.
     #[getter]
     fn redundant(&self) -> PyResult<Option<bool>> {
-        held_now(&self.0)?.redundant().map_err(stream_err)
+        Ok(self.1.redundant())
     }
     #[setter]
     fn set_redundant(&self, on: Option<bool>) -> PyResult<()> {
-        held_now(&self.0)?.set_redundant(on).map_err(stream_err)
+        self.1.set_redundant(on).map_err(stream_err)
     }
     /// The largest datagram payload the peer accepts on this stream with
     /// the context ID `context`, or `None` without datagram flows.
     #[pyo3(signature = (context=0))]
-    fn max_datagram_size(&self, context: u64) -> PyResult<Option<usize>> {
-        Ok(held_now(&self.0)?.max_datagram_size(context))
+    fn max_datagram_size(
+        &self,
+        #[pyo3(from_py_with = ranged)] context: u64,
+    ) -> PyResult<Option<usize>> {
+        Ok(self.1.max_datagram_size(context))
     }
     /// Sends a datagram of the stream with the context ID `context`.
     #[pyo3(signature = (payload, context=0))]
-    fn send_datagram(&self, payload: Vec<u8>, context: u64) -> PyResult<()> {
-        held_now(&self.0)?
-            .send_datagram(context, Bytes::from(payload))
-            .map_err(datagram_err)
+    fn send_datagram(
+        &self,
+        payload: &Bound<'_, PyAny>,
+        #[pyo3(from_py_with = ranged)] context: u64,
+    ) -> PyResult<()> {
+        let payload = chunk_of(payload)?;
+        self.1.send_datagram(context, payload).map_err(datagram_err)
     }
     /// A snapshot of the stream's statistics.
     fn stats<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
@@ -4849,7 +4970,7 @@ impl RecvStream {
             Opening {
                 preamble: s.preamble(),
                 replayable: s.is_replayable(),
-                requested: s.requested_priority(),
+                requested: s.preamble_priority(),
             },
         );
         RecvStream(Arc::new(Mutex::new(Some(s))), Unread::default(), h, o)
@@ -4864,23 +4985,35 @@ impl RecvStream {
 
     /// Up to `n` bytes; `b""` at the end of the stream.
     #[pyo3(signature = (n=65536))]
-    fn read<'p>(slf: &Bound<'p, Self>, n: usize) -> PyResult<Bound<'p, PyAny>> {
+    fn read<'p>(
+        slf: &Bound<'p, Self>,
+        #[pyo3(from_py_with = ranged)] n: usize,
+    ) -> PyResult<Bound<'p, PyAny>> {
         streams_fn(slf.py(), "_read")?.call1((slf, n, false))
     }
     /// Up to `n` bytes as a `memoryview` of the received buffer, without
     /// a copy; an empty one at the end of the stream.
     #[pyo3(signature = (n=65536))]
-    fn read_chunk<'p>(slf: &Bound<'p, Self>, n: usize) -> PyResult<Bound<'p, PyAny>> {
+    fn read_chunk<'p>(
+        slf: &Bound<'p, Self>,
+        #[pyo3(from_py_with = ranged)] n: usize,
+    ) -> PyResult<Bound<'p, PyAny>> {
         streams_fn(slf.py(), "_read")?.call1((slf, n, true))
     }
     /// Exactly `n` bytes, or `IncompleteReadError` (its `partial` the bytes
     /// read) when the stream ends first.
-    fn read_exact<'p>(slf: &Bound<'p, Self>, n: usize) -> PyResult<Bound<'p, PyAny>> {
+    fn read_exact<'p>(
+        slf: &Bound<'p, Self>,
+        #[pyo3(from_py_with = ranged)] n: usize,
+    ) -> PyResult<Bound<'p, PyAny>> {
         streams_fn(slf.py(), "_read_exact")?.call1((slf, n))
     }
     /// The rest of the stream, at most `limit` bytes.
     #[pyo3(signature = (limit=16 * 1024 * 1024))]
-    fn read_to_end<'p>(slf: &Bound<'p, Self>, limit: usize) -> PyResult<Bound<'p, PyAny>> {
+    fn read_to_end<'p>(
+        slf: &Bound<'p, Self>,
+        #[pyo3(from_py_with = ranged)] limit: usize,
+    ) -> PyResult<Bound<'p, PyAny>> {
         streams_fn(slf.py(), "_read_to_end")?.call1((slf, limit))
     }
     /// Up to `max` bytes now, those taken back first: `bytes` (a
@@ -4890,7 +5023,7 @@ impl RecvStream {
     fn take<'p>(
         &self,
         py: Python<'p>,
-        max: usize,
+        #[pyo3(from_py_with = ranged)] max: usize,
         view: bool,
     ) -> PyResult<Option<Bound<'p, PyAny>>> {
         let b = match unread_take(&self.1, max) {
@@ -4910,12 +5043,34 @@ impl RecvStream {
         };
         Ok(Some(out))
     }
-    /// Waits until a read would not wait; takes nothing. Private to
-    /// `zmux._streams`.
-    #[pyo3(name = "_readable")]
-    fn readable<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+    /// Waits until the next read returns at once: data is readable, or the
+    /// receiving part has ended (FIN, a reset, a stop by this endpoint, the
+    /// session's end). Returns `None` in every one of these cases: the read
+    /// that follows reports the data or the end, once. Takes nothing, holds
+    /// no part, and a cancelled call has no effect; it fails only with the
+    /// caller's own bound (`asyncio.timeout`).
+    fn wait_readable<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let r = self.2.readable();
-        future_into_py(py, async move { r.await.map_err(stream_err) })
+        future_into_py(py, async move {
+            r.await;
+            Ok(())
+        })
+    }
+    /// Up to `n` bytes that are there now, without waiting: `bytes`,
+    /// `None` when nothing is readable now, `b""` once the stream has ended
+    /// with a FIN and everything was read. A reset or the session's end
+    /// raises as a read would. `StreamBusyError` while a read-side call
+    /// holds the part.
+    #[pyo3(signature = (n=65536))]
+    fn try_read<'p>(
+        &self,
+        py: Python<'p>,
+        #[pyo3(from_py_with = ranged)] n: usize,
+    ) -> PyResult<Option<Bound<'p, PyAny>>> {
+        if n == 0 {
+            return Err(PyValueError::new_err("n is at least 1"));
+        }
+        self.take(py, n, false)
     }
     /// Puts `chunks` back in front of the stream, in order. Private to
     /// `zmux._streams`.
@@ -4933,7 +5088,7 @@ impl RecvStream {
     /// cancelled. During the read drain after the peer's close it discards
     /// the unread data and raises the session's error; the exit of
     /// `async with` ignores it.
-    fn stop(&self, code: u64) -> PyResult<()> {
+    fn stop(&self, #[pyo3(from_py_with = ranged)] code: u64) -> PyResult<()> {
         let code = varint(code)?;
         later(&self.0, move |r| r.stop(code))
     }
@@ -4942,15 +5097,15 @@ impl RecvStream {
     fn reject(&self) -> PyResult<()> {
         take_now(&self.0)?.reject().map_err(stream_err)
     }
-    /// The receive window of the stream, `(window, maximum)`: the window
-    /// now advertised, which auto-tuning raises up to `maximum`.
+    /// The receive window settings of the stream, `(initial, maximum)`, as
+    /// set: the initial window and the cap on auto-tuning (0: automatic).
     #[getter]
     fn receive_window(&self) -> PyResult<(u64, u64)> {
-        held_now(&self.0)?.receive_window().map_err(stream_err)
+        Ok(self.2.receive_window())
     }
     #[setter]
     fn set_receive_window(&self, window: (u64, u64)) -> PyResult<()> {
-        held_now(&self.0)?
+        self.2
             .set_receive_window(window.0, window.1)
             .map_err(stream_err)
     }
@@ -4958,7 +5113,7 @@ impl RecvStream {
     /// none was asked.
     #[getter]
     fn peer_priority<'p>(&self, py: Python<'p>) -> PyResult<Option<Bound<'p, PyAny>>> {
-        let Some(p) = held_now(&self.0)?.peer_priority().map_err(stream_err)? else {
+        let Some(p) = self.2.peer_priority() else {
             return Ok(None);
         };
         types(py)?
@@ -4967,10 +5122,8 @@ impl RecvStream {
             .map(Some)
     }
     #[setter]
-    fn set_peer_priority(&self, priority: (u8, bool)) -> PyResult<()> {
-        held_now(&self.0)?
-            .set_peer_priority(self::priority(priority.0, priority.1)?)
-            .map_err(stream_err)
+    fn set_peer_priority(&self, priority: Prio) -> PyResult<()> {
+        self.2.set_peer_priority(priority.0).map_err(stream_err)
     }
     /// The next datagram of the stream: `(context, payload)`.
     fn read_datagram<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
@@ -5038,7 +5191,7 @@ impl RecvStream {
     /// `Priority`; `None` when it sent none or the stream is a local one.
     /// Later priority updates are not reflected.
     #[getter]
-    fn requested_priority<'p>(&self, py: Python<'p>) -> PyResult<Option<Bound<'p, PyAny>>> {
+    fn preamble_priority<'p>(&self, py: Python<'p>) -> PyResult<Option<Bound<'p, PyAny>>> {
         self.3
             .requested
             .map(|p| {
@@ -5110,7 +5263,11 @@ impl ReplayFilter {
     /// earlier stamps.
     #[new]
     #[pyo3(signature = (window, capacity, *, not_before=None))]
-    fn new(window: f64, capacity: usize, not_before: Option<f64>) -> PyResult<Self> {
+    fn new(
+        window: f64,
+        #[pyo3(from_py_with = ranged)] capacity: usize,
+        not_before: Option<f64>,
+    ) -> PyResult<Self> {
         let f = zmux::ReplayFilter::new(seconds("window", window)?, capacity).map_err(value_err)?;
         Ok(Self(match not_before {
             Some(t) => {
@@ -5123,12 +5280,23 @@ impl ReplayFilter {
         }))
     }
     /// Checks `key` stamped `stamp` (Unix milliseconds) by the system clock.
-    fn check<'p>(&self, py: Python<'p>, key: &[u8], stamp: i64) -> Bound<'p, PyAny> {
+    fn check<'p>(
+        &self,
+        py: Python<'p>,
+        key: &[u8],
+        #[pyo3(from_py_with = ranged)] stamp: i64,
+    ) -> Bound<'p, PyAny> {
         replay_verdict(py, self.0.check(key, stamp))
     }
     /// Checks `key` stamped `stamp` with the clock at `now` (Unix
     /// milliseconds).
-    fn check_at<'p>(&self, py: Python<'p>, key: &[u8], stamp: i64, now: i64) -> Bound<'p, PyAny> {
+    fn check_at<'p>(
+        &self,
+        py: Python<'p>,
+        key: &[u8],
+        #[pyo3(from_py_with = ranged)] stamp: i64,
+        #[pyo3(from_py_with = ranged)] now: i64,
+    ) -> Bound<'p, PyAny> {
         replay_verdict(py, self.0.check_at(key, stamp, now))
     }
     fn __len__(&self) -> usize {
@@ -5372,7 +5540,12 @@ impl Listener {
     /// Serves plain TCP on `addr`; returns the bound address. With the
     /// listener's `admission`, a connection reaches it only once admitted.
     #[pyo3(signature = (host, port))]
-    fn serve_tcp<'p>(&self, py: Python<'p>, host: Host, port: u16) -> PyResult<Bound<'p, PyAny>> {
+    fn serve_tcp<'p>(
+        &self,
+        py: Python<'p>,
+        host: Host,
+        #[pyo3(from_py_with = ranged)] port: u16,
+    ) -> PyResult<Bound<'p, PyAny>> {
         self.bind(py);
         self.serve(py, hostport(&host, port), zmux::Listener::serve)
     }
@@ -5381,7 +5554,7 @@ impl Listener {
         &self,
         py: Python<'p>,
         host: Host,
-        port: u16,
+        #[pyo3(from_py_with = ranged)] port: u16,
         tls: PyRef<'_, TlsConfig>,
     ) -> PyResult<Bound<'p, PyAny>> {
         self.bind(py);
@@ -5405,7 +5578,7 @@ impl Listener {
         &self,
         py: Python<'p>,
         host: Host,
-        port: u16,
+        #[pyo3(from_py_with = ranged)] port: u16,
         path: &str,
         tls: Option<PyRef<'_, TlsConfig>>,
         exchange: Option<PyRef<'_, ExchangeOptions>>,
@@ -5462,7 +5635,7 @@ impl Listener {
         &self,
         py: Python<'p>,
         host: Host,
-        port: u16,
+        #[pyo3(from_py_with = ranged)] port: u16,
         tls: Option<PyRef<'_, TlsConfig>>,
     ) -> PyResult<Bound<'p, PyAny>> {
         self.bind(py);
@@ -5483,9 +5656,9 @@ impl Listener {
         &self,
         py: Python<'p>,
         host: Host,
-        port: u16,
+        #[pyo3(from_py_with = ranged)] port: u16,
         tls: PyRef<'_, TlsConfig>,
-        lanes: u32,
+        #[pyo3(from_py_with = ranged)] lanes: u32,
     ) -> PyResult<Bound<'p, PyAny>> {
         self.bind(py);
         let addr = hostport(&host, port);
@@ -5510,9 +5683,9 @@ impl Listener {
         &self,
         py: Python<'p>,
         host: Host,
-        port: u16,
+        #[pyo3(from_py_with = ranged)] port: u16,
         tls: PyRef<'_, TlsConfig>,
-        lanes: u32,
+        #[pyo3(from_py_with = ranged)] lanes: u32,
     ) -> PyResult<Bound<'p, PyAny>> {
         self.bind(py);
         let addr = hostport(&host, port);
@@ -5543,9 +5716,9 @@ impl Listener {
         &self,
         py: Python<'p>,
         host: Host,
-        port: u16,
+        #[pyo3(from_py_with = ranged)] port: u16,
         tls: PyRef<'_, TlsConfig>,
-        lanes: u32,
+        #[pyo3(from_py_with = ranged)] lanes: u32,
         zero_rtt: bool,
     ) -> PyResult<Bound<'p, PyAny>> {
         self.bind(py);
@@ -5635,7 +5808,7 @@ impl Listener {
     fn shutdown<'p>(
         &self,
         py: Python<'p>,
-        code: u64,
+        #[pyo3(from_py_with = ranged)] code: u64,
         reason: Vec<u8>,
     ) -> PyResult<Bound<'p, PyAny>> {
         let l = self.inner.clone();
@@ -5736,6 +5909,10 @@ fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     rt::register(m)?;
     m.add_class::<Config>()?;
     m.add_function(wrap_pyfunction!(config_defaults, m)?)?;
+    m.add_function(wrap_pyfunction!(check_pipe_liveness, m)?)?;
+    m.add_function(wrap_pyfunction!(check_quality_band, m)?)?;
+    m.add_function(wrap_pyfunction!(pool::check_pool_decision, m)?)?;
+    #[cfg(feature = "test-hooks")]
     m.add_function(wrap_pyfunction!(panic_future, m)?)?;
     m.add_class::<shaping::ShapingBundle>()?;
     m.add_class::<shaping::InstalledShaper>()?;
@@ -5790,9 +5967,10 @@ fn defaults(m: &Bound<'_, PyModule>) -> PyResult<()> {
         s::DEFAULT_KEEP_ALIVE_PERIOD.as_secs_f64(),
     )?;
     m.add(
-        "DEFAULT_IDLE_TIMEOUT",
-        s::DEFAULT_IDLE_TIMEOUT.as_secs_f64(),
+        "DEFAULT_MAX_IDLE_TIMEOUT",
+        zmux::DEFAULT_MAX_IDLE_TIMEOUT.as_secs_f64(),
     )?;
+    m.add("DEFAULT_MAX_LANES", zmux::DEFAULT_MAX_LANES.get())?;
     m.add("DEFAULT_PROBE_JITTER", s::DEFAULT_PROBE_JITTER)?;
     m.add(
         "DEFAULT_STANDBY_PROBE",
@@ -5822,8 +6000,12 @@ fn defaults(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("DEFAULT_LANES", zmux_quinn::LaneWindows::default().lanes)?;
     m.add("MAX_FIRST_BYTES", zmux::adapter::MAX_FIRST_BYTES)?;
     m.add(
-        "_DEFAULT_RECOVERY_RATIO",
+        "DEFAULT_RECOVERY_RATIO",
         zmux::CapacityFloor::DEFAULT_RECOVERY_RATIO,
+    )?;
+    m.add(
+        "DEFAULT_MIN_INTERVAL",
+        zmux::QualityBand::DEFAULT_MIN_INTERVAL.as_secs_f64(),
     )?;
     m.add("DIAL_TIMEOUT", zmux::adapter::DIAL_TIMEOUT.as_secs_f64())?;
     m.add("MAX_STREAM_CREDIT", zmux::MAX_STREAM_CREDIT)?;

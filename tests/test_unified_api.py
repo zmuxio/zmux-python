@@ -268,7 +268,7 @@ async def test_stream_settings_read_back_as_in_force() -> None:
         _ = s
 
 
-def test_pipe_options_take_the_form_update_takes() -> None:
+def test_pipe_options_leave_every_updatable_field_unset_with_inherit() -> None:
     o = zmux.PipeOptions()
     for name in (
         "send_priority",
@@ -280,8 +280,12 @@ def test_pipe_options_take_the_form_update_takes() -> None:
         "liveness",
         "quality_band",
     ):
-        assert getattr(o, name) is zmux.CLEAR, name
+        assert getattr(o, name) is zmux.INHERIT, name
+        # CLEAR is what an update says; a PipeOptions refuses it.
+        with pytest.raises(TypeError):
+            zmux.PipeOptions(**{name: zmux.CLEAR})  # type: ignore[arg-type]
     assert zmux.PipeOptions(probation=None).probation is None
+    assert zmux.PipeOptions(quality_band=None).quality_band is None
 
 
 def test_backoff_is_one_top_level_type() -> None:
@@ -383,13 +387,35 @@ def test_config_max_send_record() -> None:
 
 async def test_a_pipe_input_is_used_once() -> None:
     pipe, _end = zmux.adapter.pipe_pair()
-    pipe.declare_secure()
+    pipe.declare_carrier_secure()
     stream = pipe.into_stream()
     assert stream is not None
     with pytest.raises(zmux.PipeUsedError):
-        pipe.declare_secure()
+        pipe.declare_carrier_secure()
     with pytest.raises(zmux.PipeUsedError):
         _ = pipe.variant
+
+
+async def test_a_stream_datagram_goes_while_a_write_is_in_progress() -> None:
+    config = zmux.Config(enable_datagrams=True)
+    async with pair(config) as (c, s):
+        send, _ = await c.open_bi()
+        # The peer reads nothing: the write never ends and holds its part.
+        waiting = asyncio.ensure_future(send.write(b"x" * (16 << 20)))
+        await asyncio.sleep(0.05)
+        assert not waiting.done()
+        with pytest.raises(zmux.StreamBusyError):
+            send.set_reliable_boundary()
+        # The stream's ID is known once its write began: the Flow is shorter.
+        during = send.max_datagram_size(5)
+        assert during is not None and during > 0
+        send.send_datagram(b"meanwhile", 5)
+        _, remote = await s.accept_bi()
+        got = await asyncio.wait_for(remote.read_datagram(), 5)
+        assert (got.context, got.payload) == (5, b"meanwhile")
+        waiting.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await waiting
 
 
 async def test_stream_datagrams_are_named() -> None:
@@ -438,3 +464,18 @@ async def test_hosts_take_ip_addresses() -> None:
             (await asyncio.wait_for(listener.accept(), 5)).close()
     with pytest.raises(TypeError):
         await zmux.dial_tcp(1, 1)  # type: ignore[arg-type]
+
+
+def test_exported_defaults() -> None:
+    assert zmux.DEFAULT_MAX_IDLE_TIMEOUT == 30.0
+    assert not hasattr(zmux, "DEFAULT_IDLE_TIMEOUT")
+    # The QUIC lanes and the lanes accepted per pipe are two defaults.
+    assert zmux.DEFAULT_LANES == 4
+    assert zmux.DEFAULT_MAX_LANES == 258 == zmux.Config().max_lanes
+    assert zmux.DEFAULT_RECOVERY_RATIO == 1.25
+    assert zmux.DEFAULT_MIN_INTERVAL == 1.0 == zmux.QualityBand(rtt=1).min_interval
+    assert zmux.helpers.MIN_RECHECK == 0.01
+
+
+def test_session_id_is_a_new_type() -> None:
+    assert zmux.SessionId(7) == 7

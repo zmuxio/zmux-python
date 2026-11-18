@@ -72,7 +72,7 @@ jobs:
       - name: Build and install the module
         run: |
           python -m pip install "maturin>=1.16,<2"
-          maturin build --locked --out dist
+          maturin build --locked --features test-hooks --out dist
           python -m pip install --find-links dist --no-index zmuxio
       - name: Stubs match the module
         run: python -m mypy.stubtest zmux --allowlist tests/stubtest-allowlist.txt
@@ -119,12 +119,12 @@ jobs:
         shell: bash
         run: |
           python -m pip install "maturin>=1.16,<2"
-          maturin build --release --locked --out dist -i "${{ steps.py.outputs.python-path }}" ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+          maturin build --release --locked --features test-hooks --out dist -i "${{ steps.py.outputs.python-path }}" ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
       - name: Install and test
         shell: bash
         run: |
           python -m pip install --find-links dist --no-index zmuxio
-          python -m pip install "pytest>=9.2" "pytest-asyncio>=1.5"
+          python -m pip install "pytest>=9.2" "pytest-asyncio>=1.5" "hypothesis>=6.170"
           # cryptography ships no 32-bit Windows wheel; the TLS tests skip there.
           if [[ "${{ matrix.arch }}" != x86 ]]; then python -m pip install "cryptography>=50.0.2"; fi
           python -m pytest -q -rs tests
@@ -198,7 +198,7 @@ jobs:
           python -m pip install "maturin>=1.16,<2"
           maturin build --release --locked --out dist -i "${{ steps.py.outputs.python-path }}"
           python -m pip install --find-links dist --no-index zmuxio
-          python -m pip install "pytest>=9.2" "pytest-asyncio>=1.5" "cryptography>=50.0.2"
+          python -m pip install "pytest>=9.2" "pytest-asyncio>=1.5" "hypothesis>=6.170" "cryptography>=50.0.2"
       - name: Build the Go peers
         run: |
           out="$GITHUB_WORKSPACE/peers"

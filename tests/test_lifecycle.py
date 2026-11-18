@@ -82,6 +82,10 @@ def test_a_lent_buffer_is_released_clear_of_the_session() -> None:
     )
 
 
+@pytest.mark.skipif(
+    not hasattr(zmux._zmux, "_panic"),
+    reason="the module is built without the test-hooks feature",
+)
 async def test_a_panic_reaches_the_awaiter() -> None:
     with pytest.raises(RuntimeError, match="internal error: deliberate"):
         await asyncio.wait_for(zmux._zmux._panic(), 10)

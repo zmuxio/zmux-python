@@ -37,7 +37,7 @@ from ._types import (
     Sent,
     SessionState,
     SessionStats,
-    Spliced,
+    SpliceResult,
     StreamDatagram,
     StreamStats,
     Tlv,
@@ -51,8 +51,11 @@ type _HostPort = tuple[_Host, int]
 
 DEFAULT_KEEP_ALIVE_PERIOD: float
 """Default keep-alive period, seconds (15)."""
-DEFAULT_IDLE_TIMEOUT: float
+DEFAULT_MAX_IDLE_TIMEOUT: float
 """Default idle timeout, seconds (30)."""
+DEFAULT_MAX_LANES: int
+"""Default `Config.max_lanes`, the lanes accepted on each inbound pipe (258).
+Not `DEFAULT_LANES`, the QUIC adapter's lane count."""
 DEFAULT_PROBE_JITTER: float
 """Default probe jitter (0.25)."""
 DEFAULT_STANDBY_PROBE: float
@@ -68,8 +71,8 @@ of the range of `Config.max_incoming_streams`,
 `Config.max_incoming_uni_streams` and `Session.raise_incoming_streams`, a
 value of that range and not a setting: 0 keeps meaning none."""
 MIN_RECHECK: float
-"""The shortest `PoolPolicyDecision.recheck` a pool honours, seconds
-(0.01): a shorter one, 0 included, is lengthened to it."""
+"""The shortest `PoolDecision.recheck` a pool honours, seconds (0.01): a
+shorter one is lengthened to it."""
 DIAL_TIMEOUT: float
 """The default bound of a TLS, QUIC, WebSocket, HTTP/3 or WebTransport dial,
 seconds (10)."""
@@ -99,13 +102,26 @@ DEFAULT_MAX_SLOTS: int
 """Default bound on the counters and timers of a shaping candidate (4096)."""
 _KEYALG_X25519: int
 _KEYALG_MLDSA44: int
-_DEFAULT_RECOVERY_RATIO: float
+DEFAULT_RECOVERY_RATIO: float
+"""Default `CapacityFloor.recovery_ratio` (1.25)."""
+DEFAULT_MIN_INTERVAL: float
+"""Default `QualityBand.min_interval`, seconds (1)."""
+
+def _check_pipe_liveness(liveness: _t.PipeLiveness) -> None:
+    """Internal: raises `ValueError` for a `PipeLiveness` out of range."""
+
+def _check_quality_band(b: _t.QualityBand) -> None:
+    """Internal: raises `ValueError` for a `QualityBand` out of range."""
+
+def _check_pool_decision(d: _t.PoolDecision) -> None:
+    """Internal: raises `ValueError` for a `PoolDecision` out of range."""
 
 def _config_defaults() -> dict[str, Any]:
     """Internal: the library's defaults of the `zmux.Config` fields."""
 
 async def _panic() -> None:
-    """Internal: a future that panics (tests how a panic reaches its awaiter)."""
+    """Internal, only in builds with the `test-hooks` feature: a future that
+    panics (tests how a panic reaches its awaiter)."""
 
 def _listener_defaults() -> dict[str, Any]:
     """Internal: the library's defaults of the `zmux.ListenerConfig` fields."""
@@ -199,7 +215,7 @@ class PipeIo:
         clamped). There is no upper bound: the peer's `max_record_size`
         reduces it. A pipe whose limit, less a Sealed transform's overhead,
         is below 8192 is refused when it is added or joined."""
-    def declare_secure(self) -> None:
+    def declare_carrier_secure(self) -> None:
         """Declares the carrier secure: it meets the secure carrier's Bound
         contract, record confidentiality and integrity included, so a
         `record_policy` may choose `RecordMode.BOUND` on it
@@ -594,8 +610,9 @@ async def join_split(
     `PipeError`. A `PipePool(join=...)` keeps such pairs up."""
 
 @final
-class PoolPolicy:
-    """A pool policy read from a JSON object; its decisions run natively.
+class MachinePoolPolicy:
+    """A pool policy read from a JSON object, run natively: `PipePool(policy=...)` takes
+    it like any `PoolPolicy`, and no Python runs for its decisions.
 
     Absent members keep the pool's own behaviour; unknown members raise
     `ValueError`. Pools given the same object share its state."""
@@ -603,57 +620,14 @@ class PoolPolicy:
     def __init__(self, definition: str | bytes | Mapping[str, Any]) -> None:
         """Reads a policy from its JSON `definition`; an invalid one raises
         `ValueError`."""
-    def decide(
-        self,
-        failures: int = 0,
-        members: Iterable[Mapping[str, float]] = (),
-        *,
-        since_dial: float | None = None,
-    ) -> PoolPolicyDecision:
-        """One decision for members given as dicts with `id` and optional
-        `age`, `idle` (s), `pipes`, `bytes_sent`, `bytes_received`, the last
-        dial having started `since_dial` seconds ago (`None`: none)."""
-
-@final
-class PoolPolicyDecision:
-    """One answer of `PoolPolicy.decide`; `None` keeps the pool's own value.
-    Made directly, `probe_interval` below 1, `probe_jitter` outside [0, 1)
-    or a negative time raises `ValueError`."""
-
-    def __init__(
-        self,
-        *,
-        count: int | None = None,
-        dial_after: float | None = None,
-        retire: Iterable[int] = (),
-        recheck: float | None = None,
-        probe_interval: float | None = None,
-        probe_jitter: float | None = None,
-    ) -> None: ...
-    @property
-    def count(self) -> int | None:
-        """Members to keep (at least 1)."""
-    @property
-    def dial_after(self) -> float | None:
-        """Least delay in seconds of the next dial after the last one."""
-    @property
-    def retire(self) -> list[int]:
-        """IDs of members to retire, in view order, each once."""
-    @property
-    def recheck(self) -> float | None:
-        """Seconds within which to decide again even if nothing changes: the
-        soonest an `age` or `idle` rule of a member kept fires, or
-        `dial_after` elapses after the last dial. A `PipePool` with this
-        policy wakes its maintainer by it, lengthening a shorter one than
-        `MIN_RECHECK` (0 included) to that."""
-    @property
-    def probe_interval(self) -> float | None:
-        """Idle-probe interval in seconds of the pipes added from now on, as
-        drawn (0: no idle probes); `None`: not set. Any other value below 1
-        makes the decision invalid: a pool rejects it as a whole."""
-    @property
-    def probe_jitter(self) -> float | None:
-        """Their idle-probe jitter; `None`: not set."""
+    def decide(self, view: _t.PoolView) -> _t.PoolDecision:
+        """The decision for `view`, as the pool's look would get it: the policy's
+        values built into a `PoolDecision`. A value that `PoolDecision` refuses
+        (a probe interval between 0 and 1 s) raises `ValueError`, which rejects
+        the look of a pool."""
+    def evaluate(self, view: _t.PoolView) -> _t.PoolEvaluation:
+        """The policy's values for `view` as it evaluates them, unchanged and out
+        of range ones included: the way a policy file is tested."""
 
 @final
 class PipePool:
@@ -679,15 +653,22 @@ class PipePool:
     replaces a usable member make before break once it carried
     `rotate_max_bytes` either way or is `rotate_max_age` seconds old, each
     reduced by a random fraction of up to `rotate_jitter` (`None`: no
-    rotation by that measure). `pool_policy` (a `PoolPolicy` or its JSON)
-    is consulted at each look of the maintainer: at once after a pipe
-    changed state or the session was suspended or resumed (it keeps
-    dialling while suspended), and at least every 100 ms; its `dial_after`
-    replaces the backoff's delay, and its probe settings apply to the pipes
+    rotation by that measure). `policy` (a `PoolPolicy`: an object with
+    `decide(view)`, or a `MachinePoolPolicy`) is asked at each look of the
+    maintainer: at once after a pipe changed state or the session was
+    suspended or resumed (it keeps dialling while suspended), after each dial
+    attempt, no later than the `recheck` of its last decision, and every
+    100 ms. Its `decide` runs on the event loop that runs `maintain_pipes`
+    (a thread that is not a runtime worker waits for the answer, without a
+    bound: a `decide` that does not return holds the looks of this pool and
+    nothing else). Its `count`, `dial_after`, `retire_pipes`
+    and `recheck` steer the pool, and its `liveness` applies to the pipes
     added after it. `options` are the `PipeOptions` of every pipe of the
-    pool. A policy decision that is not valid (a probe interval other than
-    0 below 1 s) is rejected as a whole: the pool keeps its own behaviour
-    and calls `decision_rejected(reason)`, if given, on the event loop."""
+    pool. A look is rejected as a whole when `decide` raises, returns
+    anything but a `PoolDecision`, or returns a decision out of range: the
+    pool applies the default decision for that look and calls
+    `decision_rejected(exception)`, if given, on the event loop; without it
+    the exception is logged at warning level through the session's logger."""
 
     def __init__(
         self,
@@ -701,9 +682,9 @@ class PipePool:
         rotate_max_age: float | None = None,
         rotate_jitter: float = 0.0,
         backoff: _t.Backoff | None = None,
-        pool_policy: PoolPolicy | str | bytes | Mapping[str, Any] | None = None,
+        policy: _t.PoolPolicy | None = None,
         options: PipeOptions | None = None,
-        decision_rejected: Callable[[str], object] | None = None,
+        decision_rejected: Callable[[BaseException], object] | None = None,
     ) -> None: ...
     @property
     def count(self) -> int:
@@ -1130,9 +1111,15 @@ class SendStream:
     exception; leaving a stream neither finished nor reset keeps it
     half-open until the session ends. One operation at a time: a second
     concurrent call raises `StreamBusyError`; `id` and `stats` read on
-    while an operation is in progress. The runtime settings
-    `send_buffer`, `scheduler` and `redundant` are writable properties and
-    read back as in force."""
+    while an operation is in progress. The runtime settings `priority`,
+    `send_buffer`, `scheduler` and `redundant` are writable properties; each
+    reads back the value the part holds (the last assigned, or for
+    `priority` the peer's adjustment if it came later), `None` for a setting
+    that follows the session. A reading never fails and never waits: it
+    answers while a write, a flush or a wait holds the part, and after the
+    stream ended with the value held last. An assignment does not take the
+    part either: it works while a write, a flush or a wait is in progress, and
+    fails only as the stream does (`StreamClosedError`)."""
 
     @property
     def id(self) -> int | None:
@@ -1140,7 +1127,8 @@ class SendStream:
     @property
     def priority(self) -> Priority:
         """The local scheduling priority (urgency 0..7, lower first);
-        assigning a `Priority` or `(urgency, incremental)` changes it."""
+        assigning a `Priority` or `(urgency, incremental)` changes it. A new
+        sending part holds `Priority.LOCAL_DEFAULT`."""
     @priority.setter
     def priority(self, priority: _Prio) -> None: ...
     async def write(self, data: Buffer) -> None:
@@ -1204,7 +1192,8 @@ class SendStream:
     @property
     def send_buffer(self) -> int:
         """The written-but-unreleased bytes this part may hold: the last
-        assignment, else the session's `Config.send_buffer`."""
+        assignment, else the value the session's `Config.send_buffer` gave it
+        when the stream was created (it does not follow the session after)."""
     @send_buffer.setter
     def send_buffer(self, n: int) -> None: ...
     @property
@@ -1223,9 +1212,12 @@ class SendStream:
     def max_datagram_size(self, context: int = 0) -> int | None:
         """The largest payload the peer currently accepts in a datagram of
         this stream with the context ID `context`; `None` without datagram
-        flows."""
-    def send_datagram(self, payload: bytes, context: int = 0) -> None:
-        """Sends a datagram of the stream with the context ID `context`."""
+        flows. Never fails for a write in progress."""
+    def send_datagram(self, payload: Buffer, context: int = 0) -> None:
+        """Sends a datagram of the stream with the context ID `context`;
+        `payload` is any buffer-protocol object, copied unless it is `bytes`.
+        Never waits and does not take the part: it works while a write, a
+        flush or a wait is in progress."""
     def stats(self) -> StreamStats:
         """A snapshot of the stream; its final values once the session released it."""
     async def stopped(self) -> int | None:
@@ -1247,16 +1239,18 @@ class RecvStream:
     loses no data. Leaving `async with` stops the stream with code 0 (a
     no-op once it ended; it returns at once). `async for` ends silently at the end of the stream and raises
     the stream's error otherwise. The runtime settings `receive_window` and
-    `peer_priority` are writable properties and read back as last
-    assigned. `id`, `stats`, `preamble`, `is_replayable` and
-    `requested_priority` read on while a read is in progress."""
+    `peer_priority` are writable properties and read back the value the part
+    holds (`peer_priority`: `None` when none was asked); a reading never
+    fails and never waits, and an assignment does not take the part: both
+    work while a read is in progress. `id`, `stats`, `preamble`, `is_replayable` and
+    `preamble_priority` read on while a read is in progress."""
 
     @property
     def id(self) -> int | None:
         """The stream ID."""
     @property
-    def requested_priority(self) -> Priority | None:
-        """The PRIORITY the peer asked for in the stream's opening preamble
+    def preamble_priority(self) -> Priority | None:
+        """The PRIORITY the peer put in the stream's opening preamble
         (`open_bi(peer_priority=...)` at its end); `None`
         when it sent none or the stream was opened locally. Later priority
         updates are not reflected: see `priority` for the one in force."""
@@ -1291,17 +1285,40 @@ class RecvStream:
         """Up to `n` bytes as a read-only view of the received buffer,
         without a copy; empty at the end of the stream."""
     def _take(self, max: int, view: bool, /) -> bytes | memoryview | None: ...
-    async def _readable(self) -> None: ...
+    async def wait_readable(self) -> None:
+        """Waits until the next read returns at once: data is readable, or the
+        receiving part has ended (FIN, a reset, a stop by this endpoint, the
+        session's end). It returns `None` in every one of these cases and
+        takes nothing, so the read that follows reports the data or the end,
+        once, in its own form; wait, then `try_read`. It fails only with the
+        caller's own bound (`asyncio.timeout`); a cancelled call has no
+        effect, and any number of tasks may wait at once."""
+    def try_read(self, n: int = 65536) -> bytes | None:
+        """Up to `n` bytes (at least 1) that are there now, without waiting:
+        `None` when nothing is readable now, `b""` once the stream has ended
+        with a FIN and everything was read. A reset, or the session's end,
+        raises as a read does. `StreamBusyError` while another call holds
+        the part."""
     def _put_back(self, chunks: list[bytes], /) -> None: ...
     def reject(self) -> None:
         """Declines the stream before reading it (ZMUX_REJECTED); the handle,
         and the sending one of a stream not written to, are used up."""
     @property
     def receive_window(self) -> tuple[int, int]:
-        """The stream's receive window, `(window, maximum)`: the window now
-        advertised, which auto-tuning raises up to `maximum`."""
+        """The stream's receive window settings, `(initial, maximum)`: the
+        initial window as set (or the session's), never the window
+        auto-tuning has grown it to (that is `stats.recv_window`), and the
+        cap on auto-tuning as set, 0 when it is automatic."""
     @receive_window.setter
-    def receive_window(self, window: tuple[int, int]) -> None: ...
+    def receive_window(self, window: tuple[int, int]) -> None:
+        """Assigns `(initial, maximum)`. The initial window is advertised at
+        once when it is above the window in force; a maximum of 0 makes the
+        cap on auto-tuning automatic, whatever the session's
+        `max_stream_receive_window` is. Credit already advertised is never
+        withdrawn: an initial below the window in force only changes what the
+        getter reads back. An initial window below 4096 (the floor of
+        `initial_stream_receive_window`) or a nonzero maximum below the
+        initial window raises `InvalidArgumentError` and changes nothing."""
     @property
     def peer_priority(self) -> Priority | None:
         """The priority last asked of the peer for the stream (assigned as a
@@ -1342,10 +1359,18 @@ class Pipe:
         session's for pipe 0; `None` without one and once the session forgot
         the pipe."""
     @property
-    def options(self) -> PipeOptions | None:
-        """The options in force, with the fields `update` set (the effective
-        values, which may follow the peer's request, are in `stats()`);
-        `None` once the pipe's state is released."""
+    def options(self) -> PipeOptions:
+        """Every option as the pipe holds it: those it was added with, with each
+        `update` applied, reading back exactly what an update set or cleared.
+        A setting that follows the session, or is unset, reads as `INHERIT`;
+        `direction`, `record_mode`, `key_group`, `label` and `fate_group` read
+        as the pipe has them (the record mode and key group the join used),
+        and `return_on_reply` as it was given. A pipe the peer added reads as
+        the join made it (`direction` from this endpoint's view, `record_mode`,
+        `key_group`), the rest as `PipeOptions()` has it until an update sets
+        it. The values in effect, which may follow the peer's request, are in
+        `stats()`. It never fails: after the pipe ended it returns the options
+        held last."""
     @property
     def state(self) -> OutboundState | InboundState | str | None:
         """The outbound direction's state (else the inbound one's); `None`
@@ -1355,7 +1380,7 @@ class Pipe:
         """The `Session` object the pipe was given by, always the same one."""
     async def joined(self) -> None:
         """Waits until the peer confirmed the join; `PipeError` if it failed."""
-    async def attached(self) -> None:
+    async def wait_attached(self) -> None:
         """Waits until the peer attached the pipe, so that it carries the
         session even if every other pipe goes: pipe 0 once established, a
         pipe the peer joined at once, one of this endpoint's joins once
@@ -1365,7 +1390,9 @@ class Pipe:
     async def wait_closed(self) -> None:
         """Waits until the pipe ended: returns once every direction closed
         (or the session released it); `PipeError` if it failed or the
-        session ended first."""
+        session ended first. The end is stable: a wait that starts after the
+        pipe retired reports the same end as one registered before (after
+        `abort()`, `PipeAbortedError`)."""
     def update(
         self,
         *,
@@ -1376,14 +1403,16 @@ class Pipe:
         weight: int | _t.Clear = ...,
         probation: float | _t.Auto | _t.Clear | None = ...,
         liveness: _t.PipeLiveness | _t.Clear = ...,
-        quality_band: QualityBand | _t.Clear = ...,
+        quality_band: QualityBand | _t.Clear | None = ...,
     ) -> None:
         """Changes these settings together (both receive fields: one
         PIPE_STATUS). A keyword left out keeps its value; `zmux.CLEAR`
         clears it (the `send_*` fields then follow the peer's request, the
         `receive_*` fields request the default again, `weight` is 1,
         `probation`, `liveness` and `quality_band` follow the session's); a
-        value sets it (`probation=None` turns probation off). A field fixed when the pipe
+        value sets it (`probation=None` turns probation off, `quality_band=None`
+        turns the quality reports of this pipe off whatever the session's band
+        is). A field fixed when the pipe
         is added or an unknown name raises `TypeError`; an invalid value
         raises `ValueError` and changes nothing. Nothing is sent for
         `liveness`."""
@@ -1513,7 +1542,8 @@ class Session:
     @property
     def quality_band(self) -> QualityBand | None:
         """The default quality band of the session's pipes; `None` (the
-        default): no reports."""
+        default): no reports. A pipe can follow it, have a band of its own
+        or be off (`PipeOptions.quality_band`)."""
     @quality_band.setter
     def quality_band(self, band: QualityBand | None) -> None: ...
     @property
@@ -1718,9 +1748,9 @@ class Session:
     def zero_rtt(self) -> ZeroRtt | None:
         """For sessions from `QuicClient.connect`: what became of the 0-RTT data."""
     @property
-    def id(self) -> int:
-        """The session's identifier in this process (unique while it runs):
-        the one `Tracer` methods are given."""
+    def id(self) -> _t.SessionId:
+        """The session's identifier in this process (unique while it runs,
+        never reused): the one `Tracer` methods are given."""
     @property
     def role(self) -> Role:
         """`Role.CLIENT` or `Role.SERVER`, negotiated when started as auto."""
@@ -1911,7 +1941,7 @@ async def splice(
     a_to_b: Limiter | None = None,
     b_to_a: Limiter | None = None,
     abort: SpliceAbort | None = None,
-) -> Spliced:
+) -> SpliceResult:
     """Forwards two bidirectional streams into each other until both
     directions ended; the handles are used up. Splicing a stream into
     itself raises `ValueError`; cancelling the task cancels the splice (the
@@ -1934,11 +1964,11 @@ async def splice_packets(
     a_to_b: Limiter | None = None,
     b_to_a: Limiter | None = None,
     abort: SpliceAbort | None = None,
-) -> Spliced:
+) -> SpliceResult:
     """Relays two packet streams as `splice` does: stream bytes pass through
     with only capsule headers parsed, and a stream datagram that does not fit
     the next hop's datagrams goes on as a DATAGRAM capsule at the next
-    capsule boundary (`Forwarded.datagrams_as_capsules`). A capsule never
+    capsule boundary (`SpliceDirection.datagrams_as_capsules`). A capsule never
     becomes a datagram. A direction's limiter is asked `acquire(n, n)` once
     for each whole capsule (n its Type, Length and Value bytes) and
     `try_acquire(n, n)` for each datagram it forwards."""
@@ -2076,16 +2106,34 @@ def resolve_duplicate(
     keeps one, drains the other, and starts `rejoin` (on the running event
     loop: `NoRunningLoopError` without one) to keep the loser's route as a
     pipe of the survivor. An
-    undecidable pair or one with the same dialer raises `ValueError`."""
+    undecidable pair or one with the same dialer raises
+    `DuplicateUndecidedError` (a `ValueError`)."""
 
 type _Source = tuple[str, int] | None
 
 def static_key_id(key: Buffer) -> bytes:
     """The 32-byte KeyId of a static key, for `PinVerifier`."""
 
-def static_public(secret: Buffer) -> bytes:
-    """The X25519 public key of a 32-byte static secret, as `static_key_id` names it;
-    another length raises `ValueError`."""
+@final
+class StaticKey:
+    """A node's X25519 static private key: `establish(static_key=...)` for a client,
+    `SecureServer(gate, static_key)` for a server. A client without one uses a key
+    generated once per process."""
+
+    @staticmethod
+    def generate() -> StaticKey:
+        """A new random key from the operating system's random source. When that fails
+        (early boot, a sandbox without it), there is no fallback: `SecureCarrierError`
+        with `kind == "random_failed"`."""
+    @staticmethod
+    def from_scalar(scalar: Buffer) -> StaticKey:
+        """The key of a 32-byte X25519 private scalar; another length raises `ValueError`."""
+    @property
+    def public_key(self) -> bytes:
+        """The X25519 public key (32 bytes): what `static_key_id` names for a peer's pin."""
+    @property
+    def scalar(self) -> bytes:
+        """The private scalar (32 bytes)."""
 
 def key_id(key_alg: _t.KeyAlg | int, key: Buffer) -> bytes:
     """The 32-byte KeyId of a key of `key_alg`: what a pin and a verdict name it by."""
@@ -2225,7 +2273,7 @@ class SecureServer:
     def __new__(
         cls,
         gate: Gate,
-        static_key: Buffer,
+        static_key: StaticKey,
         *,
         accepted_profiles: Iterable[int] | None = None,
         allow_record_mode: Callable[[_t.RecordMode, _t.Peer], bool | Awaitable[bool]]
@@ -2247,7 +2295,7 @@ async def establish(
     allow_psk_only: bool = False,
     handle: Buffer = b"",
     psk: Buffer = b"",
-    static_secret: Buffer | _t.Auto | None = None,
+    static_key: StaticKey = ...,
     allowed_profiles: Iterable[int] | None = None,
     record_mode: _t.RecordMode | str | None = None,
     credential: tuple[int, bytes] | None = None,
@@ -2264,9 +2312,14 @@ async def establish(
     `pipe_auth` stays unset, and what it learned of the server. On a failure the
     carrier is closed; nothing is retried. A server that ends or stays silent until
     `reply_timeout` (`None`: none) raises `NoReplyError`; a rejected server raises
-    `ZmuxError`; a configuration mistake raises `ValueError` naming it.
-    `static_secret` is the client's 32-byte X25519 static secret (`AUTO` or
-    `None`, the default: a key generated once per process); `record_mode` the
+    `CredentialsFailedError` (a `SecureCarrierError`, `kind == "credentials_failed"`; the
+    verifier rejected it or could not decide, a proof failed, or `require_pq_auth` did not
+    hold; only the side that judged raises it, so a server raises nothing: it closes the
+    carrier and reports it to `on_reject`); another handshake failure raises
+    `SecureCarrierError` with its `kind`; a
+    configuration mistake raises `ValueError` naming it.
+    `static_key` is the client's `StaticKey` (left out: a key generated once per
+    process, shared by this process's clients); `record_mode` the
     record mode of the session's first pipe (`None`: `RecordMode.SEALED`).
     `allowed_profiles` `None` is both ciphers, AES-GCM first with AES hardware: 1 or
     3 with a pre-shared key, 4 or 5 without; an empty list raises `ValueError`. `credential` is sent in message 3;

@@ -108,7 +108,7 @@ over any asyncio stream pair (slower: bytes pass through Python), and
 A `PipeIo`'s settings are properties, changed in place until the input is
 given to a session: `carrier_kind`, `variant` (the host's name of the
 transform a carrier runs, reported in `PipeStats.variant`), `write_overhead`
-and `terminated_tls`; `declare_secure()` declares the carrier secure for the
+and `terminated_tls`; `declare_carrier_secure()` declares the carrier secure for the
 Bound record mode, and `set_max_record(n)` limits the largest record
 plaintext the carrier takes (at least 8192, the carrier record floor; no upper
 bound; the smaller limit holds; a pipe whose limit falls below 8192 after a
@@ -189,8 +189,9 @@ off, no-timeout or unlimited setting of a field that has one (and raises
 their own: `zmux.AUTO` (an automatic cap or a derived value, the default
 where a field has it), `zmux.STAGED` (staged unidirectional credit, the
 default), `zmux.INHERIT` (a pipe setting that follows the session's, the
-default of those) and `zmux.CLEAR` (`Pipe.update` and the settings of
-`PipeOptions` that it changes). Durations are seconds
+default of those, and the unset value of every updatable field of a
+`PipeOptions`) and `zmux.CLEAR` (only `Pipe.update` clears a setting; a
+`PipeOptions` given `CLEAR` raises `TypeError`). Durations are seconds
 (`float`). Fragment:
 
 ```python
@@ -205,15 +206,30 @@ config = zmux.Config(
 
 `Config(liveness=zmux.Liveness(...))` holds the keep-alive and probe
 settings; a running session replaces them with `session.liveness = ...`.
-The other runtime settings of a session are writable properties too, and read
-back as in force, whether the configuration or an assignment set them:
-`scheduler`, `quality_band`, `capacity_floor`, `shaper` (an opaque
-`zmux.shaping.InstalledShaper`) and `shaping_limits`; an invalid value raises `ValueError` and
-changes nothing. Use `config.replace(...)` to derive a variant. The defaults are exported as
-constants (`DEFAULT_KEEP_ALIVE_PERIOD`, `DEFAULT_IDLE_TIMEOUT`,
+The other runtime settings of a session are writable properties too. Each
+reads back what the session holds (the last assignment, or the configuration
+that set it), never fails and still answers after the session ended:
+`scheduler` (its name), `quality_band` and `capacity_floor` (`None` while
+unset), `shaper` (an opaque `zmux.shaping.InstalledShaper`) and
+`shaping_limits`; an invalid value raises `ValueError` and changes nothing. `zmux.QualityBand(rtt=None, rate_ratio=None, min_interval=1.0)`
+reports a pipe's quality once its RTT moved by more than `rtt` seconds
+(positive) or its rate by more than the factor `rate_ratio` (at least 1; 1
+reports every change), at most once per `min_interval` seconds (positive;
+`None`: no minimum); a half left `None` reports nothing, a band with both
+halves `None` raises `ValueError`, and `session.quality_band = None` turns the
+reports off. `zmux.CapacityFloor(rate, recovery_ratio=1.25)` takes a `rate` of
+at least 1 and a finite `recovery_ratio` of at least 1. A pipe follows the
+session's band by default (`PipeOptions(quality_band=zmux.INHERIT)`, which
+`pipe.update(quality_band=zmux.CLEAR)` returns to), has a band of its own
+(`quality_band=band`), or is off whatever the session's band is
+(`quality_band=None`). Use `config.replace(...)` to derive a variant. The defaults are exported as
+constants (`DEFAULT_KEEP_ALIVE_PERIOD`, `DEFAULT_MAX_IDLE_TIMEOUT`,
 `DEFAULT_PROBE_JITTER`, `DEFAULT_STANDBY_PROBE`, `DEFAULT_MAX_RECORD_SIZE`,
 `DEFAULT_MIN_BACKOFF`, `DEFAULT_MAX_BACKOFF`, `DEFAULT_BACKOFF_JITTER`,
-`DEFAULT_LANES`, `DEFAULT_JOIN_TIMEOUT`). `zmux.MAX_STREAM_CREDIT` (2**60) is the largest stream
+`DEFAULT_MAX_LANES`, `DEFAULT_JOIN_TIMEOUT`, `DEFAULT_RECOVERY_RATIO`,
+`DEFAULT_MIN_INTERVAL`; `DEFAULT_LANES` is the QUIC carriers' lane count, a
+different default than `DEFAULT_MAX_LANES`, the lanes accepted per inbound
+pipe). `zmux.MAX_STREAM_CREDIT` (2**60) is the largest stream
 count: pass it as `max_incoming_streams` or `max_incoming_uni_streams` to
 let the peer open as many streams as the protocol can count.
 
@@ -242,12 +258,31 @@ returns the bytes `try_write` takes now), then write synchronously and return
 the length taken, so a cancelled call took nothing. `send_capacity()` and
 `wait_send_capacity(minimum)` report the flow-control credit instead. `send.try_write(data)` and
 `send.try_writev(buffers)` write without waiting (0 when there is no room).
+Reading mirrors it: `await recv.wait_readable()` returns `None` once the next
+read returns at once, that is when data is readable or the part has ended (a
+FIN, a reset, your own `stop`, the session's end), and takes nothing; the end
+is reported once, by the read that follows. `recv.try_read(n=65536)` reads
+without waiting: the bytes, `None` when nothing is readable now, `b""` once
+the stream ended with a FIN and everything was read, and a reset or the
+session's end raises as `read` does. Wait, then `try_read`, is a read that a
+cancellation cannot lose data from.
 Use
-`asyncio.timeout()` for deadlines. `send.priority` is writable, and so are the runtime settings of a stream, which
-read back as in force: `send.send_buffer`, `send.scheduler`,
-`send.redundant`, `recv.receive_window` and `recv.peer_priority`;
+`asyncio.timeout()` for deadlines. `send.priority` is writable, and so are the runtime settings of a stream. Each
+reads back the value the part holds, never as the session's value it follows:
+`send.priority` (a new part holds `zmux.Priority.LOCAL_DEFAULT`, urgency 3 and
+incremental; `Priority.WIRE_DEFAULT`, urgency 3 and not incremental, is what
+the wire means without a signal; the peer's update replaces the local value if
+it comes later), `send.send_buffer`, `send.scheduler` and `send.redundant`
+(`None` follows the session), `recv.receive_window` and `recv.peer_priority`
+(`None` when none was asked). A reading never fails and never waits: it
+answers while a write, `flush` or `wait_send_capacity` holds the part, and so do
+`send.send_datagram` and `send.max_datagram_size`. An
+assignment does not take the part either: it works meanwhile too, and a
+raised `send.send_buffer` wakes a write that waits for room;
 `await recv.read_chunk(n)` returns a `memoryview` of the received buffer, and
-every write takes any buffer-protocol object: `bytes` (or a contiguous
+`recv.preamble_priority` is the priority the peer put in the stream's opening
+preamble (`None` when it sent none), for a relay that copies it to the next
+hop; every write takes any buffer-protocol object: `bytes` (or a contiguous
 `memoryview` of `bytes`) goes without a copy, any other buffer is copied when
 the call is made, so it may be reused at once.
 
@@ -289,6 +324,12 @@ per chunk; `splice_packets` asks `acquire(n, n)` per whole capsule; a
 forwarded stream datagram needs `try_acquire(n, n)` and is dropped without a
 grant. An `acquire` that raises ends the direction with
 `SpliceEnd.LIMITER_FAILED`.
+The result is a `zmux.helpers.SpliceResult` of two `SpliceDirection`s
+(`a_to_b`, `b_to_a`) with `bytes`, `datagram_bytes`, `datagrams_dropped`
+(every datagram received and not forwarded), `datagrams_too_large` (of those,
+the ones dropped for their size: larger than a datagram of the downstream
+stream, or, in `splice_packets`, larger than `DEFAULT_MAX_PACKET`),
+`datagrams_limited`, `datagrams_as_capsules`, `end` (a `SpliceEnd`) and `code`.
 `zmux.helpers.SpliceAbort()` given as `abort=` ends the splices sharing it
 with a chosen code: `abort.abort(0x77)` resets the downstream parts and stops
 the upstream parts with it, and the directions still running report
@@ -389,25 +430,64 @@ pipe = await session.add_pipe(
     options=zmux.PipeOptions(send_priority=1, receive_priority=1),
 )
 pipe.update(weight=2, send_priority=zmux.CLEAR)  # CLEAR: follow the peer again
+pipe.options.send_priority  # zmux.INHERIT: unset, as a PipeOptions writes it
 ```
 
 `add_pipe` returns once the peer attached the pipe (`return_on_reply=True`:
-once the Reply is verified), within `Config(join_timeout=...)`, and raises
+once the Reply is verified, after which `await pipe.wait_attached()` waits for the attachment), within `Config(join_timeout=...)`, and raises
 `zmux.JoinRefusedError` when the peer refused the join and
 `zmux.DeadlineExceededError` when the bound passed. `PipeOptions` holds every
 option of a pipe; `pipe.update(**fields)` is the one way to change the
 settings of a live pipe, together: `send_priority`, `receive_priority`,
 `send_standby`, `receive_standby`, `weight`, `probation`, `liveness` and
 `quality_band`, each left out (kept), `zmux.CLEAR` (cleared) or a value (set).
-`PipeOptions` takes the same fields in the same form, `zmux.CLEAR` being their
-default. A pipe's own liveness is `PipeOptions(liveness=zmux.PipeLiveness(...))`.
-`await pipe.wait_closed()` waits for a pipe's end.
+`PipeOptions` takes the same fields, each `zmux.INHERIT` (unset: the session's
+value, the peer's request or the default) unless given a value; `None` is the
+off setting of `probation` and `quality_band`, and `CLEAR` is only for
+`update`. `pipe.options` reads every option back as the pipe holds it, after
+each update exactly what it set or cleared (unset reads `INHERIT`), with
+`direction` from this end, the `record_mode` and `key_group` the join used,
+and `return_on_reply` as given, so options read from one pipe add another the
+same way; a pipe the peer added reads as the join made it, the rest as a
+`PipeOptions` default. It never fails, also after the pipe ended. A pipe's own
+liveness is `PipeOptions(liveness=zmux.PipeLiveness(...))`.
+`await pipe.wait_closed()` waits for a pipe's end, and raises
+`zmux.PipeAbortedError` when this endpoint removed it abruptly (`pipe.abort()`,
+a resource limit, room made for a join); wait before the removal to see it.
 
 Pools: `handle = session.maintain_pipes(zmux.helpers.PipePool(count, dial))` keeps
 `count` usable pipes dialled by the async `dial()`, with backoff, rotation
-(`rotate_max_bytes`, `rotate_max_age`) and an optional `pool_policy`;
+(`rotate_max_bytes`, `rotate_max_age`) and an optional `policy`;
 `join=` takes groups of pipes such as `zmux.join_split`, `choice=` a carrier
 choice, and `backoff=` a `zmux.Backoff`. `handle.stop()` ends it.
+
+A pool's `policy` is an object with `decide(view)`, the protocol
+`zmux.helpers.PoolPolicy`: at each look of the pool it is given a
+`zmux.helpers.PoolView` (`members` as `PoolMember`s with `pipe`, `age`, `idle`,
+`pipes`, `bytes_sent`, `bytes_received`, `usable` and `replacing`, `failures`,
+`since_last_dial` and `dialing`) and returns a `zmux.helpers.PoolDecision`,
+whose fields left at their defaults keep the pool's own behaviour: `count`
+(the members to keep), `dial_after` (the wait before the next dial, in place
+of the backoff's), `retire_pipes` (members to replace now, by `pipe`),
+`recheck` (look again within that many seconds) and `liveness` (a
+`PipeLiveness` for the pipes dialled from then on). A smaller `count` cancels
+dials in progress first, then closes members gracefully, those in
+`retire_pipes` first, then the longest idle. `decide` runs on the event loop
+that runs `maintain_pipes`, keeps whatever state the object holds, and should
+return promptly: no bound is put on it, and one that does not return holds
+the looks of its own pool and nothing else. It must not call into the
+session. A look is
+rejected when `decide` raises or returns anything but a `PoolDecision`: the
+pool applies the default decision for it and calls
+`PipePool(decision_rejected=f)` with the exception, on the event loop, or,
+without `f`, logs it at warning level through the session's logger.
+`zmux.helpers.MachinePoolPolicy(json)` is a policy the binding runs natively
+from a JSON definition, passed the same way. Its `evaluate(view)` gives the
+values the definition evaluates to, unchanged (a `zmux.helpers.PoolEvaluation`),
+which is how a policy file is tested; `decide(view)` builds the
+`PoolDecision` from them, and a value `PoolDecision` refuses (an idle-probe
+interval between 0 and 1 s) is a `ValueError`: that is a rejected look in a
+pool.
 
 Resume: with `resume_timeout` set, a session whose pipes are lost waits that
 long for a pipe to join again; a `redial` hook dials it, waiting by
@@ -434,7 +514,9 @@ refuses, `redial` fails, observed events are dropped and counted) until the
 next use from a running loop binds the object to that loop, so a `Config`
 can serve one `asyncio.run` after another.
 `logger` and `tracer` read a bounded queue
-there (`hook_queue`), and deciding hooks (`authorize_join`,
+there (`hook_queue`, which drops the item that arrives when it is full and
+counts it, except a session's `established` and `closed`; a `Tracer` is told the session's `Session.id`, a
+`zmux.SessionId`), and deciding hooks (`authorize_join`,
 `allow_record_mode`, `on_reject`, `session_config`, an admission decider)
 may be `async` and are cancelled at the library's deadline. Choices the
 library makes in its own calls are data: `record_policy=zmux.RecordPolicy(...)`,
@@ -511,7 +593,7 @@ handle, psk = zmux.adapter.derive_handle_psk(secret, b"my-domain")
 listener = zmux.Listener(
     config=config,
     listener_config=zmux.ListenerConfig(
-        secure_server=zmux.SecureServer(gate, node_key)
+        secure_server=zmux.SecureServer(gate, node_key)  # a zmux.StaticKey
     ),
 )
 
@@ -533,10 +615,33 @@ be synchronous or `async`. `signer=` takes a `zmux.SigningKey` (of
 `max_app_data` bounds the peer's handshake application data (256 bytes;
 `None`: no bound beyond the message).
 
+A node's static key is a `zmux.StaticKey`: `StaticKey.generate()` (which
+raises `SecureCarrierError` with `kind == "random_failed"` when the operating
+system's random source fails), `StaticKey.from_scalar(32 bytes)`, and the
+properties `public_key` and `scalar`. A server takes one in
+`SecureServer(gate, static_key)`; a client gives `establish(static_key=...)`,
+and without one uses a key generated once per process. `zmux.static_key_id(key.public_key)`
+is the `KeyId` a `PinVerifier` pins. A handshake a verifier rejects raises
+`zmux.CredentialsFailedError`, any other failure of the secure carrier
+`zmux.SecureCarrierError`; both carry the secure carrier's error class as a
+string in `kind` (`"credentials_failed"`, `"random_failed"`, ...), and `code`
+stays what it is everywhere else, a wire error code (`None` here: an error
+class is not on the wire). `CredentialsFailedError` is raised only by the side
+that judged the peer: a client whose verifier rejected the server or could not
+decide, whose required proof failed, or whose `require_pq_auth` did not hold,
+fails `establish` with it. A server that judges a client the same way closes
+that carrier, reports it to `ListenerConfig(on_reject=...)` and the
+statistics, and raises nothing; `RejectInfo.reason` is then
+`"credentials_failed"` (its verifier rejected the client), `"proof"` (a
+required proof is missing or wrong) or `"pq_auth_required"`, and `"auth"` only
+for a failed AEAD or Confirm. A verifier that could not decide closes the
+carrier without an `on_reject` call. The side whose credentials were refused
+learns nothing from the wire: its carrier just ends.
+
 ## Errors
 
-Every error class zmux defines derives from `zmux.ZmuxError` (with `kind`,
-`retryable` and `code`) and, where one fits, from the built-in exception for
+Every error class zmux defines derives from `zmux.ZmuxError` (with `kind`, what
+happened; `retryable`; and `code`, only a wire error code, `None` without one) and, where one fits, from the built-in exception for
 the same condition. The end of a session is `SessionClosedError` (a
 `ConnectionError`) with the subclasses `ApplicationClosedError`,
 `TransportClosedError`, `IdleTimeoutError`, `HandshakeTimeoutError`,
@@ -549,7 +654,8 @@ the object stays usable; your own `asyncio.timeout` raises its own
 `ConnectionError`s; `StreamClosedError` and `ListenerClosedError` say that
 this end closed the stream direction or listener; `IncompleteReadError` is an
 `asyncio.IncompleteReadError` (the one `StreamPairReader` raises too);
-`InvalidArgumentError` and `PreambleTooLargeError` are `ValueError`s, as are
+`InvalidArgumentError`, `PreambleTooLargeError` and `DuplicateUndecidedError`
+(`resolve_duplicate` could not decide) are `ValueError`s, as are
 the mistakes the binding finds in an argument. Errors are classified by what
 happened, not by the call (`GoingAwayError` and `StreamRejectedError` are
 stream errors wherever they are raised). Fragment:

@@ -393,63 +393,75 @@ async def test_datagram_queue_sizes() -> None:
 
 async def test_quality_band_and_capacity_floor() -> None:
     async with pair() as (c, _s, _l):
-        c.quality_band = zmux.QualityBand(rtt=0.05, rate_ratio=2.0, min_interval=1.0)
+        band = zmux.QualityBand(rtt=0.05, rate_ratio=2.0, min_interval=1.0)
+        c.quality_band = band
+        assert c.quality_band == band
         c.quality_band = None
         c.capacity_floor = zmux.CapacityFloor(rate=1000)
         c.capacity_floor = None
         with contextlib.suppress(zmux.NotNegotiatedError):
             c.pipes()[0].update(quality_band=zmux.QualityBand(rtt=0.01))
+    # `min_interval=None` is no minimum, and survives the session's band.
+    async with pair() as (c, _s, _l):
+        c.quality_band = zmux.QualityBand(rate_ratio=1.0, min_interval=None)
+        assert c.quality_band == zmux.QualityBand(rate_ratio=1.0, min_interval=None)
+        assert c.quality_band is not None and c.quality_band.min_interval is None
+        c.quality_band = zmux.QualityBand(rtt=0.1)
+        assert c.quality_band is not None
+        assert c.quality_band.min_interval == zmux.DEFAULT_MIN_INTERVAL == 1.0
+    for ok in (1.0, 1.5, 2.0, None):
+        zmux.QualityBand(rate_ratio=ok, rtt=0.1)
+    bad_ratios = (0, 0.5, 0.999, -1.0, float("nan"), math.inf)
+    for ratio in bad_ratios:
         with pytest.raises(ValueError):
-            c.quality_band = zmux.QualityBand(rtt=-1)
-    for ok in (0, 0.5, 1.0, 2.0, None):  # 1 or less: every change
-        zmux.QualityBand(rate_ratio=ok)
-    for bad in (float("nan"), -1.0, math.inf):
-        with pytest.raises(ValueError):
-            zmux.QualityBand(rate_ratio=bad)
+            zmux.QualityBand(rate_ratio=ratio)
+    for bad in (0, -1.0, float("nan"), math.inf, 1e30):
         with pytest.raises(ValueError):
             zmux.QualityBand(rtt=bad)
         with pytest.raises(ValueError):
-            zmux.QualityBand(min_interval=bad)
-    with pytest.raises(ValueError):
-        zmux.QualityBand(rtt=1e30)
-    for bad in (float("nan"), -1.0):
+            zmux.QualityBand(rate_ratio=2, min_interval=bad)
+    with pytest.raises(ValueError, match="both halves off"):
+        zmux.QualityBand()
+    with pytest.raises(ValueError, match="both halves off"):
+        zmux.QualityBand(min_interval=None)
+    assert zmux.CapacityFloor(rate=1).recovery_ratio == zmux.DEFAULT_RECOVERY_RATIO
+    assert zmux.DEFAULT_RECOVERY_RATIO == 1.25
+    for bad in (0, 0.5, -1.0, float("nan"), math.inf):
         with pytest.raises(ValueError):
             zmux.CapacityFloor(rate=1, recovery_ratio=bad)
+    assert zmux.CapacityFloor(rate=1, recovery_ratio=1).recovery_ratio == 1
     with pytest.raises(ValueError):
-        zmux.CapacityFloor(rate=1, recovery_ratio=0.5)
+        zmux.CapacityFloor(rate=0)
 
 
 async def test_quality_band_every_change_reports_every_change() -> None:
-    """With only the rate half set, a `rate_ratio` of 1 or less (0, 0.5, 1)
-    reports delivery-rate changes without a threshold, never turning it off."""
-    for ratio in (0, 0.5, 1.0):
-        async with pair() as (c, s, _l):
-            c.quality_band = zmux.QualityBand(rate_ratio=ratio, min_interval=0)
-            band = c.quality_band
-            assert band is not None and band.rate_ratio == 1.0 and band.rtt is None
+    """A `rate_ratio` of 1 with no minimum interval reports every change of
+    the delivery rate."""
+    async with pair() as (c, s, _l):
+        c.quality_band = zmux.QualityBand(rate_ratio=1.0, min_interval=None)
 
-            async def drain() -> None:
-                _send, recv = await s.accept_bi()
-                while await recv.read(65536):
-                    pass
+        async def drain() -> None:
+            _send, recv = await s.accept_bi()
+            while await recv.read(65536):
+                pass
 
-            async def watch() -> None:
-                async for e in c.events():
-                    if isinstance(e, zmux.PipeQualityChanged):
-                        return
+        async def watch() -> None:
+            async for e in c.events():
+                if isinstance(e, zmux.PipeQualityChanged):
+                    return
 
-            tasks = [asyncio.create_task(drain()), asyncio.create_task(watch())]
-            send, _recv = await c.open_bi()
-            try:
-                async with asyncio.timeout(15):
-                    while not tasks[1].done():
-                        await send.write(b"x" * 65536)
-                        await asyncio.sleep(0)
-                    await tasks[1]
-            finally:
-                for t in tasks:
-                    t.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+        tasks = [asyncio.create_task(drain()), asyncio.create_task(watch())]
+        send, _recv = await c.open_bi()
+        try:
+            async with asyncio.timeout(15):
+                while not tasks[1].done():
+                    await send.write(b"x" * 65536)
+                    await asyncio.sleep(0)
+                await tasks[1]
+        finally:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def test_nested_session_over_a_carrier_stream() -> None:
@@ -508,7 +520,7 @@ class Counting:
 async def test_splice_forwards_and_takes_what_it_forwards() -> None:
     async with pair() as (c, relay_in, _l1), pair() as (relay_out, server, _l2):
 
-        async def relay() -> tuple[zmux.helpers.Spliced, Counting]:
+        async def relay() -> tuple[zmux.helpers.SpliceResult, Counting]:
             a = await relay_in.accept_bi()
             b = await relay_out.open_bi()
             limiter = Counting()
@@ -528,7 +540,7 @@ async def test_splice_forwards_and_takes_what_it_forwards() -> None:
         await send.finish()
         assert await recv.read_to_end() == b"spliced" * 100
         (done, limiter), _ = await asyncio.wait_for(tasks, 10)
-        assert isinstance(done, zmux.helpers.Spliced)
+        assert isinstance(done, zmux.helpers.SpliceResult)
         assert (
             done.a_to_b.end is zmux.helpers.SpliceEnd.FINISHED
             and done.a_to_b.code is None
@@ -544,9 +556,11 @@ async def test_resolve_duplicate() -> None:
         y1 = await ly.accept()
         y2 = await zmux.Session.connect(await zmux.dial_tcp(*ax))  # Y dialed
         x2 = await lx.accept()
-        with pytest.raises(ValueError):
+        with pytest.raises(zmux.DuplicateUndecidedError) as undecided:
             zmux.helpers.resolve_duplicate(x1, x2)  # nothing decides
-        with pytest.raises(ValueError):
+        assert isinstance(undecided.value, ValueError)
+        assert isinstance(undecided.value, zmux.ZmuxError)
+        with pytest.raises(zmux.DuplicateUndecidedError):
             zmux.helpers.resolve_duplicate(
                 x1, x1, local_identity=b"x", peer_identity=b"y"
             )
@@ -590,21 +604,19 @@ def test_pipe_options_defaults_and_sentinels() -> None:
     assert (o.record_mode, o.key_group, o.probation) == (
         zmux.INHERIT,
         zmux.INHERIT,
-        zmux.CLEAR,
+        zmux.INHERIT,
     )
     assert (o.send_priority, o.send_standby, o.receive_priority, o.weight) == (
-        zmux.CLEAR,
-        zmux.CLEAR,
-        zmux.CLEAR,
-        zmux.CLEAR,
+        zmux.INHERIT,
+        zmux.INHERIT,
+        zmux.INHERIT,
+        zmux.INHERIT,
     )
-    assert o.liveness is zmux.CLEAR and o.quality_band is zmux.CLEAR
+    assert o.liveness is zmux.INHERIT and o.quality_band is zmux.INHERIT
     assert zmux.PipeLiveness().dead_timeout is zmux.INHERIT and o.fate_group == 0
     assert zmux.shaping.ShapingSizeLimits().max_slots == zmux.shaping.DEFAULT_MAX_SLOTS
     with pytest.raises(ValueError):
         zmux.QualityBand(rtt=-1)
-    assert zmux.QualityBand(rtt=None, rate_ratio=None).min_interval == 1.0
-    assert zmux.QualityBand(rtt=0, rate_ratio=0).rtt == 0  # every change
     with pytest.raises(ValueError):
         zmux.adapter.ReplayFilter(1.0, 0)
 
@@ -637,7 +649,7 @@ async def test_stream_credit_maximum_and_datagram_stream_bytes() -> None:
         with pytest.raises((ValueError, zmux.ZmuxError)):
             async with pair(client=zmux.Config(**bad)):
                 pass
-    with pytest.raises((ValueError, OverflowError)):
+    with pytest.raises(ValueError):
         zmux.Config(datagram_stream_bytes=-1)
 
 
@@ -709,7 +721,7 @@ async def _abort_relay(
     abort: zmux.helpers.SpliceAbort,
     *,
     packets: bool = False,
-) -> zmux.helpers.Spliced:
+) -> zmux.helpers.SpliceResult:
     a = await relay_in.accept_bi()
     b = await relay_out.open_bi()
     run = zmux.helpers.splice_packets if packets else zmux.helpers.splice
@@ -765,7 +777,7 @@ async def test_splice_abort_before_start_ends_at_once() -> None:
         done = await asyncio.wait_for(task, 5)
         assert done.a_to_b.end is zmux.helpers.SpliceEnd.CANCELLED
         assert done.b_to_a.code == 0
-        with pytest.raises(OverflowError):
+        with pytest.raises(ValueError):
             abort.abort(-1)
         with pytest.raises(ValueError):
             abort.abort(2**62)

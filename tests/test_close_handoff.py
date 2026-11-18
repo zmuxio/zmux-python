@@ -111,7 +111,7 @@ async def test_add_pipe_waits_for_the_attachment() -> None:
                 session.add_pipe(await zmux.dial_tcp(*addr)), 10
             )
             # Attached at return.
-            await asyncio.wait_for(pipe.attached(), 0.05)
+            await asyncio.wait_for(pipe.wait_attached(), 0.05)
             o = pipe.options
             assert o is not None and o.return_on_reply is False
             options = zmux.PipeOptions(return_on_reply=True, label="n")
@@ -123,7 +123,7 @@ async def test_add_pipe_waits_for_the_attachment() -> None:
             with pytest.raises(TypeError):
                 # Fixed when the pipe is added: not updatable.
                 quick.update(return_on_reply=False)  # type: ignore[call-arg]
-            await asyncio.wait_for(quick.attached(), 10)
+            await asyncio.wait_for(quick.wait_attached(), 10)
 
 
 async def test_add_pipe_times_out_and_leaves_no_pipe() -> None:
@@ -272,3 +272,24 @@ async def test_stop_and_reset_in_the_read_drain_raise_exits_stay_quiet() -> None
                 raise RuntimeError("boom")
         async with recv_b:  # a normal exit of a receiving part does nothing
             pass
+
+
+async def test_an_unread_fin_keeps_the_read_drain_open_for_a_late_read() -> None:
+    # The peer sends nothing but the end of its stream and then closes the
+    # session. The FIN is received and not yet read: a late read still ends
+    # with EOF, not with the session's error.
+    async with zmux.Listener(config=config()) as listener:
+        addr = await listener.serve_tcp("127.0.0.1", 0)
+        session = await zmux.connect_tcp(*addr, config=config())
+        server = await asyncio.wait_for(listener.accept(), 5)
+        send, recv = await session.open_bi()
+        await send.write(b"x")
+        reply, request = await asyncio.wait_for(server.accept_bi(), 5)
+        await asyncio.wait_for(request.read_exact(1), 5)
+        await asyncio.wait_for(reply.finish(), 5)
+        await asyncio.sleep(0.1)  # the FIN arrived and nothing read it
+        server.close(0x2A, b"done")
+        await asyncio.sleep(0.1)
+        assert await asyncio.wait_for(recv.read(4096), 5) == b""
+        await asyncio.wait_for(server.wait_closed(), 5)
+        await asyncio.wait_for(session.wait_closed(), 5)

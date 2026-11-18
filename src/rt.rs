@@ -1105,7 +1105,7 @@ impl LoopRef {
     /// Delivers what `events` reads to `deliver`, on the loop, in order. A
     /// runtime task waits for the events and hands each batch to the loop,
     /// one at a time: a loop that falls behind leaves them in the bounded
-    /// subscription, which drops the oldest. Events that reach a closed
+    /// subscription, which drops the event that arrives (and counts it). Events that reach a closed
     /// loop are dropped and counted: the count is delivered, as
     /// `HostEvent::Overflowed`, before the next event a loop bound again
     /// receives. Ends once every writer of the subscription is gone.
@@ -1156,11 +1156,7 @@ impl LoopRef {
 /// How many events `e` stands for, as `HostEvent::Overflowed` counts them.
 fn event_weight(e: &zmux::HostEvent) -> u64 {
     match e {
-        zmux::HostEvent::Overflowed(n)
-        | zmux::HostEvent::Trace {
-            record: zmux::TraceRecord::Dropped(n),
-            ..
-        } => *n,
+        zmux::HostEvent::Overflowed(n) => *n,
         _ => 1,
     }
 }
