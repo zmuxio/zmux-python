@@ -160,18 +160,24 @@ async def test_try_read_gives_back_what_a_limited_read_put_back() -> None:
 async def test_wait_readable_then_try_read_is_a_read_that_loses_nothing() -> None:
     async with pair() as (c, s):
         send, _ = await c.open_bi()
-        await send.write(b"first")
+        await send.write(b"x")
         _, recv = await s.accept_bi()
-        got = bytearray()
-        for _ in range(5):
-            try:
+        await recv.wait_readable()
+        assert recv.try_read() == b"x"
+        # Waits cancelled while nothing is readable take nothing ...
+        for _ in range(3):
+            with pytest.raises(TimeoutError):
                 async with asyncio.timeout(0.01):
                     await recv.wait_readable()
-            except TimeoutError:
-                continue
-            chunk = recv.try_read()
-            if chunk:
-                got += chunk
+        # ... so the data that comes after them is all there for the read.
+        await send.write(b"first")
+        got = bytearray()
+        async with asyncio.timeout(10):
+            while bytes(got) != b"first":
+                await recv.wait_readable()
+                chunk = recv.try_read()
+                if chunk:
+                    got += chunk
         assert bytes(got) == b"first"
 
 
