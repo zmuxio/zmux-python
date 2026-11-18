@@ -2,6 +2,7 @@
 and the next use from a running loop binds them to that loop."""
 
 import asyncio
+import time
 from collections.abc import Callable
 
 import pytest
@@ -60,18 +61,18 @@ def test_a_decider_of_a_closed_loop_refuses_at_once() -> None:
     assert len(calls) == 1
 
 
-def test_events_of_a_closed_loop_are_dropped_and_counted() -> None:
-    seen: list[tuple[str, int | None, int]] = []
+def test_events_of_a_closed_loop_are_dropped_and_not_reported() -> None:
+    seen: list[tuple[str, int]] = []
 
     class Trace(zmux.Tracer):
-        def established(self, session: int) -> None:
-            seen.append(("established", session, 0))
+        def established(self, session: zmux.SessionId) -> None:
+            seen.append(("established", session))
 
-        def dropped(self, session: int | None, count: int) -> None:
-            seen.append(("dropped", session, count))
+        def dropped(self, session: zmux.SessionId, count: int) -> None:
+            seen.append(("dropped", session))
 
-        def closed(self, session: int, reason: BaseException) -> None:
-            seen.append(("closed", session, 0))
+        def closed(self, session: zmux.SessionId, reason: BaseException) -> None:
+            seen.append(("closed", session))
 
     config = zmux.Config(tracer=Trace())
     li = zmux.Listener()
@@ -86,14 +87,12 @@ def test_events_of_a_closed_loop_are_dropped_and_counted() -> None:
 
     addr = asyncio.run(first())
     c1 = held["c"].id
-    assert seen == [("established", c1, 0)]
+    assert seen == [("established", c1)]
 
-    async def close() -> None:
-        held["s"].close()
-        await asyncio.wait_for(held["c"].wait_closed(), 5)
-
-    # The client's close is traced with its loop closed.
-    asyncio.run(close())
+    # The client's session ends with its loop closed: its `closed` is not
+    # told, and nothing is reported later.
+    held["s"].close()
+    time.sleep(0.5)
 
     async def again() -> int:
         # `li` first: its use binds it to this loop.
@@ -102,14 +101,13 @@ def test_events_of_a_closed_loop_are_dropped_and_counted() -> None:
             await zmux.connect_tcp(*addr, config=config) as c,
             await asyncio.wait_for(li.accept(), 5),
         ):
-            await until(lambda: ("established", c.id, 0) in seen)
+            await until(lambda: ("established", c.id) in seen)
             return c.id
 
-    c2 = asyncio.run(again())
-    rest = seen[1 : seen.index(("established", c2, 0))]
-    # The close reached the closed loop and was counted, or (should the
-    # next loop bind before it was read) delivered there.
-    assert rest in ([("dropped", None, 1)], [("closed", c1, 0)])
+    asyncio.run(again())
+    # Nothing of the first session was reported after its loop closed.
+    assert [e for e in seen[1:] if e[1] == c1] == []
+    assert all(k != "dropped" for k, _ in seen)
 
 
 def test_min_recheck() -> None:

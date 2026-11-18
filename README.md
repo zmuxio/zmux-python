@@ -510,13 +510,16 @@ config = zmux.Config(
 Every Python hook runs on the event loop of its `Config` or `Listener`: the
 one running when it is made, else the one running at its first use. Once
 that loop closes, hooks are answered at once without it (a deciding hook
-refuses, `redial` fails, observed events are dropped and counted) until the
+refuses, `redial` fails, observed events are dropped and not reported) until the
 next use from a running loop binds the object to that loop, so a `Config`
 can serve one `asyncio.run` after another.
-`logger` and `tracer` read a bounded queue
-there (`hook_queue`, which drops the item that arrives when it is full and
-counts it, except a session's `established` and `closed`; a `Tracer` is told the session's `Session.id`, a
-`zmux.SessionId`), and deciding hooks (`authorize_join`,
+`tracer` is told every occurrence of an event, each session's in a fixed
+backlog of 256 for the loop (an event that finds it full is dropped and
+counted in `Tracer.dropped(session, n)`, told before the next event or before
+`closed`; `established`, `dropped` and `closed` are never dropped and nothing
+follows `closed`), and `logger` is told a session's log lines through a backlog
+of 256 per session (a lost line is counted in `SessionStats.log_lines_dropped`). A `Tracer` is told the session's `Session.id`, a
+`zmux.SessionId`. Deciding hooks (`authorize_join`,
 `allow_record_mode`, `on_reject`, `session_config`, an admission decider)
 may be `async` and are cancelled at the library's deadline. Choices the
 library makes in its own calls are data: `record_policy=zmux.RecordPolicy(...)`,

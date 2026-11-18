@@ -437,14 +437,6 @@ pub(crate) fn backoff_of(v: &Bound<'_, PyAny>) -> PyResult<zmux::Backoff> {
     Ok(b)
 }
 
-/// `v`, a count, when it is at least 1.
-fn positive(name: &str, v: usize) -> PyResult<usize> {
-    if v == 0 {
-        return Err(PyValueError::new_err(format!("{name} is at least 1")));
-    }
-    Ok(v)
-}
-
 /// An integer argument: a value outside the Rust type's range (negative for
 /// an unsigned one, or too large) is `ValueError`, as every out-of-range
 /// argument is, where `PyO3` raises `OverflowError`.
@@ -514,7 +506,7 @@ impl Observers {
         use zmux::{HostEvent as H, TraceRecord as T};
         let tracer = self.tracer.as_ref().map(|t| t.bind(py));
         match (e, tracer) {
-            (H::Log { level, message }, _) => {
+            (H::Log { level, message, .. }, _) => {
                 if let Some(l) = &self.logger {
                     tell(l.bind(py), "log", || {
                         (log_level(level), message).into_pyobject(py)
@@ -534,22 +526,19 @@ impl Observers {
                             ],
                         )
                     }),
+                    T::Dropped(n) => tell(t, "dropped", || (id, n).into_pyobject(py)),
                     T::Closed(reason) => tell(t, "closed", || {
                         (id, session_err(reason).into_value(py)).into_pyobject(py)
                     }),
                     _ => {}
                 }
             }
-            (H::Overflowed(n), tracer) => {
-                // One count serves both observers: the tracer is told
-                // `dropped(None, n)` and the logger gets a warning.
-                if let Some(t) = tracer {
-                    tell(t, "dropped", || (None::<u64>, n).into_pyobject(py));
-                }
+            (H::Overflowed(n), _) => {
+                // Log lines and pressure reports lost to a full queue are
+                // counted apart from the tracer's events: the logger gets
+                // a warning, the tracer is told nothing.
                 if let Some(l) = &self.logger {
-                    let text = format!(
-                        "{n} zmux observer calls dropped: the event loop fell behind or closed"
-                    );
+                    let text = format!("{n} zmux log lines dropped: the event loop fell behind");
                     tell(l.bind(py), "log", || (30u8, text).into_pyobject(py));
                 }
             }
@@ -836,7 +825,6 @@ fn config_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     ld.set_item("probe_interval", dur(l.probe_interval))?;
     ld.set_item("probe_jitter", l.probe_jitter)?;
     d.set_item("liveness", ld)?;
-    d.set_item("hook_queue", rt::HOOK_QUEUE)?;
     Ok(d)
 }
 
@@ -857,7 +845,6 @@ fn listener_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     d.set_item("accept_sessions", l.accept_sessions)?;
     d.set_item("max_suspended", l.max_suspended)?;
     d.set_item("memory_budget", l.memory_budget)?;
-    d.set_item("hook_queue", rt::HOOK_QUEUE)?;
     Ok(d)
 }
 
@@ -871,7 +858,7 @@ impl Config {
         let lp = rt::LoopRef::lazy(py);
         let mut early = zmux::EarlyData::default();
         let (mut shaping_kinds, mut shaping_variants) = (None, None);
-        let (mut observers, mut hook_queue) = (Observers::default(), rt::HOOK_QUEUE);
+        let mut observers = Observers::default();
         for (k, v) in fields.into_iter().flatten() {
             let k: String = k.extract()?;
             let v = &v;
@@ -971,7 +958,6 @@ impl Config {
                 "redial" if hook => c.redial = Some(helpers::redial_of(v, &lp)),
                 "logger" if hook => observers.logger = Some(v.clone().unbind()),
                 "tracer" if hook => observers.tracer = Some(v.clone().unbind()),
-                "hook_queue" => hook_queue = positive(&k, field_count(&k, v)?)?,
                 "authorize_join" if hook => {
                     c.authorize_join = Some(authorize_join(v.clone().unbind(), lp.clone()));
                 }
@@ -1024,7 +1010,7 @@ impl Config {
         let observing = if observers.is_empty() {
             None
         } else {
-            let events = c.events(hook_queue);
+            let events = c.events();
             if observers.logger.is_none() {
                 c.logger = None;
             }
@@ -3435,6 +3421,7 @@ impl Session {
             pipes_added,
             pipe_failures,
             join_auth_failures,
+            log_lines_dropped,
             join_pending,
             join_batch_dropped,
             join_failures,
@@ -3801,14 +3788,12 @@ fn event_obj(py: Python<'_>, e: &zmux::SessionEvent) -> PyResult<Py<PyAny>> {
             retired,
             failed,
             closed,
-            dropped,
             last,
             ..
         } => {
             d.set_item("retired", retired)?;
             d.set_item("failed", failed)?;
             d.set_item("closed", closed)?;
-            d.set_item("dropped", dropped)?;
             d.set_item("last", last.iter().map(|p| p.get()).collect::<Vec<_>>())?;
             "PipesRetired"
         }
@@ -5458,13 +5443,12 @@ impl Listener {
             tracer: None,
             on_memory_pressure,
         };
-        let hook_queue = positive("hook_queue", get("hook_queue")?.extract()?)?;
         let mut l = zmux::ListenerConfig::default();
         // The loop of the hooks: the running one, else that of first use.
         let lp = rt::LoopRef::lazy(py);
         let mut loops = vec![lp.clone()];
         if !observers.is_empty() {
-            let events = l.events(hook_queue);
+            let events = l.events(rt::LOG_QUEUE);
             if observers.logger.is_none() {
                 l.logger = None;
             }

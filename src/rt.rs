@@ -824,7 +824,7 @@ where
 /// first used ([`LoopRef::bind`]); a call made before waits for that.
 /// Once the bound loop closes, every call on it, pending or later, is
 /// answered at once as dropped (a decider refuses, an observed event is
-/// dropped and counted), and the next use from a running loop binds that
+/// dropped and not reported), and the next use from a running loop binds that
 /// one instead.
 #[derive(Clone)]
 pub(crate) struct LoopRef(Arc<Slot>);
@@ -1094,9 +1094,11 @@ impl LoopRef {
     }
 }
 
-/// The default bound of a subscription to the observing hooks
-/// (`hook_queue`).
-pub(crate) const HOOK_QUEUE: usize = 1024;
+/// The listener's log lines and memory pressure reports a subscription to
+/// the observing hooks holds unread: these are not session lines, and the
+/// bound is the same 256 as the core's own backlogs of a session's trace
+/// records and log lines inside the subscription.
+pub(crate) const LOG_QUEUE: usize = 256;
 
 /// The most events one run on the loop delivers before it yields.
 const DELIVER_BATCH: usize = 256;
@@ -1104,11 +1106,13 @@ const DELIVER_BATCH: usize = 256;
 impl LoopRef {
     /// Delivers what `events` reads to `deliver`, on the loop, in order. A
     /// runtime task waits for the events and hands each batch to the loop,
-    /// one at a time: a loop that falls behind leaves them in the bounded
-    /// subscription, which drops the event that arrives (and counts it). Events that reach a closed
-    /// loop are dropped and counted: the count is delivered, as
-    /// `HostEvent::Overflowed`, before the next event a loop bound again
-    /// receives. Ends once every writer of the subscription is gone.
+    /// one at a time: a loop that falls behind leaves them in the
+    /// subscription, whose per-session backlog of 256 trace events drops
+    /// (and counts, as the session's `TraceRecord::Dropped`) the event that
+    /// arrives. The one exception is a loop that is closed: what it would
+    /// be told is dropped and reported nowhere, `established` and `closed`
+    /// included, until the next use from a running loop binds another.
+    /// Ends once every writer of the subscription is gone.
     pub(crate) fn observe(
         &self,
         events: zmux::HostEvents,
@@ -1116,22 +1120,15 @@ impl LoopRef {
     ) -> PyResult<()> {
         let (lp, deliver) = (self.clone(), Arc::new(deliver));
         runtime()?.spawn(async move {
-            let mut lost = 0u64;
             while let Some(first) = events.next().await {
                 // Held in the subscription until the loop is bound.
                 let At { queue, .. } = lp.at().await;
-                let weight = event_weight(&first);
                 if queue.is_closed() {
-                    lost = lost.saturating_add(weight);
                     continue;
                 }
-                let carried = std::mem::take(&mut lost);
                 let (done, delivered) = oneshot::channel::<()>();
                 let (queued, deliver) = (events.clone(), deliver.clone());
                 queue.push(Box::new(move |py| {
-                    if carried > 0 {
-                        deliver(py, zmux::HostEvent::Overflowed(carried));
-                    }
                     deliver(py, first);
                     for _ in 1..DELIVER_BATCH {
                         match queued.try_next() {
@@ -1142,22 +1139,12 @@ impl LoopRef {
                     let _ = done.send(());
                 }));
                 drop(queue);
-                if delivered.await.is_err() {
-                    // The loop closed with the batch queued: only what it
-                    // took is lost; the rest stays in the subscription.
-                    lost = lost.saturating_add(weight).saturating_add(carried);
-                }
+                // A loop that closed with the batch queued drops what it
+                // took; the rest stays in the subscription.
+                let _ = delivered.await;
             }
         });
         Ok(())
-    }
-}
-
-/// How many events `e` stands for, as `HostEvent::Overflowed` counts them.
-fn event_weight(e: &zmux::HostEvent) -> u64 {
-    match e {
-        zmux::HostEvent::Overflowed(n) => *n,
-        _ => 1,
     }
 }
 

@@ -654,66 +654,94 @@ async def test_stuck_policies_hold_no_thread_and_stop_ends_the_wait() -> None:
                     await asyncio.sleep(0.005)
 
 
-# ---- the hook queue ----------------------------------------------------------------------------
+# ---- the tracer backlog ------------------------------------------------------------------------
 
 
-async def test_a_full_hook_queue_drops_what_arrives_and_never_the_end() -> None:
-    """With the loop blocked the bounded queue fills: the items that arrive are
-    counted in `dropped`, and `established` and `closed` still come."""
-    seen: list[tuple[str, int | None]] = []
+async def test_a_blocked_loop_costs_a_session_its_newest_events_and_never_the_end() -> (
+    None
+):
+    """With delivery held the session's backlog of 256 events fills: the events
+    that arrive are counted in the session's own `dropped`, told before the
+    next event delivered, and `established` and `closed` still come."""
+    seen: list[tuple[str, int, int]] = []
     logged: list[str] = []
+    changes = 300
+    entered = threading.Event()
+    gate = threading.Event()
 
     class Log:
         def log(self, level: int, message: str) -> None:
             logged.append(message)
 
     class Trace(zmux.Tracer):
-        def established(self, session: int) -> None:
-            seen.append(("established", session))
+        def established(self, session: zmux.SessionId) -> None:
+            seen.append(("established", session, 0))
 
-        def event(self, session: int, event: zmux.Event) -> None:
-            seen.append(("event", session))
+        def event(self, session: zmux.SessionId, event: zmux.Event) -> None:
+            if isinstance(event, zmux.PipePriorityChanged):
+                seen.append(("change", session, 0))
+                if not entered.is_set():
+                    # Delivery stands in this call, on the loop, until the
+                    # test opens the gate.
+                    entered.set()
+                    assert gate.wait(30)
+            else:
+                seen.append(("event", session, 0))
 
-        def dropped(self, session: int | None, count: int) -> None:
-            seen.append(("dropped", count))
+        def dropped(self, session: zmux.SessionId, count: int) -> None:
+            seen.append(("dropped", session, count))
 
-        def closed(self, session: int, reason: BaseException) -> None:
-            seen.append(("closed", session))
+        def closed(self, session: zmux.SessionId, reason: BaseException) -> None:
+            seen.append(("closed", session, 0))
 
     config = zmux.Config(
         max_pipes=8,
         pipe_auth=zmux.PipeAuth.psk(b"k" * 32).with_end_to_end(),
         tracer=Trace(),
         logger=Log(),
-        hook_queue=1,
     )
     async with zmux.Listener(config=POOL_CONFIG, listener_config=LISTENER) as listener:
         addr = await listener.serve_tcp("127.0.0.1", 0)
         client = await zmux.connect_tcp(*addr, config=config)
         server = await listener.accept()
-        pipes = [await client.add_pipe(await zmux.dial_tcp(*addr)) for _ in range(6)]
-        for p in pipes:
-            await p.wait_attached()
-        await until(lambda: ("established", client.id) in seen)
-        await asyncio.sleep(0.2)
-        seen.clear()
-        # The peer ends its pipes, then the session, while the loop is held:
-        # the runtime queues what the tracer would be told.
-        for p in server.pipes()[1:]:
-            p.close()
-        time.sleep(0.3)
+        pipe = await client.add_pipe(await zmux.dial_tcp(*addr))
+        await pipe.wait_attached()
+        await until(lambda: ("established", client.id, 0) in seen)
+
+        def produce() -> None:
+            # The first change reaches the tracer, which holds delivery in its
+            # call; the rest are produced while it does, then it is released.
+            pipe.update(send_priority=3)
+            assert entered.wait(30)
+            for i in range(1, changes):
+                pipe.update(send_priority=3 + i % 2)
+            gate.set()
+
+        try:
+            await asyncio.to_thread(produce)
+        finally:
+            gate.set()
+        # The tracer was told the change it held and, once delivery resumed, what
+        # the backlog of 256 kept; the rest were lost in place. (Another event of
+        # the session may take a backlog place too, so the count is a bound.)
+        kept = 1 + 256
+        # The next event accepted is told after the count of what was lost.
+        pipe.update(send_priority=9)
+        await until(lambda: any(k == "dropped" for k, _, _ in seen))
+        at = next(i for i, (k, _, _) in enumerate(seen) if k == "dropped")
+        told = [k for k, _, _ in seen[:at]].count("change")
+        assert seen[at][1] == client.id
+        assert told <= kept
+        assert seen[at][2] >= changes - told
+        await until(lambda: any(k == "change" for k, _, _ in seen[at + 1 :]))
+        assert [k for k, _, _ in seen].count("dropped") == 1
+        # The lost events are the tracer's: the logger is told nothing of them.
+        assert not any("dropped" in m for m in logged)
         server.close()
-        time.sleep(0.3)
-        await until(lambda: ("closed", client.id) in seen)
-        dropped = sum(n or 0 for k, n in seen if k == "dropped")
-        assert dropped > 0
-        # The one count reaches the logger too, as a warning.
-        await until(lambda: any("dropped" in m for m in logged))
-        # What reached the tracer is in order: no `event` after the end.
-        assert [k for k, _ in seen if k == "closed"] == ["closed"]
-        assert seen.index(("closed", client.id)) == max(
-            i for i, (k, _) in enumerate(seen) if k in ("closed", "event")
-        )
+        await until(lambda: ("closed", client.id, 0) in seen)
+        # `closed` is the last call.
+        assert seen[-1] == ("closed", client.id, 0)
+        assert [k for k, _, _ in seen].count("closed") == 1
         server.abort(0)
         await server.wait_closed()
 
@@ -752,3 +780,8 @@ async def test_a_stream_datagram_takes_any_buffer() -> None:
         send, _recv = await c.open_bi()
         for payload in (b"abc", bytearray(b"abc"), memoryview(b"abc")):
             send.send_datagram(payload)
+
+
+async def test_log_lines_dropped_is_a_session_statistic() -> None:
+    async with pair() as (c, _s):
+        assert c.stats().log_lines_dropped == 0

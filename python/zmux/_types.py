@@ -882,6 +882,7 @@ class SessionStats:
     pipes_added: int
     pipe_failures: int
     join_auth_failures: int
+    log_lines_dropped: int
     join_pending: int
     join_batch_dropped: int
     join_failures: int
@@ -997,7 +998,9 @@ class PipeClosed(Event):
 
 @dataclass(frozen=True, slots=True)
 class JoinAuthFailed(Event):
-    """`count` joins failed authentication since the last such event."""
+    """`count` joins failed with this `reason` since the last such event was
+    read (one event per reason, `count` at least 1; a `Tracer` gets one event
+    per failure, with `count` 1)."""
 
     kind: ClassVar[EventKind] = EventKind.JOIN_AUTH_FAILED
     reason: str
@@ -1088,13 +1091,17 @@ class ResumeUnattended(Event):
 
 @dataclass(frozen=True, slots=True)
 class PipesRetired(Event):
-    """Pipes were retired; `last` holds up to four of their IDs, oldest first."""
+    """Pipes were retired since the last such event was read; `last` holds up
+    to four of their IDs, oldest first. `failed` counts the retired pipes that
+    ended failed and `closed` the others, those whose terminal state the
+    application had not read (a `PipeFailed` or `PipeClosed` of the pipe; one
+    never queued counts as unread). A `Tracer` gets one per retired pipe, with
+    `retired` 1 and the pipe in `failed` or in `closed`."""
 
     kind: ClassVar[EventKind] = EventKind.PIPES_RETIRED
     retired: int
     failed: int
     closed: int
-    dropped: int
     last: tuple[PipeId, ...]
 
 
@@ -1965,9 +1972,13 @@ class Tracer:
     method runs on the `Config`'s event loop, in order
     (every session of the `Config` tells the one tracer, each session's
     calls in its own order), and an exception is reported as unraisable.
-    The calls wait for the loop in a queue of `Config.hook_queue` entries:
-    past it the call that arrives is dropped and counted in the next
-    `dropped`; `established` and `closed` are never dropped."""
+    Each session has a backlog of 256 events for the loop, fixed: an event
+    that finds it full is dropped and counted in a `dropped` of that
+    session, which is told before the next event delivered or before
+    `closed`; `established`, `dropped` and `closed` take no room from the
+    backlog and are never dropped, and `closed` is the last call. The one
+    exception is a closed loop: nothing is delivered then, `established`
+    and `closed` included, and nothing is reported afterwards."""
 
     def established(self, session: SessionId) -> None:
         """The session `session` (its `Session.id`) was established."""
@@ -1975,12 +1986,10 @@ class Tracer:
     def event(self, session: SessionId, event: Event) -> None:
         """A session event."""
 
-    def dropped(self, session: SessionId | None, count: int) -> None:
-        """`count` calls to the tracer or the logger were dropped before the
-        next one delivered (the queue to the event loop was full, or the loop
-        closed). The count belongs to no single session, so `session` is
-        always `None`. A `logger` set as well gets a warning with the same
-        count."""
+    def dropped(self, session: SessionId, count: int) -> None:
+        """`count` events of the session `session` were dropped here, before
+        the next event delivered or before `closed`: its backlog of 256
+        events for the event loop was full."""
 
     def closed(self, session: SessionId, reason: BaseException) -> None:
         """The session ended, with the reason (the error `Session` calls
@@ -2039,9 +2048,8 @@ class Config:
     then waits for it. Once that loop closes (the end of an `asyncio.run`),
     what reaches a hook is answered at once without it: a deciding hook
     refuses, a call such as `redial` fails, and the events of `logger` and
-    `tracer` are dropped and counted (`Tracer.dropped(None, n)` and a
-    warning to the logger, before the next event delivered). The next use
-    from a running loop binds the `Config` to that loop.
+    `tracer` are dropped and not reported. The next use from a running
+    loop binds the `Config` to that loop.
 
     Scheduling: `scheduler` (`Scheduler.AFFINITY`), `spread_chunk`,
     `probation` (`AUTO`, derived from the pipe's RTT; `None` off; else the
@@ -2071,10 +2079,11 @@ class Config:
     `logging.Logger`) receives zmux's warnings; `tracer` (a `Tracer`)
     receives every event in order beside the event stream. Both run on the
     `Config`'s event loop, never on the library's threads: what
-    they are told waits for the loop in a queue of `hook_queue` (1024, at
-    least 1) entries, past which the item that arrives is dropped (`Tracer.dropped`,
-    or a warning to `logger`; a session's `established` and `closed` are never
-    dropped);
+    they are told waits for the loop, each session's tracer events in a
+    backlog of 256 (fixed; past it the event that arrives is dropped and
+    counted in `Tracer.dropped`; `established`, `dropped` and `closed` are
+    never dropped) and its log lines in a backlog of 256 (fixed; a lost line is
+    counted in `SessionStats.log_lines_dropped`, never in `Tracer.dropped`);
     `shaping_limits`, `shaping_budget`, `shaping` (definitions by carrier
     kind, `None` key the default), `shaping_by_variant` (by carrier variant,
     first), `handshake_shaper` and `shaping_bundle`. A hook left at `None`
@@ -2138,7 +2147,6 @@ class Config:
     protocols: tuple[str, ...] | None = None
     logger: logging.Logger | None = field(default=None, repr=False, compare=False)
     tracer: Tracer | None = field(default=None, repr=False, compare=False)
-    hook_queue: int = _DEFAULTS["hook_queue"]
     shaping_limits: ShapingLimits = ShapingLimits()
     shaping_budget: ShapingBudget | None = None
     handshake_shaper: ShapingBundle | None = field(
@@ -2245,8 +2253,8 @@ class ListenerConfig:
     without a byte, counted as `rejected`. `logger` receives the failures of
     the listener's own callbacks that it contains; its sessions log through
     their `Config.logger`. `logger` and `on_memory_pressure` run on the
-    listener's event loop, through a queue of `hook_queue` (1024,
-    at least 1) entries past which the item that arrives is dropped."""
+    listener's event loop, through a queue of their own past which the
+    item that arrives is dropped (counted in a warning to `logger`)."""
 
     max_pending: int | None = _LISTENER["max_pending"]
     max_pending_per_source: int = _LISTENER["max_pending_per_source"]
@@ -2279,7 +2287,6 @@ class ListenerConfig:
         Callable[[SessionCarrier], Config | Awaitable[Config | None] | None] | None
     ) = field(default=None, compare=False)
     logger: logging.Logger | None = field(default=None, repr=False, compare=False)
-    hook_queue: int = _LISTENER["hook_queue"]
 
 
 @dataclass(frozen=True, kw_only=True)
