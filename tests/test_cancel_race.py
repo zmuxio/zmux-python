@@ -238,7 +238,9 @@ async def test_events(order: str, by_iteration: bool) -> None:
     )
     async with zmux.Listener(
         config=config,
-        listener_config=zmux.ListenerConfig(instance_id=b"instance", max_suspended=16),
+        listener_config=zmux.ListenerConfig(
+            instance_id=b"instance", limits=zmux.ListenerLimits(max_suspended=16)
+        ),
     ) as listener:
         addr = await listener.serve_tcp("127.0.0.1", 0)
         async with (
@@ -350,7 +352,9 @@ async def test_blocked_next_event_gets_the_result(order: str) -> None:
     )
     async with zmux.Listener(
         config=config,
-        listener_config=zmux.ListenerConfig(instance_id=b"instance", max_suspended=16),
+        listener_config=zmux.ListenerConfig(
+            instance_id=b"instance", limits=zmux.ListenerLimits(max_suspended=16)
+        ),
     ) as listener:
         addr = await listener.serve_tcp("127.0.0.1", 0)
         async with (

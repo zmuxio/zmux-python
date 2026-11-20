@@ -843,23 +843,30 @@ fn config_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     Ok(d)
 }
 
-/// The library's defaults of the `zmux.ListenerConfig` fields that hold
+/// The fields of a `zmux.ListenerLimits`.
+fn limits_dict<'p>(py: Python<'p>, l: &zmux::ListenerLimits) -> PyResult<Bound<'p, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("max_pending", l.max_pending)?;
+    d.set_item("max_pending_per_source", l.max_pending_per_source)?;
+    d.set_item("max_pending_per_session", l.max_pending_per_session)?;
+    d.set_item("max_suspended", l.max_suspended)?;
+    d.set_item("first_record_timeout", l.first_record_timeout.as_secs_f64())?;
+    d.set_item("memory_budget", l.memory_budget)?;
+    Ok(d)
+}
+
+/// The library's defaults of the `zmux.ListenerConfig` and
+/// `zmux.ListenerLimits` fields that hold
 /// values, the one source of the Python defaults.
 #[pyfunction(name = "_listener_defaults")]
 fn listener_defaults(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     let l = zmux::ListenerConfig::default();
-    let d = PyDict::new(py);
-    d.set_item("max_pending", l.max_pending)?;
-    d.set_item("max_pending_per_source", l.max_pending_per_source)?;
+    let d = limits_dict(py, &l.limits)?;
     d.set_item("source_prefix_v4", l.source_prefix_v4)?;
     d.set_item("source_prefix_v6", l.source_prefix_v6)?;
-    d.set_item("max_pending_per_session", l.max_pending_per_session)?;
-    d.set_item("first_record_timeout", l.first_record_timeout.as_secs_f64())?;
     d.set_item("handshake_timeout", l.handshake_timeout.as_secs_f64())?;
     d.set_item("max_record_size", l.max_record_size)?;
     d.set_item("accept_sessions", l.accept_sessions)?;
-    d.set_item("max_suspended", l.max_suspended)?;
-    d.set_item("memory_budget", l.memory_budget)?;
     Ok(d)
 }
 
@@ -5422,6 +5429,27 @@ impl Listener {
     }
 }
 
+/// A timeout without an off setting, in seconds.
+fn required_seconds(name: &str, v: Option<f64>) -> PyResult<Duration> {
+    v.ok_or_else(|| PyValueError::new_err(format!("{name} has no off setting: give a value")))
+        .and_then(|v| seconds(name, v))
+}
+
+/// The limits of a `zmux.ListenerLimits`.
+fn listener_limits(o: &Bound<'_, PyAny>) -> PyResult<zmux::ListenerLimits> {
+    let mut l = zmux::ListenerLimits::default();
+    l.max_pending = o.getattr("max_pending")?.extract()?;
+    l.max_pending_per_source = o.getattr("max_pending_per_source")?.extract()?;
+    l.max_pending_per_session = o.getattr("max_pending_per_session")?.extract()?;
+    l.max_suspended = o.getattr("max_suspended")?.extract()?;
+    l.first_record_timeout = required_seconds(
+        "first_record_timeout",
+        o.getattr("first_record_timeout")?.extract()?,
+    )?;
+    l.memory_budget = o.getattr("memory_budget")?.extract()?;
+    Ok(l)
+}
+
 #[pymethods]
 impl Listener {
     #[new]
@@ -5436,17 +5464,12 @@ impl Listener {
             None => types(py)?.getattr("ListenerConfig")?.call0()?,
         };
         let get = |n: &str| lc.getattr(n);
-        let max_pending: Option<usize> = get("max_pending")?.extract()?;
-        let max_pending_per_source: usize = get("max_pending_per_source")?.extract()?;
+        let limits = listener_limits(&get("limits")?)?;
         let source_prefix_v4: i64 = get("source_prefix_v4")?.extract()?;
         let source_prefix_v6: i64 = get("source_prefix_v6")?.extract()?;
-        let max_pending_per_session: usize = get("max_pending_per_session")?.extract()?;
-        let first_record_timeout: Option<f64> = get("first_record_timeout")?.extract()?;
         let handshake_timeout: Option<f64> = get("handshake_timeout")?.extract()?;
         let max_record_size: u64 = get("max_record_size")?.extract()?;
         let accept_sessions: bool = get("accept_sessions")?.extract()?;
-        let max_suspended: usize = get("max_suspended")?.extract()?;
-        let memory_budget: Option<u64> = get("memory_budget")?.extract()?;
         let instance_id: Vec<u8> = get("instance_id")?.extract()?;
         let on_memory_pressure = Some(get("on_memory_pressure")?)
             .filter(|f| !f.is_none())
@@ -5498,23 +5521,12 @@ impl Listener {
             trusted = trusted.with_forwarded_header(h);
         }
         l.trusted_proxies = trusted;
-        l.max_pending = max_pending;
-        l.max_pending_per_source = max_pending_per_source;
+        l.limits = limits;
         l.source_prefix_v4 = prefix_bits("source_prefix_v4", source_prefix_v4, 32)?;
         l.source_prefix_v6 = prefix_bits("source_prefix_v6", source_prefix_v6, 128)?;
-        l.max_pending_per_session = max_pending_per_session;
-        let timeout = |name: &str, v: Option<f64>| {
-            v.ok_or_else(|| {
-                PyValueError::new_err(format!("{name} has no off setting: give a value"))
-            })
-            .and_then(|v| seconds(name, v))
-        };
-        l.first_record_timeout = timeout("first_record_timeout", first_record_timeout)?;
-        l.handshake_timeout = timeout("handshake_timeout", handshake_timeout)?;
+        l.handshake_timeout = required_seconds("handshake_timeout", handshake_timeout)?;
         l.max_record_size = max_record_size;
         l.accept_sessions = accept_sessions;
-        l.max_suspended = max_suspended;
-        l.memory_budget = memory_budget;
         l.instance_id = instance_id;
         if l.instance_id.len() > zmux::MAX_INSTANCE_ID_LEN {
             return Err(PyValueError::new_err(format!(
@@ -5860,6 +5872,20 @@ impl Listener {
         types(py)?
             .getattr("AdmissionVariants")?
             .call1((variants, of(&v.overflow)?))
+    }
+
+    /// The limits in effect, as a `zmux.ListenerLimits`.
+    fn limits<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+        let d = limits_dict(py, &self.inner.limits())?;
+        types(py)?.getattr("ListenerLimits")?.call((), Some(&d))
+    }
+
+    /// Replaces the limits of a `zmux.ListenerLimits`.
+    #[pyo3(signature = (limits, /))]
+    fn set_limits(&self, limits: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.inner
+            .set_limits(listener_limits(limits)?)
+            .map_err(config_err)
     }
 
     /// What happened to the listener's carriers: counts since it was made.

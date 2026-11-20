@@ -20,6 +20,7 @@ from ._types import (
     Event,
     InboundState,
     Limiter,
+    ListenerLimits,
     ListenerStats,
     OutboundState,
     Packet,
@@ -2035,6 +2036,18 @@ class Listener:
         """The admission's verdicts on the carriers it labelled, per label."""
     def stats(self) -> ListenerStats:
         """What happened to the carriers handed to the listener: counts since it was made."""
+    def limits(self) -> ListenerLimits:
+        """The limits in effect."""
+    def set_limits(self, limits: ListenerLimits, /) -> None:
+        """Replaces the listener's limits; invalid ones raise
+        `InvalidArgumentError` and change nothing. New carriers and the next
+        decisions on held ones use them at once: lowered pending bounds
+        refuse or displace new carriers but close none already held, a
+        lowered `max_pending_per_session` applies to the next join, a
+        lowered `max_suspended` closes the longest-suspended sessions beyond
+        it, a changed `first_record_timeout` applies to carriers that
+        arrive after the call, and a changed `memory_budget` applies at once,
+        as if the sum crossed it."""
     async def __aenter__(self) -> Self: ...
     async def __aexit__(
         self,

@@ -2209,31 +2209,55 @@ class Config:
 _LISTENER: Final[dict[str, Any]] = _zmux._listener_defaults()
 
 
+@dataclass(frozen=True, kw_only=True, slots=True)
+class ListenerLimits:
+    """The bounds of a `Listener` that `Listener.set_limits` changes while it
+    runs; `ListenerConfig.limits` gives the initial values, and the listener
+    holds the live ones. `max_pending` (1024; `None`: unlimited) bounds every
+    carrier before it enters a session, from its source slot through the
+    outer handshake, the admission, the transform, classification and join
+    verification; when it is full the oldest stalled carrier makes room,
+    else the new one is closed. `max_pending_per_source` (8, at least 2)
+    bounds those of one source (counted as `ListenerConfig.source_prefix_v4`
+    and `source_prefix_v6` say). `max_pending_per_session` (4) bounds the
+    pending joins of one session. `max_suspended` (1024) bounds the
+    suspended sessions. `first_record_timeout` (2 s; no off setting) bounds
+    a carrier's first record. `memory_budget` (1 GiB; `None`: unlimited)
+    bounds what the sessions hold together, in place of their own
+    `Config.memory_budget`; a change applies at once, as if the sum crossed
+    the new bound (the `on_memory_pressure` hook is told). The rest of the
+    `ListenerConfig` is fixed for the listener's life; the bounds of a
+    session are its `Config`, which `session_config` answers for every new
+    session. Change one with `dataclasses.replace(listener.limits(), ...)`."""
+
+    max_pending: int | None = _LISTENER["max_pending"]
+    max_pending_per_source: int = _LISTENER["max_pending_per_source"]
+    max_pending_per_session: int = _LISTENER["max_pending_per_session"]
+    max_suspended: int = _LISTENER["max_suspended"]
+    first_record_timeout: float = _LISTENER["first_record_timeout"]
+    memory_budget: int | None = _LISTENER["memory_budget"]
+
+
 @dataclass(frozen=True, kw_only=True)
 class ListenerConfig:
     """The configuration of a `Listener` besides its sessions' `Config`:
     what it takes in, and how it judges carriers. A keyword left out keeps
     the library's default; durations are seconds.
 
-    Bounds: `max_pending` (1024; `None`: unlimited) bounds every carrier
-    before it enters a session, from its source slot through the outer
-    handshake, the admission, the transform, classification and join
-    verification; when it is full the oldest stalled carrier makes room,
-    else the new one is closed. `max_pending_per_source` (8) bounds those of
-    one source, a source counted by its first `source_prefix_v4` bits (1 to
-    32, default 32: the address on its own) when IPv4 and its first
-    `source_prefix_v6` bits (1 to 128, default 64) when IPv6, ports ignored
-    and an IPv4-mapped IPv6 address counted as IPv4; the same aggregation
-    serves the source's stalled carriers, the stall duration and the limit
-    on failed join verifications, and a value outside its range raises
-    `ValueError`. `max_pending_per_session` (4) bounds the pending joins of
-    one session. `first_record_timeout` (2 s) and `handshake_timeout` (10 s)
-    bound carriers that have not proved anything; they have no off setting.
-    `max_record_size` (65535), `accept_sessions` (`True`), `max_suspended`
-    (1024), `memory_budget` (1 GiB; `None`: unlimited). `instance_id` (at
-    most 8 bytes) starts every session locator, for load-balancer
-    stickiness. `on_memory_pressure(used, budget, active)` is called when
-    memory pressure starts and ends.
+    Bounds: `limits` (a `ListenerLimits`) holds the initial values of the
+    bounds `Listener.set_limits` changes while it runs. A source is counted
+    by its first `source_prefix_v4` bits (1 to 32, default 32: the address
+    on its own) when IPv4 and its first `source_prefix_v6` bits (1 to 128,
+    default 64) when IPv6, ports ignored and an IPv4-mapped IPv6 address
+    counted as IPv4; the same aggregation serves the per-source bound, the
+    source's stalled carriers, the stall duration and the limit on failed
+    join verifications, and a value outside its range raises `ValueError`.
+    `handshake_timeout` (10 s) bounds carriers that have not proved
+    anything; it has no off setting. `max_record_size` (65535),
+    `accept_sessions` (`True`).
+    `instance_id` (at most 8 bytes) starts every session locator, for
+    load-balancer stickiness. `on_memory_pressure(used, budget, active)` is
+    called when memory pressure starts and ends.
 
     Behind reverse proxies, load balancers or CDNs, `trusted_proxies` lists
     their networks (`"10.0.0.0/8"`, a bare address): a carrier from one of
@@ -2245,7 +2269,7 @@ class ListenerConfig:
 
     Judgement: `admission` applies at every entry (every `serve_*` and
     `handle_pipe`), in one order: the carrier takes a slot of its source's
-    `max_pending_per_source` (refused at once beyond it), then its outer
+    `limits.max_pending_per_source` (refused at once beyond it), then its outer
     handshake (TLS, HTTP upgrade, QUIC), then the admission, then its first
     record. `inbound_transform(pipe, hint)` runs once for every carrier
     after its admission and before its first record, each half of a split
@@ -2296,17 +2320,12 @@ class ListenerConfig:
     listener's event loop, through a queue of their own past which the
     item that arrives is dropped (counted in a warning to `logger`)."""
 
-    max_pending: int | None = _LISTENER["max_pending"]
-    max_pending_per_source: int = _LISTENER["max_pending_per_source"]
+    limits: ListenerLimits = ListenerLimits()
     source_prefix_v4: int = _LISTENER["source_prefix_v4"]
     source_prefix_v6: int = _LISTENER["source_prefix_v6"]
-    max_pending_per_session: int = _LISTENER["max_pending_per_session"]
-    first_record_timeout: float = _LISTENER["first_record_timeout"]
     handshake_timeout: float = _LISTENER["handshake_timeout"]
     max_record_size: int = _LISTENER["max_record_size"]
     accept_sessions: bool = _LISTENER["accept_sessions"]
-    max_suspended: int = _LISTENER["max_suspended"]
-    memory_budget: int | None = _LISTENER["memory_budget"]
     instance_id: bytes = b""
     on_memory_pressure: Callable[[int, int, bool], object] | None = field(
         default=None, compare=False

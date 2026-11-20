@@ -320,8 +320,10 @@ async def _no_dial() -> zmux.PipeIo:
 
 
 def test_listener_takes_its_configuration_as_a_dataclass() -> None:
-    lc = zmux.ListenerConfig(max_suspended=5, instance_id=b"a")
-    assert lc.max_pending == 1024 and lc.first_record_timeout == 2.0
+    lc = zmux.ListenerConfig(
+        limits=zmux.ListenerLimits(max_suspended=5), instance_id=b"a"
+    )
+    assert lc.limits.max_pending == 1024 and lc.limits.first_record_timeout == 2.0
     with pytest.raises(TypeError):
         zmux.Listener(zmux.Config())  # type: ignore[call-arg]  # keyword-only
     with pytest.raises(TypeError):

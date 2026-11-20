@@ -558,8 +558,10 @@ synchronously or `async`. An accept's `value` is the carrier's admitted
 value (`session.admitted`, `pipe.admitted`). A carrier credential of your own is any object with
 `prefix(info)` and `header(info)` (`zmux.CarrierCredential`).
 `Listener(config=..., listener_config=...)` takes the sessions' `Config` and
-the listener's own `ListenerConfig`, whose `max_pending` (1024; `None`:
-unlimited) bounds every carrier before it enters a session.
+the listener's own `ListenerConfig`, whose `limits` (a `ListenerLimits`)
+hold the initial bounds that `listener.set_limits(...)` changes while it runs
+(`listener.limits()` reads them): `max_pending` (1024; `None`: unlimited)
+bounds every carrier before it enters a session.
 `max_pending_per_source` counts a source by its prefix, `source_prefix_v4`
 (1 to 32, default 32) for IPv4 and `source_prefix_v6` (1 to 128, default 64)
 for IPv6; a value outside its range raises `ValueError`.

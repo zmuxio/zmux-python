@@ -325,7 +325,9 @@ async def test_session_getters_read_unset_as_none() -> None:
 POOL_CONFIG = zmux.Config(
     max_pipes=8, pipe_auth=zmux.PipeAuth.psk(b"k" * 32).with_end_to_end()
 )
-LISTENER = zmux.ListenerConfig(instance_id=b"instance", max_suspended=16)
+LISTENER = zmux.ListenerConfig(
+    instance_id=b"instance", limits=zmux.ListenerLimits(max_suspended=16)
+)
 
 
 @contextlib.asynccontextmanager

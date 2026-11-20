@@ -364,16 +364,18 @@ def test_classify_first_bytes() -> None:
 
 
 async def test_listener_timeouts_are_floats() -> None:
-    for name in ("first_record_timeout", "handshake_timeout"):
+    no_first = zmux.ListenerLimits(
+        **cast("dict[str, Any]", {"first_record_timeout": None})
+    )
+    for lc in (
+        zmux.ListenerConfig(limits=no_first),
+        zmux.ListenerConfig(**cast("dict[str, Any]", {"handshake_timeout": None})),
+    ):
         with pytest.raises(ValueError):  # no off setting
-            zmux.Listener(
-                listener_config=zmux.ListenerConfig(
-                    **cast("dict[str, Any]", {name: None})
-                )
-            )
+            zmux.Listener(listener_config=lc)
     async with zmux.Listener(
         listener_config=zmux.ListenerConfig(
-            first_record_timeout=1.0, handshake_timeout=5.0
+            limits=zmux.ListenerLimits(first_record_timeout=1.0), handshake_timeout=5.0
         )
     ) as li:
         addr = await li.serve_tcp("127.0.0.1", 0)

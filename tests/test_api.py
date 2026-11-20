@@ -3,6 +3,7 @@
 import asyncio
 import threading
 import contextlib
+import dataclasses
 import datetime
 import math
 from collections.abc import AsyncIterator, Callable
@@ -136,6 +137,23 @@ def test_none_only_where_a_field_has_an_off_setting() -> None:
     ):
         with pytest.raises(TypeError):
             zmux.Config(**cast("dict[str, Any]", {gone: 1}))
+
+
+async def test_listener_set_limits() -> None:
+    lc = zmux.ListenerConfig(
+        limits=zmux.ListenerLimits(max_suspended=3, max_pending=None)
+    )
+    async with zmux.Listener(listener_config=lc) as listener:
+        lim = listener.limits()
+        assert lim == zmux.ListenerLimits(max_suspended=3, max_pending=None)
+        with pytest.raises(zmux.InvalidArgumentError):
+            listener.set_limits(dataclasses.replace(lim, max_pending_per_source=1))
+        assert listener.limits() == lim
+        new = dataclasses.replace(
+            lim, max_pending=7, first_record_timeout=0.5, memory_budget=None
+        )
+        listener.set_limits(new)
+        assert listener.limits() == new
 
 
 async def test_hold_first_flight() -> None:
@@ -591,7 +609,9 @@ def test_negative_durations_raise() -> None:
             listener_config=zmux.ListenerConfig(handshake_timeout=-1)
         ),
         lambda: zmux.Listener(
-            listener_config=zmux.ListenerConfig(first_record_timeout=float("nan"))
+            listener_config=zmux.ListenerConfig(
+                limits=zmux.ListenerLimits(first_record_timeout=float("nan"))
+            )
         ),
         lambda: zmux.CarrierCache(success_ttl=-1),
         lambda: zmux.ExchangeOptions(idle_timeout=-1),

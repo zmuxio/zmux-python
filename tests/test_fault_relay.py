@@ -89,7 +89,9 @@ async def test_a_black_hole_is_found_by_the_probe() -> None:
     config = _config()
     async with zmux.Listener(
         config=config,
-        listener_config=zmux.ListenerConfig(instance_id=b"instance", max_suspended=16),
+        listener_config=zmux.ListenerConfig(
+            instance_id=b"instance", limits=zmux.ListenerLimits(max_suspended=16)
+        ),
     ) as listener:
         addr = await listener.serve_tcp("127.0.0.1", 0)
         relay = Relay(addr)
@@ -134,7 +136,9 @@ async def test_the_last_pipe_cut_resumes_without_loss() -> None:
     config = _config()
     async with zmux.Listener(
         config=config,
-        listener_config=zmux.ListenerConfig(instance_id=b"instance", max_suspended=16),
+        listener_config=zmux.ListenerConfig(
+            instance_id=b"instance", limits=zmux.ListenerLimits(max_suspended=16)
+        ),
     ) as listener:
         addr = await listener.serve_tcp("127.0.0.1", 0)
         relay = Relay(addr)

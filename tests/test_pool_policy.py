@@ -66,7 +66,9 @@ async def test_pool_count_and_age_retire() -> None:
     )
     async with zmux.Listener(
         config=config,
-        listener_config=zmux.ListenerConfig(instance_id=b"instance", max_suspended=16),
+        listener_config=zmux.ListenerConfig(
+            instance_id=b"instance", limits=zmux.ListenerLimits(max_suspended=16)
+        ),
     ) as listener:
         addr = await listener.serve_tcp("127.0.0.1", 0)
         dials: list[int] = []
@@ -169,7 +171,9 @@ async def test_pool_policy_probe_settings_reach_new_pipes() -> None:
     )
     async with zmux.Listener(
         config=config,
-        listener_config=zmux.ListenerConfig(instance_id=b"instance", max_suspended=16),
+        listener_config=zmux.ListenerConfig(
+            instance_id=b"instance", limits=zmux.ListenerLimits(max_suspended=16)
+        ),
     ) as listener:
         addr = await listener.serve_tcp("127.0.0.1", 0)
 
@@ -290,7 +294,9 @@ async def _session_pool(
     """Runs `run(session, first_pipe, dial)` on a client of a listener."""
     async with zmux.Listener(
         config=config,
-        listener_config=zmux.ListenerConfig(instance_id=b"instance", max_suspended=16),
+        listener_config=zmux.ListenerConfig(
+            instance_id=b"instance", limits=zmux.ListenerLimits(max_suspended=16)
+        ),
     ) as listener:
         addr = await listener.serve_tcp("127.0.0.1", 0)
 
@@ -465,7 +471,9 @@ async def test_join_pool_keeps_groups_up_whole() -> None:
     )
     async with zmux.Listener(
         config=config,
-        listener_config=zmux.ListenerConfig(instance_id=b"instance", max_suspended=16),
+        listener_config=zmux.ListenerConfig(
+            instance_id=b"instance", limits=zmux.ListenerLimits(max_suspended=16)
+        ),
     ) as listener:
         addr = await listener.serve_tcp("127.0.0.1", 0)
         joins: list[list[zmux.Pipe]] = []

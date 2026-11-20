@@ -238,7 +238,7 @@ async def test_held_carriers_count_per_source() -> None:
     )
     async with zmux.Listener(
         listener_config=zmux.ListenerConfig(
-            max_pending_per_source=2, admission=admission
+            limits=zmux.ListenerLimits(max_pending_per_source=2), admission=admission
         )
     ) as listener:
         host, port = await listener.serve_tcp("127.0.0.1", 0)
@@ -562,7 +562,9 @@ async def test_a_pipes_quality_band_follows_is_own_or_off() -> None:
     own = zmux.QualityBand(rtt=0.1)
     async with zmux.Listener(
         config=config,
-        listener_config=zmux.ListenerConfig(instance_id=b"instance", max_suspended=16),
+        listener_config=zmux.ListenerConfig(
+            instance_id=b"instance", limits=zmux.ListenerLimits(max_suspended=16)
+        ),
     ) as listener:
         addr = await listener.serve_tcp("127.0.0.1", 0)
         server = asyncio.create_task(echo(listener))
@@ -606,7 +608,9 @@ async def test_multipath() -> None:
     )
     async with zmux.Listener(
         config=config,
-        listener_config=zmux.ListenerConfig(instance_id=b"instance", max_suspended=16),
+        listener_config=zmux.ListenerConfig(
+            instance_id=b"instance", limits=zmux.ListenerLimits(max_suspended=16)
+        ),
     ) as listener:
         addr = await listener.serve_tcp("127.0.0.1", 0)
         server = asyncio.create_task(echo(listener))
@@ -1317,7 +1321,9 @@ async def test_split_join_as_further_pipes() -> None:
     )
     async with zmux.Listener(
         config=config,
-        listener_config=zmux.ListenerConfig(instance_id=b"instance", max_suspended=16),
+        listener_config=zmux.ListenerConfig(
+            instance_id=b"instance", limits=zmux.ListenerLimits(max_suspended=16)
+        ),
     ) as listener:
         addr = await listener.serve_http("127.0.0.1", 0)
         server = asyncio.create_task(echo(listener))
