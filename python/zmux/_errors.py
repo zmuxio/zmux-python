@@ -55,6 +55,7 @@ __all__ = [
     "StreamRejectedError",
     "StreamResetError",
     "StreamStoppedError",
+    "TakeoverReturnedError",
     "TransportClosedError",
     "VerifyRejectedError",
     "VerifyUnavailableError",
@@ -90,6 +91,11 @@ class NoRunningLoopError(ZmuxError, RuntimeError):
 
 class PipeUsedError(ZmuxError):
     """The pipe input was given to a session or a listener already."""
+
+
+class TakeoverReturnedError(ZmuxError):
+    """`Takeover.detach` after the listener's fallback returned without
+    detaching it: what the adapter held of the carrier is closed."""
 
 
 class ConnectError(ZmuxError, ConnectionError):

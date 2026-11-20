@@ -32,6 +32,7 @@ if TYPE_CHECKING:
         SecureServer,
         SendStream,
         ShapingBundle,
+        Takeover,
     )
 
 
@@ -683,18 +684,24 @@ class AdmissionStats:
     without an admission. `accepted` carriers count once more in the other
     `ListenerStats` fields; `fallback` includes those stalled for want of a
     fallback; `stalled` counts when the stall starts; `closed` also counts
-    an `accept` beyond the prefix, a failing decide and one cancelled by the
-    listener's close; `stall_overflow` a stall closed at once, its source
-    already stalling `max_pending_per_source - 1` carriers or the listener
-    closing; `peek_timed_out` a decision past the peek timeout;
-    `handshake_failed` an outer handshake (TLS, HTTP upgrade, QUIC) that
-    failed or timed out, counted here and not in `setup_failures`."""
+    a verdict where it does not apply (an `accept` beyond the prefix, a
+    `more` or `DEFER` out of place), a failing decide, one cancelled by the
+    listener's close, a message-framed carrier without a first message to
+    decide on, and a deferred decision whose carrier ended first;
+    `stall_overflow` a stall closed at once, its source already stalling
+    `max_pending_per_source - 1` carriers or the listener closing;
+    `too_large` a first message longer than `Admission.max_message`, closed
+    undecided; `peek_timed_out` a prefix, a deferred carrier or a decision
+    past the peek timeout; `handshake_failed` an outer handshake (TLS, HTTP
+    upgrade, QUIC) that failed or timed out, counted here and not in
+    `setup_failures`. A deferral is no outcome of its own."""
 
     accepted: int = 0
     fallback: int = 0
     stalled: int = 0
     closed: int = 0
     stall_overflow: int = 0
+    too_large: int = 0
     peek_timed_out: int = 0
     handshake_failed: int = 0
 
@@ -758,6 +765,16 @@ class Framing(_Enum):
     """Concatenated records, each with its Size field."""
     RECORDS = "records"
     """Each carrier message is one record's frames."""
+
+
+class AdmissionStage(_Enum):
+    """What of a carrier an admission decides on (`CarrierInfo.stage`)."""
+
+    HEAD = "head"
+    """An HTTP request head: no prefix, a credential in a request header
+    field."""
+    CARRIER = "carrier"
+    """The carrier's start: its first bytes, or its first message."""
 
 
 class FirstBytes(_Enum):
@@ -1509,15 +1526,19 @@ class Liveness:
     `keep_alive_period` (15 s, at least 1; `None` off): QX_PING when idle,
     capped at half the effective idle timeout. `suspect_floor` (0.25 s, at
     least 0.05): the floor of the suspicion timer. `dead_timeout` (`AUTO`,
-    derived; else at least 1): how long a suspect pipe stays suspect before
-    it fails. `standby_probe` (1 s, at least 1; `None` off: standby pipes are
+    derived; `None` turns stall-based failure off: a stalled pipe still
+    turns suspect, is avoided, has its data reinjected and is probed, but
+    only its carrier's error or end, its drain deadline or its removal fail
+    it; else at least 1, any larger value safe): how long a suspect pipe
+    stays suspect before it fails. It is off by default on a carrier that
+    reports its own failure (`PipeIo.reports_failure`). `standby_probe` (1 s, at least 1; `None` off: standby pipes are
     probed at `probe_interval`). `probe_interval` (15 s, at least 1; `None`
     turns the idle probes off). `probe_jitter` (0.25, in [0, 1); 0 gives
     the fixed schedule tests use)."""
 
     keep_alive_period: float | None = _LIVENESS["keep_alive_period"]
     suspect_floor: float = _LIVENESS["suspect_floor"]
-    dead_timeout: float | Auto = AUTO
+    dead_timeout: float | Auto | None = AUTO
     standby_probe: float | None = _LIVENESS["standby_probe"]
     probe_interval: float | None = _LIVENESS["probe_interval"]
     probe_jitter: float = _LIVENESS["probe_jitter"]
@@ -1529,11 +1550,14 @@ class PipeLiveness:
     `Pipe.update(liveness=...)`): the `Liveness` fields of the same names
     that apply to one pipe, each `INHERIT` (the default, following the
     session's) or a value; `probe_interval=None` turns the pipe's idle
-    probes off. Durations are seconds; invalid values raise `ValueError`
-    where they are used."""
+    probes off. `dead_timeout` `INHERIT` follows the carrier (off on one
+    that reports its own failure, `PipeIo.reports_failure`), else the
+    session's; `AUTO` (derived), `None` (stall-based failure off) or a
+    value override both. Durations are seconds; invalid values raise
+    `ValueError` where they are used."""
 
     suspect_floor: float | Inherit = INHERIT
-    dead_timeout: float | Inherit = INHERIT
+    dead_timeout: float | Auto | Inherit | None = INHERIT
     probe_interval: float | Inherit | None = INHERIT
     probe_jitter: float | Inherit = INHERIT
 
@@ -2235,7 +2259,23 @@ class ListenerConfig:
     is reported as unraisable. `on_reject(info)` decides what happens to an
     unauthenticated carrier: an unknown Locator, a failed Hello, a refused
     Establish (it may be `async`; past the handshake timeout the carrier is
-    closed). Nothing is sent either way. Every Python hook of the
+    closed). Nothing is sent either way. `fallback(takeover)` (it may be
+    `async`) is given every carrier the admission hands back, as a
+    `Takeover`: on `AdmissionVerdict.fallback(value=...)`, or on a prefix
+    `fallback_on_peek_timeout` gave up on, whatever entry took it (a TCP or
+    TLS stream, a WebSocket decided on its first message, the first stream
+    of a QUIC connection or a WebTransport session, an HTTP request carrier
+    decided on its body, a pipe given to `handle_pipe`). An HTTP request
+    carrier decided on its body is answered 200 as an accepted one and taken
+    over as the full-duplex pipe of its request and response bodies (HTTP/1.1,
+    HTTP/2, HTTP/3); one decided on its head gets 404. Without `fallback`
+    such carriers are stalled. The call runs to its end whatever the
+    listener does (its close included); once it returned, what it neither
+    took (`into_pipe`, `into_messages`) nor detached is closed, and so is
+    what the adapter holds of the carrier (the QUIC connection, the
+    WebTransport session, the HTTP response) unless it called
+    `Takeover.detach()`. An exception is reported as unraisable and closes
+    the carrier. Every Python hook of the
     listener runs on its event loop: the one running when the `Listener` is
     made, else the one running at its first use (`async with`, a `serve_*`,
     `handle_pipe`, `accept`); an admission decider runs on the loop running
@@ -2283,6 +2323,9 @@ class ListenerConfig:
         | None
     ) = field(default=None, compare=False)
     secure_server: SecureServer | None = field(default=None, compare=False)
+    fallback: Callable[[Takeover], Awaitable[None] | None] | None = field(
+        default=None, compare=False
+    )
     session_config: (
         Callable[[SessionCarrier], Config | Awaitable[Config | None] | None] | None
     ) = field(default=None, compare=False)

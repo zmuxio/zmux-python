@@ -80,6 +80,9 @@ RESERVED_EXPORTER_PREFIX: str
 """The start of the exporter labels zmux itself uses."""
 DEFAULT_MAX_RECORD_SIZE: int
 """Record size limit before the peer's parameters, bytes (16382)."""
+MAX_ADMISSION_MESSAGE: int
+"""The largest first message an `Admission` reads, its default
+`max_message`: the largest record, bytes (65535)."""
 DEFAULT_MIN_BACKOFF: float
 """Shortest redial wait of the `redial` hook and of a pipe pool, seconds (1)."""
 DEFAULT_MAX_BACKOFF: float
@@ -222,6 +225,15 @@ class PipeIo:
         (`RecordPolicy.secure`). An exporter alone is no such
         declaration; a carrier whose TLS ends outside the process is not
         secure."""
+    @property
+    def reports_failure(self) -> bool:
+        """Whether the carrier reports its own failure: its reads or writes
+        fail when the path under it fails (a stream of an outer session:
+        `stream_pipe`, `Session.open_pipe_stream`, which report it). A
+        stall then never fails the pipe unless its own
+        `PipeLiveness.dead_timeout` says otherwise."""
+    @reports_failure.setter
+    def reports_failure(self, on: bool) -> None: ...
     def into_stream(self) -> CarrierStream:
         """The carrier's halves as one byte stream, for a layer that runs
         over a stream; bytes a listener already read from it come first.
@@ -348,10 +360,21 @@ class CarrierInfo:
         """The request header fields of an HTTP carrier, names in lower case;
         None for other carriers."""
     @property
-    def head(self) -> bool:
-        """Whether the carrier is decided on its HTTP request head (WebSocket,
-        WebTransport): there is no prefix, and a credential travels in a
-        request header field."""
+    def stage(self) -> _t.AdmissionStage:
+        """What of the carrier the decision is taken on: `HEAD`, an HTTP
+        request head (WebSocket, WebTransport, an HTTP request without a
+        body: there is no prefix, and a credential travels in a request
+        header field), or `CARRIER`, its first bytes or first message."""
+    @property
+    def framing(self) -> _t.Framing:
+        """The carrier's framing at `AdmissionStage.CARRIER`: with
+        `Framing.RECORDS` the prefix is its first message; `BYTE_STREAM` on
+        a head."""
+    @property
+    def upgrade(self) -> bool:
+        """The carrier of an HTTP upgrade (WebSocket, WebTransport), on its
+        head and on the decision `AdmissionVerdict.DEFER` takes on the
+        carrier."""
     def export(
         self, label: str, context: bytes = b"", length: int = 32
     ) -> bytes | None:
@@ -366,26 +389,37 @@ class CarrierInfo:
 class AdmissionVerdict:
     """The outcome of an admission decision."""
 
-    FALLBACK: ClassVar[AdmissionVerdict]
-    """To the fallback handler, every byte read replayed; without one the
-    carrier is stalled (an HTTP request gets 404)."""
     STALL: ClassVar[AdmissionVerdict]
     """Nothing is sent; what arrives is discarded until the stall interval
     has passed, then the carrier is closed."""
     CLOSE: ClassVar[AdmissionVerdict]
     """The carrier is closed at once."""
+    DEFER: ClassVar[AdmissionVerdict]
+    """On the head of an HTTP upgrade (`CarrierInfo.upgrade`, stage `HEAD`):
+    completes the upgrade and decides again, with the same metadata at
+    stage `CARRIER`, on the carrier's first message (WebSocket) or first
+    `peek` bytes (a WebTransport session's first stream), within what
+    remains of the peek timeout. Anywhere else it counts as `CLOSE`."""
     @staticmethod
     def accept(skip: int = 0, value: Any = None) -> AdmissionVerdict:
         """To the listener, without the first `skip` bytes of the prefix;
         `value`, any object, is the carrier's admitted value
         (`PipeHint.admitted`, `Session.admitted`, `Pipe.admitted`)."""
     @staticmethod
+    def fallback(value: Any = None) -> AdmissionVerdict:
+        """To the listener's fallback (`ListenerConfig.fallback`), what was
+        read replayed; `value`, any object, is the host's routing of the
+        carrier to a service of its own (`Takeover.value`). Without a
+        fallback the carrier is stalled; an HTTP request decided on its
+        head gets 404, and the value reaches no HTTP handler."""
+    @staticmethod
     def more(need: int) -> AdmissionVerdict:
         """Reads until the prefix holds `need` bytes in all (or the carrier
         ends, or the peek timeout passes, all rounds sharing it), then decides
         again with the longer prefix. `need` exceeds the prefix and is at most
-        `Admission.max_peek`, on a byte stream; otherwise, and on a carrier
-        that ended short, it counts as `CLOSE`."""
+        `Admission.max_peek`, on a byte stream; otherwise (a first message, a
+        request head), and on a carrier that ended short, it counts as
+        `CLOSE`."""
     def labelled(self, variant: str) -> Decision:
         """A `Decision` of this verdict labelled `variant`."""
     @property
@@ -396,7 +430,81 @@ class AdmissionVerdict:
         """An accept's `skip`; `None` for another verdict."""
     @property
     def value(self) -> Any:
-        """An accept's value."""
+        """An accept's or a fallback's value."""
+
+@final
+class Takeover:
+    """A carrier the listener's admission handed to
+    `ListenerConfig.fallback`, what was read of it replayed: the bytes of a
+    byte stream, or the first message of a message-framed carrier (a whole,
+    non-empty binary message).
+
+    The carrier is the fallback's for its call: once the call returned,
+    what it did not take (`into_pipe`, `into_messages`) is closed, and so is
+    what the adapter holds beside it (the QUIC connection of a stream, the
+    WebTransport session, the response of an HTTP request carrier, reset if
+    not ended), unless the call detached it first (`detach`). A taken
+    carrier is its holder's, closed when it is dropped or shut down; each
+    half closes on its own."""
+
+    @property
+    def info(self) -> CarrierInfo:
+        """The carrier's metadata, as the decision saw it."""
+    @property
+    def framing(self) -> _t.Framing:
+        """The carrier's framing: `Framing.RECORDS` for a message-framed
+        carrier (a WebSocket), whose replay is its first message."""
+    @property
+    def replayed(self) -> bytes:
+        """What the admission read, replayed in front of the carrier."""
+    @property
+    def value(self) -> Any:
+        """The value of the verdict that handed the carrier over
+        (`AdmissionVerdict.fallback(value=...)`): the host's routing of it
+        to a service of its own; `None` without one, and after a peek
+        timeout."""
+    @property
+    def detached(self) -> bool:
+        """Whether `detach` made the carrier the host's (`False` once it is
+        taken)."""
+    def detach(self) -> None:
+        """Makes the carrier the host's for good: what the adapter holds of
+        it stays open when the fallback returns, so that the host may serve
+        it on another task; the host closes it once done. Call it before
+        taking the carrier; a second call does nothing.
+        `TakeoverReturnedError` once the fallback returned without it,
+        `PipeUsedError` once the carrier was taken."""
+    def into_pipe(self) -> PipeIo:
+        """The carrier as a pipe input, what was read replayed first (on a
+        message-framed carrier its first message is read again), with every
+        capability an accepted carrier has (TLS state, exporter, secure
+        declaration, failure reporting, ...): give it to a session or a
+        listener, or read it as a stream (`PipeIo.into_stream`).
+        `PipeUsedError` once taken, `TakeoverReturnedError` after the
+        fallback returned without detaching it."""
+    def into_messages(self) -> TakeoverMessages:
+        """A message-framed carrier (`Framing.RECORDS`) read and written by
+        whole messages, the first one read again first. `TypeError` for a
+        byte stream (the takeover keeps its carrier); otherwise as
+        `into_pipe`."""
+
+@final
+class TakeoverMessages:
+    """A taken-over message-framed carrier (`Takeover.into_messages`): each
+    read a whole message, each write one. Full duplex: a read waiting for a
+    message never holds back a write, so one task may read while another
+    writes; reads run one at a time, as do writes. A cancelled read may
+    lose the message it was reading. Each half is closed once the object
+    is dropped."""
+
+    async def read_message(self, max: int = 65535) -> bytes | None:
+        """The next message, of at most `max` bytes (a longer one is an
+        error, raised as the carrier's, the replayed first one too); `None`
+        at the carrier's end."""
+    async def write_message(self, message: Buffer) -> None:
+        """Writes `message` as one message."""
+    async def shutdown(self) -> None:
+        """Ends the sending half gracefully; the receiving half reads on."""
 
 @final
 class Decision:
@@ -427,9 +535,13 @@ class Admission:
     cancelled (`CancelledError`) when the peek timeout ends or the
     listener closes.
     An exception or another return value closes the carrier.
-    `max_peek` is the largest prefix `AdmissionVerdict.more` may ask for and the
-    largest first message of a message-framed carrier taken as a prefix (`peek`
-    when larger; a longer message closes the carrier).
+    `max_peek` is the largest prefix of a byte stream `AdmissionVerdict.more`
+    may ask for (`peek` when larger). On a message-framed carrier the prefix
+    is its first message, whole, read with a `peek` above 0 or after a
+    `DEFER`: at most `max_message` bytes (0: `MAX_ADMISSION_MESSAGE`, the
+    largest record; above it `ValueError`), a longer one closed undecided
+    (`too_large`), and a carrier without one (ended, failed, a text or an
+    empty message) closed undecided.
     `peek_timeout` (seconds, from the end of the outer handshake) bounds the
     reading of the prefix and the decision; `stall` is the `(min, max)`
     seconds a stalled carrier is held open; `AUTO` or `None` (the default) draws them
@@ -452,6 +564,7 @@ class Admission:
         *,
         peek: int = 0,
         max_peek: int = 0,
+        max_message: int = 0,
         peek_timeout: float | _t.Auto | None = None,
         stall: tuple[float, float] | _t.Auto | None = None,
         fallback_on_peek_timeout: bool = False,
@@ -475,7 +588,10 @@ class Admission:
     def peek(self) -> int: ...
     @property
     def max_peek(self) -> int:
-        """The largest prefix, at least `peek`."""
+        """The largest prefix of a byte stream, at least `peek`."""
+    @property
+    def max_message(self) -> int:
+        """The largest first message of a message-framed carrier decided on."""
     @property
     def fallback_on_peek_timeout(self) -> bool: ...
     @property
@@ -1902,7 +2018,9 @@ class Listener:
         directly connected peer, `source` the client the application resolved
         (unset, the peer; the peer unset, `127.0.0.1:0`). It takes a source
         slot and goes through the listener's admission, joins and
-        resumptions too."""
+        resumptions too. Returns once the carrier is done; a carrier the
+        admission does not accept (stalled, closed, or given to
+        `ListenerConfig.fallback`) raises `ConnectError`."""
     async def shutdown(self, code: int = 0, reason: bytes = b"") -> None:
         """Closes gracefully: new sessions are refused at once while joins
         and resumptions of the live sessions are still taken; every session

@@ -28,6 +28,7 @@ mod pool;
 mod rt;
 mod seal;
 mod shaping;
+mod takeover;
 use admission::Admission;
 use helpers::lock;
 use rt::future_into_py;
@@ -622,11 +623,7 @@ fn liveness(v: &Bound<'_, PyAny>) -> PyResult<zmux::Liveness> {
     Ok(zmux::Liveness {
         keep_alive_period: opt("keep_alive_period")?,
         suspect_floor: field_secs("suspect_floor", &v.getattr("suspect_floor")?)?,
-        dead_timeout: if is_setting(&dead, "AUTO")? {
-            zmux::Cap::Auto
-        } else {
-            zmux::Cap::Fixed(field_secs("dead_timeout", &dead)?)
-        },
+        dead_timeout: dead_timeout(&dead)?,
         standby_probe: opt("standby_probe")?,
         probe_interval: opt("probe_interval")?,
         probe_jitter: required("probe_jitter", &v.getattr("probe_jitter")?)?.extract()?,
@@ -638,17 +635,32 @@ fn liveness_obj<'p>(py: Python<'p>, l: &zmux::Liveness) -> PyResult<Bound<'p, Py
     let d = PyDict::new(py);
     d.set_item("keep_alive_period", dur(l.keep_alive_period))?;
     d.set_item("suspect_floor", l.suspect_floor.as_secs_f64())?;
-    d.set_item(
-        "dead_timeout",
-        match l.dead_timeout {
-            zmux::Cap::Auto => setting(py, "AUTO")?,
-            zmux::Cap::Fixed(t) => t.as_secs_f64().into_pyobject(py)?.into_any(),
-        },
-    )?;
+    d.set_item("dead_timeout", dead_timeout_obj(py, l.dead_timeout)?)?;
     d.set_item("standby_probe", dur(l.standby_probe))?;
     d.set_item("probe_interval", dur(l.probe_interval))?;
     d.set_item("probe_jitter", l.probe_jitter)?;
     types(py)?.getattr("Liveness")?.call((), Some(&d))
+}
+
+/// A dead timeout: `AUTO` derived, `None` off (stall-based failure off),
+/// else at least 1 s.
+fn dead_timeout(v: &Bound<'_, PyAny>) -> PyResult<zmux::DeadTimeout> {
+    if is_setting(v, "AUTO")? {
+        return Ok(zmux::DeadTimeout::Auto);
+    }
+    if v.is_none() {
+        return Ok(zmux::DeadTimeout::Off);
+    }
+    Ok(zmux::DeadTimeout::After(field_secs("dead_timeout", v)?))
+}
+
+/// The Python value of a dead timeout.
+fn dead_timeout_obj(py: Python<'_>, d: zmux::DeadTimeout) -> PyResult<Bound<'_, PyAny>> {
+    Ok(match d {
+        zmux::DeadTimeout::Auto => setting(py, "AUTO")?,
+        zmux::DeadTimeout::Off => py.None().into_bound(py),
+        zmux::DeadTimeout::After(t) => t.as_secs_f64().into_pyobject(py)?.into_any(),
+    })
 }
 
 /// The native policy of a `zmux.EpochPolicy`: `None` never advances by
@@ -690,7 +702,7 @@ pub(crate) fn pipe_liveness(v: &Bound<'_, PyAny>) -> PyResult<zmux::PipeLiveness
     let get = |n: &str| v.getattr(n);
     let l = zmux::PipeLiveness {
         suspect_floor: inherit(&get("suspect_floor")?, |x| field_secs("suspect_floor", x))?,
-        dead_timeout: inherit(&get("dead_timeout")?, |x| field_secs("dead_timeout", x))?,
+        dead_timeout: inherit(&get("dead_timeout")?, dead_timeout)?,
         probe_interval: inherit(&get("probe_interval")?, |x| {
             field_opt_secs("probe_interval", x)
         })?,
@@ -710,7 +722,10 @@ pub(crate) fn pipe_liveness_obj<'p>(
     let secs = |d: Duration| Ok(d.as_secs_f64().into_pyobject(py)?.into_any());
     let d = PyDict::new(py);
     d.set_item("suspect_floor", inherit_obj(py, l.suspect_floor, secs)?)?;
-    d.set_item("dead_timeout", inherit_obj(py, l.dead_timeout, secs)?)?;
+    d.set_item(
+        "dead_timeout",
+        inherit_obj(py, l.dead_timeout, |t| dead_timeout_obj(py, t))?,
+    )?;
     d.set_item(
         "probe_interval",
         inherit_obj(py, l.probe_interval, |d| {
@@ -1447,6 +1462,21 @@ impl PipeIo {
     /// choose Bound on it.
     fn declare_carrier_secure(&self) -> PyResult<()> {
         self.modify(zmux::PipeIo::with_carrier_secure)
+    }
+
+    /// Whether the carrier reports its own failure: its reads or writes
+    /// fail when the path under it fails (a stream of an outer session,
+    /// `stream_pipe`, `Session.open_pipe_stream`, which report it). A
+    /// stall then never fails the pipe unless its own
+    /// `PipeLiveness.dead_timeout` says otherwise.
+    #[getter]
+    fn reports_failure(&self) -> PyResult<bool> {
+        self.read(zmux::PipeIo::reports_failure)
+    }
+
+    #[setter]
+    fn set_reports_failure(&self, on: bool) -> PyResult<()> {
+        self.modify(|io| io.with_reports_failure(on))
     }
 
     /// The host's name of the transform the carrier runs, or `None`:
@@ -5431,6 +5461,9 @@ impl Listener {
         let on_reject = Some(get("on_reject")?)
             .filter(|f| !f.is_none())
             .map(Bound::unbind);
+        let fallback = Some(get("fallback")?)
+            .filter(|f| !f.is_none())
+            .map(Bound::unbind);
         let secure_server: Option<PyRef<'_, seal::SecureServer>> =
             get("secure_server")?.extract()?;
         let session_config = Some(get("session_config")?)
@@ -5504,6 +5537,9 @@ impl Listener {
                 ));
             }
             l.inbound_transform = Some(server.transform(py, lp.clone())?);
+        }
+        if let Some(f) = fallback {
+            l.fallback = Some(takeover::fallback(f, lp.clone()));
         }
         if let Some(f) = on_reject {
             l.on_reject = Some(seal::on_reject(f, lp.clone()));
@@ -5724,7 +5760,7 @@ impl Listener {
             let addr = resolve(&addr).await?;
             let ep = quinn::Endpoint::server(sc, addr).map_err(io_err)?;
             let local = host_port(ep.local_addr().map_err(io_err)?);
-            tasks(tokio::spawn(zmux_quinn::serve(l, ep, opts, None)));
+            tasks(tokio::spawn(zmux_quinn::serve(l, ep, opts)));
             Ok(local)
         })
     }
@@ -5843,6 +5879,7 @@ impl Listener {
         ad.set_item("stalled", a.stalled)?;
         ad.set_item("closed", a.closed)?;
         ad.set_item("stall_overflow", a.stall_overflow)?;
+        ad.set_item("too_large", a.too_large)?;
         ad.set_item("peek_timed_out", a.peek_timed_out)?;
         ad.set_item("handshake_failed", a.handshake_failed)?;
         d.set_item(
@@ -5920,6 +5957,7 @@ fn init_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Http2Connection>()?;
     m.add_class::<ExchangeOptions>()?;
     admission::register(m)?;
+    takeover::register(m)?;
     layer::register(m)?;
     pool::register(m)?;
     m.add_class::<QuicClient>()?;
@@ -5964,6 +6002,7 @@ fn defaults(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "DEFAULT_MAX_RECORD_SIZE",
         zmux::proto::params::DEFAULT_MAX_RECORD_SIZE,
     )?;
+    m.add("MAX_ADMISSION_MESSAGE", zmux::MAX_ADMISSION_MESSAGE)?;
     m.add(
         "DEFAULT_MIN_BACKOFF",
         zmux::DEFAULT_MIN_BACKOFF.as_secs_f64(),

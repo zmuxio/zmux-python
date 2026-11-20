@@ -480,9 +480,13 @@ async def test_nested_session_over_a_carrier_stream() -> None:
             return inner
 
         task = asyncio.create_task(inner_server())
-        inner = await zmux.Session.connect(
-            await c.open_pipe_stream(tlvs=[(0x1000, b"route")])
-        )
+        carrier = await c.open_pipe_stream(tlvs=[(0x1000, b"route")])
+        # A stream of an outer session reports its own failure.
+        assert carrier.reports_failure
+        carrier.reports_failure = False
+        assert not carrier.reports_failure
+        carrier.reports_failure = True
+        inner = await zmux.Session.connect(carrier)
         send, recv = await inner.open_bi()
         await send.write(b"nested")
         await send.finish()

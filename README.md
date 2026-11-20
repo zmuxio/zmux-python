@@ -552,10 +552,10 @@ pipe = await zmux.dial_websocket("wss://example.net/", carrier_credential=auth)
 
 `Admission(decide, *, peek=N)` takes a decision of your own:
 `decide(info, prefix)` gets the `CarrierInfo` and up to `N` first bytes, and
-returns an `AdmissionVerdict` (`accept(skip, value=...)`, `FALLBACK`,
-`STALL`, `CLOSE`, `more(need)`), synchronously or `async`. An accept's
-`value` is the carrier's admitted value (`session.admitted`,
-`pipe.admitted`). A carrier credential of your own is any object with
+returns an `AdmissionVerdict` (`accept(skip, value=...)`,
+`fallback(value=...)`, `STALL`, `CLOSE`, `more(need)`, `DEFER`),
+synchronously or `async`. An accept's `value` is the carrier's admitted
+value (`session.admitted`, `pipe.admitted`). A carrier credential of your own is any object with
 `prefix(info)` and `header(info)` (`zmux.CarrierCredential`).
 `Listener(config=..., listener_config=...)` takes the sessions' `Config` and
 the listener's own `ListenerConfig`, whose `max_pending` (1024; `None`:
@@ -563,6 +563,33 @@ unlimited) bounds every carrier before it enters a session.
 `max_pending_per_source` counts a source by its prefix, `source_prefix_v4`
 (1 to 32, default 32) for IPv4 and `source_prefix_v6` (1 to 128, default 64)
 for IPv6; a value outside its range raises `ValueError`.
+
+`ListenerConfig(fallback=f)` is given every carrier the admission hands
+back (`fallback(value=...)`, or a peek timeout with
+`fallback_on_peek_timeout`) as a `zmux.Takeover`, whatever entry took it: a
+TCP/TLS stream, a WebSocket decided on its first message, a QUIC
+connection's or WebTransport session's first stream, an HTTP request carrier
+decided on its body (answered 200 and taken over as the full-duplex pipe of
+its request and response bodies), a pipe given to `handle_pipe`. It reads
+`takeover.value`, `info`, `framing` and `replayed`, and takes the carrier
+with `into_pipe()` (every capability kept, the bytes read replayed first) or,
+when message-framed, `into_messages()` (full duplex: one task may wait in
+`read_message()` while another calls `write_message()`). Once `f` returns, what it did not
+take is closed, and so is what the adapter holds (the QUIC connection, the
+WebTransport session, the HTTP response) unless `f` called
+`takeover.detach()` to serve it on another task:
+
+```python
+async def fallback(t: zmux.Takeover) -> None:
+    t.detach()
+    asyncio.create_task(serve_web(t.value, t.into_pipe().into_stream()))
+```
+
+`Liveness(dead_timeout=None)` (and `PipeLiveness(dead_timeout=None)` for one
+pipe) turns stall-based pipe failure off: a stalled pipe is still avoided,
+reinjected and probed, but fails only on its carrier's error or end. It is
+off by default on a carrier that reports its own failure
+(`PipeIo.reports_failure`, set on streams of an outer session).
 
 `ListenerConfig(inbound_transform=f)` runs `f(pipe, hint)` for every carrier
 after its admission and goes on with the carrier it returns. Fragment:

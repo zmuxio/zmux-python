@@ -318,7 +318,7 @@ def test_prefix_auth_config() -> None:
     assert (
         zmux.AdmissionVerdict.accept()
         == zmux.AdmissionVerdict.accept(0)
-        != zmux.AdmissionVerdict.FALLBACK
+        != zmux.AdmissionVerdict.fallback()
     )
     assert zmux.ExchangeOptions(psk=b"k", time_window=30, max_recorded=16).path
 
@@ -356,19 +356,20 @@ async def test_custom_credential_and_decider(carrier: str, tls: Tls) -> None:
         seen.append(info)
         expected = info.export(LABEL, b"", 32)
         assert expected is not None
-        if info.head:
+        if info.stage is zmux.AdmissionStage.HEAD:
+            assert info.upgrade
             assert prefix == b"" and info.headers is not None
             fields = dict(info.headers)
             return (
                 zmux.AdmissionVerdict.accept()
                 if fields.get("x-token") == expected.hex().encode()
-                else zmux.AdmissionVerdict.FALLBACK
+                else zmux.AdmissionVerdict.fallback()
             )
         assert info.headers is None
         return (
             zmux.AdmissionVerdict.accept(32)
             if prefix == expected
-            else zmux.AdmissionVerdict.FALLBACK
+            else zmux.AdmissionVerdict.fallback()
         )
 
     credential = ExportedToken()
@@ -385,11 +386,57 @@ async def test_custom_credential_and_decider(carrier: str, tls: Tls) -> None:
             await round_trip(session)
         server.cancel()
     assert len(seen) == 1 and seen[0].source is not None and seen[0].peer is not None
-    assert seen[0].head == (carrier in ("wss", "webtransport"))
+    head = carrier in ("wss", "webtransport")
+    assert (seen[0].stage is zmux.AdmissionStage.HEAD) == head
+    assert seen[0].upgrade == head
     # A TLS listener's metadata holds zmux's own labels only.
     if carrier == "tls":
         assert seen[0].export(LABEL) is not None
         assert seen[0].export("EXPORTER-test") is None
+
+
+@pytest.mark.parametrize("carrier", ["websocket", "webtransport"])
+async def test_a_deferred_decision_on_the_carrier(carrier: str, tls: Tls) -> None:
+    server_tls, client_tls = tls
+    seen: list[tuple[zmux.AdmissionStage, zmux.adapter.Framing, bool, bytes]] = []
+
+    def decide(info: zmux.CarrierInfo, prefix: bytes) -> zmux.AdmissionVerdict:
+        seen.append((info.stage, info.framing, info.upgrade, prefix))
+        if info.stage is zmux.AdmissionStage.HEAD:
+            return zmux.AdmissionVerdict.DEFER
+        kind, need = zmux.adapter.classify_first_bytes(prefix, framing=info.framing)
+        if kind is zmux.adapter.FirstBytes.RECORD:
+            return zmux.AdmissionVerdict.accept()
+        if kind is zmux.adapter.FirstBytes.NEED_MORE:
+            return zmux.AdmissionVerdict.more(need)
+        return zmux.AdmissionVerdict.CLOSE
+
+    admission = zmux.Admission(
+        decide, peek=1, max_peek=zmux.adapter.MAX_FIRST_BYTES, peek_timeout=5
+    )
+    async with zmux.Listener(
+        listener_config=zmux.ListenerConfig(admission=admission)
+    ) as listener:
+        addr = await serve_admitted(listener, carrier, server_tls)
+        server = asyncio.create_task(echo(listener))
+        pipe = await asyncio.wait_for(dial_with(carrier, addr, client_tls, None), 10)
+        async with await zmux.Session.connect(pipe) as session:
+            await round_trip(session)
+        server.cancel()
+        stats = listener.stats().admission
+    framing = (
+        zmux.adapter.Framing.RECORDS
+        if carrier == "websocket"
+        else zmux.adapter.Framing.BYTE_STREAM
+    )
+    assert seen[0][:3] == (
+        zmux.AdmissionStage.HEAD,
+        zmux.adapter.Framing.BYTE_STREAM,
+        True,
+    )
+    assert seen[-1][:3] == (zmux.AdmissionStage.CARRIER, framing, True)
+    assert seen[-1][3]
+    assert (stats.accepted, stats.closed, stats.too_large) == (1, 0, 0)
 
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")

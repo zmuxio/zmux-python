@@ -18,7 +18,7 @@ use crate::seconds;
 /// The metadata of a carrier, as Python sees it: an owned copy, usable
 /// for as long as Python keeps it.
 #[pyclass(frozen, module = "zmux")]
-pub(crate) struct CarrierInfo(zmux::CarrierInfo);
+pub(crate) struct CarrierInfo(pub(crate) zmux::CarrierInfo);
 
 fn addr(a: Option<std::net::SocketAddr>) -> Option<(String, u16)> {
     a.map(|r| (r.ip().to_string(), r.port()))
@@ -58,9 +58,27 @@ impl CarrierInfo {
             .collect::<PyResult<_>>()
             .map(Some)
     }
+    /// What of the carrier the decision is taken on: `AdmissionStage.HEAD`
+    /// (an HTTP request head, no prefix) or `AdmissionStage.CARRIER`.
     #[getter]
-    fn head(&self) -> bool {
-        self.0.head
+    fn stage<'p>(&self, py: Python<'p>) -> Bound<'p, PyAny> {
+        let name = match self.0.stage {
+            zmux::AdmissionStage::Head => "head",
+            _ => "carrier",
+        };
+        crate::typed(py, "AdmissionStage", name.to_owned())
+    }
+    /// The carrier's framing at `AdmissionStage.CARRIER` (`Framing.RECORDS`:
+    /// the prefix is its first message).
+    #[getter]
+    fn framing<'p>(&self, py: Python<'p>) -> Bound<'p, PyAny> {
+        crate::typed(py, "Framing", framing_name(self.0.framing).to_owned())
+    }
+    /// The carrier of an HTTP upgrade (WebSocket, WebTransport), on its head
+    /// and on the decision a `DEFER` takes on the carrier.
+    #[getter]
+    fn upgrade(&self) -> bool {
+        self.0.upgrade
     }
     /// `length` bytes of the exporter of the carrier's handshake for
     /// `label` and `context`, as it answers without waiting; `None`
@@ -77,13 +95,22 @@ impl CarrierInfo {
         Some(PyBytes::new(py, &value))
     }
     fn __repr__(&self) -> String {
+        let stage = if self.0.is_head() { "head" } else { "carrier" };
         format!(
-            "CarrierInfo(source={:?}, peer={:?}, server_name={:?}, head={})",
+            "CarrierInfo(source={:?}, peer={:?}, server_name={:?}, stage={stage}, framing={}, upgrade={})",
             addr(self.0.source),
             addr(self.0.peer),
             self.0.server_name.as_deref(),
-            self.0.head
+            framing_name(self.0.framing),
+            self.0.upgrade
         )
+    }
+}
+
+pub(crate) fn framing_name(f: zmux::adapter::Framing) -> &'static str {
+    match f {
+        zmux::adapter::Framing::Records => "records",
+        zmux::adapter::Framing::ByteStream => "byte_stream",
     }
 }
 
@@ -97,12 +124,15 @@ enum V {
         skip: usize,
         value: Option<Arc<Py<PyAny>>>,
     },
-    Fallback,
+    Fallback {
+        value: Option<Arc<Py<PyAny>>>,
+    },
     Stall,
     Close,
     More {
         need: usize,
     },
+    Defer,
 }
 
 /// The Python object of an admission's value (`AdmittedValue`): the one a
@@ -122,10 +152,17 @@ impl AdmissionVerdict {
                     None => v,
                 }
             }
-            V::Fallback => zmux::AdmissionVerdict::Fallback,
+            V::Fallback { value } => {
+                let v = zmux::AdmissionVerdict::fallback();
+                match value {
+                    Some(o) => v.with_value(o.clone() as zmux::AdmittedValue),
+                    None => v,
+                }
+            }
             V::Stall => zmux::AdmissionVerdict::Stall,
             V::Close => zmux::AdmissionVerdict::Close,
             V::More { need } => zmux::AdmissionVerdict::More { need: *need },
+            V::Defer => zmux::AdmissionVerdict::Defer,
         }
     }
 }
@@ -143,10 +180,15 @@ impl AdmissionVerdict {
             value: value.map(Arc::new),
         })
     }
-    #[classattr]
-    #[allow(non_snake_case)]
-    fn FALLBACK() -> AdmissionVerdict {
-        AdmissionVerdict(V::Fallback)
+    /// Hands the carrier to the listener's fallback, what was read
+    /// replayed; `value`, any object, is the host's routing of it
+    /// (`Takeover.value`).
+    #[staticmethod]
+    #[pyo3(signature = (value=None))]
+    fn fallback(value: Option<Py<PyAny>>) -> Self {
+        AdmissionVerdict(V::Fallback {
+            value: value.map(Arc::new),
+        })
     }
     #[classattr]
     #[allow(non_snake_case)]
@@ -157,6 +199,13 @@ impl AdmissionVerdict {
     #[allow(non_snake_case)]
     fn CLOSE() -> AdmissionVerdict {
         AdmissionVerdict(V::Close)
+    }
+    /// On the head of an HTTP upgrade (`CarrierInfo.upgrade`): completes the
+    /// upgrade and decides again on the carrier's first message or bytes.
+    #[classattr]
+    #[allow(non_snake_case)]
+    fn DEFER() -> AdmissionVerdict {
+        AdmissionVerdict(V::Defer)
     }
     /// Reads until the prefix holds `need` bytes in all, then decides again
     /// with the longer prefix.
@@ -187,11 +236,13 @@ impl AdmissionVerdict {
             _ => None,
         }
     }
-    /// An accept's value.
+    /// An accept's or a fallback's value.
     #[getter]
     fn value(&self, py: Python<'_>) -> Option<Py<PyAny>> {
         match &self.0 {
-            V::Accept { value, .. } => value.as_ref().map(|o| o.clone_ref(py)),
+            V::Accept { value, .. } | V::Fallback { value } => {
+                value.as_ref().map(|o| o.clone_ref(py))
+            }
             _ => None,
         }
     }
@@ -201,14 +252,12 @@ impl AdmissionVerdict {
         };
         Ok(match (&self.0, &o.get().0) {
             (V::Accept { skip: a, value: x }, V::Accept { skip: b, value: y }) => {
-                a == b
-                    && match (x, y) {
-                        (None, None) => true,
-                        (Some(x), Some(y)) => x.bind(py).eq(y.bind(py))?,
-                        _ => false,
-                    }
+                a == b && same(py, x.as_deref(), y.as_deref())?
             }
-            (V::Fallback, V::Fallback) | (V::Stall, V::Stall) | (V::Close, V::Close) => true,
+            (V::Fallback { value: x }, V::Fallback { value: y }) => {
+                same(py, x.as_deref(), y.as_deref())?
+            }
+            (V::Stall, V::Stall) | (V::Close, V::Close) | (V::Defer, V::Defer) => true,
             (V::More { need: a }, V::More { need: b }) => a == b,
             _ => false,
         })
@@ -223,11 +272,24 @@ impl AdmissionVerdict {
                 "AdmissionVerdict.accept({skip}, value={})",
                 v.bind(py).repr()?
             ),
-            V::Fallback => "AdmissionVerdict.FALLBACK".into(),
+            V::Fallback { value: None } => "AdmissionVerdict.fallback()".into(),
+            V::Fallback { value: Some(v) } => {
+                format!("AdmissionVerdict.fallback(value={})", v.bind(py).repr()?)
+            }
             V::Stall => "AdmissionVerdict.STALL".into(),
             V::Close => "AdmissionVerdict.CLOSE".into(),
             V::More { need } => format!("AdmissionVerdict.more({need})"),
+            V::Defer => "AdmissionVerdict.DEFER".into(),
         })
+    }
+}
+
+/// Whether two optional values are equal.
+fn same(py: Python<'_>, x: Option<&Py<PyAny>>, y: Option<&Py<PyAny>>) -> PyResult<bool> {
+    match (x, y) {
+        (None, None) => Ok(true),
+        (Some(x), Some(y)) => x.bind(py).eq(y.bind(py)),
+        _ => Ok(false),
     }
 }
 
@@ -360,11 +422,11 @@ impl zmux::Decide for PyDecide {
     /// future when it gives the decision up, which cancels the call.
     fn decide(
         &self,
-        info: &zmux::CarrierInfo,
+        info: zmux::CarrierInfo,
         prefix: &[u8],
     ) -> zmux::Decision<zmux::AdmissionDecision> {
         let lp = &self.lp;
-        let (info, prefix) = (info.clone(), prefix.to_vec());
+        let prefix = prefix.to_vec();
         let (decide, settling) = (self.decide.clone(), self.decide.clone());
         zmux::Decision::later(lp.settled(
             move |py| {
@@ -385,22 +447,31 @@ impl Admission {
     /// the event loop running when the admission is made, else on that of
     /// the `Listener`'s creation.
     #[new]
-    #[pyo3(signature = (decide, *, peek=0, max_peek=0, peek_timeout=None, stall=None,
-        fallback_on_peek_timeout=false))]
+    #[pyo3(signature = (decide, *, peek=0, max_peek=0, max_message=0, peek_timeout=None,
+        stall=None, fallback_on_peek_timeout=false))]
     fn new(
         py: Python<'_>,
         decide: Py<PyAny>,
         #[pyo3(from_py_with = ranged)] peek: usize,
         #[pyo3(from_py_with = ranged)] max_peek: usize,
+        #[pyo3(from_py_with = ranged)] max_message: usize,
         peek_timeout: Option<Bound<'_, PyAny>>,
         stall: Option<Bound<'_, PyAny>>,
         fallback_on_peek_timeout: bool,
     ) -> PyResult<Self> {
+        if max_message > zmux::MAX_ADMISSION_MESSAGE {
+            return Err(PyValueError::new_err(format!(
+                "max_message is at most {}",
+                zmux::MAX_ADMISSION_MESSAGE
+            )));
+        }
         let d = PyDecide {
             decide: Arc::new(decide),
             lp: LoopRef::lazy(py),
         };
-        let a = zmux::Admission::with_decider(peek, d.clone()).with_max_peek(max_peek);
+        let a = zmux::Admission::with_decider(peek, d.clone())
+            .with_max_peek(max_peek)
+            .with_max_message(max_message);
         Self::with_times(a, Some(d), peek_timeout, stall, fallback_on_peek_timeout)
     }
 
@@ -425,10 +496,17 @@ impl Admission {
     fn peek(&self) -> usize {
         self.inner.peek()
     }
-    /// The largest prefix `AdmissionVerdict.more` may ask for, at least `peek`.
+    /// The largest prefix of a byte stream `AdmissionVerdict.more` may ask
+    /// for, at least `peek`.
     #[getter]
     fn max_peek(&self) -> usize {
         self.inner.max_peek()
+    }
+    /// The largest first message of a message-framed carrier decided on (a
+    /// longer one is closed, counted in `too_large`).
+    #[getter]
+    fn max_message(&self) -> usize {
+        self.inner.max_message()
     }
     /// Whether a carrier whose prefix does not arrive within the peek
     /// timeout goes to the fallback (with the bytes read replayed) instead

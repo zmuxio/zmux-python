@@ -81,6 +81,10 @@ async def test_deferred_secret_joins_after_set() -> None:
             pipe.update(liveness=zmux.PipeLiveness())
             with pytest.raises(ValueError):
                 pipe.update(liveness=zmux.PipeLiveness(dead_timeout=0.1))
+            # Off, derived, or following the carrier and the session.
+            for dead in (None, zmux.AUTO, 1e9):
+                pipe.update(liveness=zmux.PipeLiveness(dead_timeout=dead))
+                assert pipe.options.liveness == zmux.PipeLiveness(dead_timeout=dead)
 
 
 async def test_runtime_settings(sessions: tuple[zmux.Session, zmux.Session]) -> None:
@@ -93,6 +97,13 @@ async def test_runtime_settings(sessions: tuple[zmux.Session, zmux.Session]) -> 
     with pytest.raises(ValueError):
         c.liveness = dataclasses.replace(changed, suspect_floor=0.001)
     assert c.liveness == changed
+    # A dead timeout of None turns stall-based failure off.
+    off = dataclasses.replace(changed, dead_timeout=None)
+    c.liveness = off
+    assert c.liveness.dead_timeout is None
+    with pytest.raises(ValueError):
+        c.liveness = dataclasses.replace(changed, dead_timeout=0.5)
+    assert c.liveness == off
 
     limits = zmux.shaping.ShapingLimits(
         wire=zmux.shaping.ShapingAccount(initial=9), max_delay=0.5
@@ -255,6 +266,18 @@ def test_verdict_forms() -> None:
         and zmux.AdmissionVerdict.CLOSE.need is None
     )
     assert repr(zmux.AdmissionVerdict.more(3)) == "AdmissionVerdict.more(3)"
+    assert repr(zmux.AdmissionVerdict.DEFER) == "AdmissionVerdict.DEFER"
+    assert zmux.AdmissionVerdict.DEFER == zmux.AdmissionVerdict.DEFER
+    assert zmux.AdmissionVerdict.DEFER != zmux.AdmissionVerdict.CLOSE
+
+    def close(_: zmux.CarrierInfo, __: bytes) -> zmux.AdmissionVerdict:
+        return zmux.AdmissionVerdict.CLOSE
+
+    a = zmux.Admission(close, peek=1, max_peek=2)
+    assert (a.max_peek, a.max_message) == (2, zmux.MAX_ADMISSION_MESSAGE)
+    assert zmux.Admission(close, max_message=100).max_message == 100
+    with pytest.raises(ValueError, match="max_message"):
+        zmux.Admission(close, max_message=zmux.MAX_ADMISSION_MESSAGE + 1)
     d = zmux.Decision(zmux.AdmissionVerdict.CLOSE, variant="x")
     assert d == zmux.AdmissionVerdict.CLOSE.labelled("x")
     assert (d.verdict, d.variant) == (zmux.AdmissionVerdict.CLOSE, "x")
