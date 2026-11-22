@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import logging
 import math
 import threading
 import time
@@ -463,7 +464,7 @@ async def test_a_pipe_this_endpoint_aborted_is_reported_as_aborted() -> None:
         with pytest.raises(zmux.PipeAbortedError) as e:
             await asyncio.wait_for(waiting, 10)
         assert isinstance(e.value, zmux.PipeError)
-        assert not isinstance(e.value, zmux.PipeGoneError)
+        assert isinstance(e.value, zmux.PipeGoneError)
         assert e.value.kind == zmux.ErrorKind.FAILED
         await until(lambda: pipe.stats() is None)
         for _ in range(2):
@@ -671,9 +672,9 @@ async def test_a_blocked_loop_costs_a_session_its_newest_events_and_never_the_en
     entered = threading.Event()
     gate = threading.Event()
 
-    class Log:
-        def log(self, level: int, message: str) -> None:
-            logged.append(message)
+    class Log(logging.Logger):
+        def log(self, level: int, msg: object, *args: Any, **kwargs: Any) -> None:
+            logged.append(str(msg))
 
     class Trace(zmux.Tracer):
         def established(self, session: zmux.SessionId) -> None:
@@ -700,7 +701,7 @@ async def test_a_blocked_loop_costs_a_session_its_newest_events_and_never_the_en
         max_pipes=8,
         pipe_auth=zmux.PipeAuth.psk(b"k" * 32).with_end_to_end(),
         tracer=Trace(),
-        logger=Log(),
+        logger=Log(__name__),
     )
     async with zmux.Listener(config=POOL_CONFIG, listener_config=LISTENER) as listener:
         addr = await listener.serve_tcp("127.0.0.1", 0)

@@ -243,8 +243,20 @@ async def test_pipe_loss_statistics() -> None:
             await round_trip(session)
             (st,) = session.pipe_stats()
             assert st.bytes_lost in (0, None) and st.records_lost in (0, None)
-            assert st.bytes_retransmitted is None or st.bytes_retransmitted >= 0
-            assert st.loss_rate is None or st.loss_rate >= 0
+            sample = st.carrier_sample
+            assert sample is not None
+            assert sample.generation == 0
+            assert sample.direction is zmux.Direction.OUT
+            assert isinstance(sample.sampled_at, int)
+            if sample.source in (
+                zmux.CarrierSource.UNKNOWN,
+                zmux.CarrierSource.WINDOWS_SIO_TCP_INFO,
+            ):
+                assert sample.counts is None
+            elif sample.source is zmux.CarrierSource.LINUX_TCP_INFO:
+                assert isinstance(sample.counts, zmux.TcpSegmentCounters)
+                assert sample.counts.data_segs_out >= 0
+            assert session.pipe_stats()[0].carrier_sample == sample
         server.cancel()
 
 
@@ -406,3 +418,29 @@ async def test_a_layer_transport_force_closes_like_asyncio_transports() -> None:
     transport._force_close(err)
     assert transport.is_closing() and transport.get_write_buffer_size() == 0
     assert await asyncio.wait_for(lost, 5) is err
+
+
+def test_carrier_counter_conversion_distinguishes_absence_from_zero() -> None:
+    from zmux._types import _carrier_sample
+
+    zero = _carrier_sample(7, 0, zmux.Direction.OUT, "quinn", 123, ("quic", 0, 0))
+    absent = _carrier_sample(7, 0, zmux.Direction.OUT, "quinn", 123, None)
+    windows = _carrier_sample(
+        8, 0, zmux.Direction.OUT, "windows_sio_tcp_info", 123, None
+    )
+    assert isinstance(zero.carrier_id, zmux.CarrierId)
+    assert len({zero.carrier_id, absent.carrier_id, windows.carrier_id}) == 2
+    assert zero.counts == zmux.QuicCounters(0, 0)
+    darwin = _carrier_sample(
+        9,
+        0,
+        zmux.Direction.OUT,
+        "darwin_tcp_connection_info",
+        123,
+        ("tcp_packets", 4, 2),
+    )
+    assert isinstance(darwin.counts, zmux.TcpPacketCounters)
+    assert (darwin.counts.packets_sent, darwin.counts.packets_retransmitted) == (4, 2)
+    assert absent.counts is None and absent.source is zmux.CarrierSource.QUINN
+    assert windows.counts is None
+    assert windows.source is zmux.CarrierSource.WINDOWS_SIO_TCP_INFO

@@ -655,15 +655,22 @@ impl OnCancel {
         if fut
             .call_method0(intern!(fut.py(), "cancelled"))?
             .is_truthy()?
-            && let Some(tx) = lock(&self.0).take()
         {
-            *lock(&CANCELLING) += 1;
-            if tx.send(()).is_err() {
-                // The task ended already.
-                *lock(&CANCELLING) -= 1;
-            }
+            self.signal();
         }
         Ok(())
+    }
+}
+
+impl OnCancel {
+    fn signal(&self) {
+        if let Some(tx) = lock(&self.0).take() {
+            *lock(&CANCELLING) += 1;
+            if tx.send(()).is_err() {
+                *lock(&CANCELLING) -= 1;
+                CANCELLED.notify_all();
+            }
+        }
     }
 }
 
@@ -720,6 +727,21 @@ fn drive(py: Python<'_>) -> PyResult<&Bound<'_, PyAny>> {
             let code = c"
 import asyncio
 
+class SetupFuture(asyncio.Future):
+    def __init__(self, loop, withdraw):
+        super().__init__(loop=loop)
+        self.withdraw = withdraw
+
+    def cancel(self, msg=None):
+        if self.done():
+            return False
+        error = asyncio.CancelledError() if msg is None else asyncio.CancelledError(msg)
+        if self.withdraw(error):
+            return super().cancel(msg)
+        # Task.cancel delegated here. Rust already owns the result and
+        # its event-loop delivery must still wake the original awaiter.
+        return True
+
 async def drive(start, undo):
     fut, release = start()
     try:
@@ -730,6 +752,8 @@ async def drive(start, undo):
         raise
     finally:
         release()
+
+drive.setup_future = SetupFuture
 ";
             let m = PyModule::from_code(py, code, c"zmux_drive", c"zmux_drive")?;
             Ok::<_, PyErr>(m.getattr("drive")?.unbind())
@@ -759,14 +783,94 @@ where
     T: for<'py> IntoPyObject<'py> + Send + 'static,
     G: Send + 'static,
 {
+    operation(py, fut, undo, None)
+}
+
+#[pyclass(frozen)]
+struct Withdraw {
+    gate: Withdrawal,
+    waiter: OnCancel,
+}
+
+#[pymethods]
+impl Withdraw {
+    fn __call__(&self, error: Bound<'_, PyBaseException>) -> bool {
+        let won = match &self.gate {
+            Withdrawal::Setup(gate) => gate.cancel(),
+            Withdrawal::Join(receipt) => receipt.cancel(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                PyErr::from_value(error.into_any()),
+            )),
+        };
+        if won {
+            self.waiter.signal();
+        }
+        won
+    }
+}
+
+enum Withdrawal {
+    Setup(zmux::adapter::SetupCancellation),
+    Join(zmux::adapter::JoinCancellation),
+}
+
+pub(crate) fn join_future_into_py<F, T>(
+    py: Python<'_>,
+    fut: F,
+    receipt: zmux::adapter::JoinCancellation,
+) -> PyResult<Bound<'_, PyAny>>
+where
+    F: Future<Output = PyResult<T>> + Send + 'static,
+    T: for<'py> IntoPyObject<'py> + Send + 'static,
+{
+    operation(
+        py,
+        async move { fut.await.map(|v| (v, ())) },
+        None,
+        Some(Withdrawal::Join(receipt)),
+    )
+}
+
+pub(crate) fn setup_future_into_py<F>(
+    py: Python<'_>,
+    fut: F,
+    withdrawal: zmux::adapter::SetupCancellation,
+) -> PyResult<Bound<'_, PyAny>>
+where
+    F: Future<Output = PyResult<()>> + Send + 'static,
+{
+    operation(
+        py,
+        async move { fut.await.map(|()| ((), ())) },
+        None,
+        Some(Withdrawal::Setup(withdrawal)),
+    )
+}
+
+fn operation<F, T, G>(
+    py: Python<'_>,
+    fut: F,
+    undo: Option<Py<PyAny>>,
+    withdrawal: Option<Withdrawal>,
+) -> PyResult<Bound<'_, PyAny>>
+where
+    F: Future<Output = PyResult<(T, G)>> + Send + 'static,
+    T: for<'py> IntoPyObject<'py> + Send + 'static,
+    G: Send + 'static,
+{
     let completing = undo.as_ref().map(|u| u.clone_ref(py));
-    let start: Starter = Box::new(move |py| start_future(py, fut, completing));
+    let start: Starter = Box::new(move |py| start_future(py, fut, completing, withdrawal));
     drive(py)?.call1((Begin(StdMutex::new(Some(start))), undo))
 }
 
 /// The asyncio future of `fut`, run on the runtime, on the running event loop.
 /// With the callable that lets go of what the operation held.
-fn start_future<F, T, G>(py: Python<'_>, fut: F, undo: Option<Py<PyAny>>) -> PyResult<Py<PyAny>>
+fn start_future<F, T, G>(
+    py: Python<'_>,
+    fut: F,
+    undo: Option<Py<PyAny>>,
+    withdrawal: Option<Withdrawal>,
+) -> PyResult<Py<PyAny>>
 where
     F: Future<Output = PyResult<(T, G)>> + Send + 'static,
     T: for<'py> IntoPyObject<'py> + Send + 'static,
@@ -774,12 +878,17 @@ where
 {
     let lp = running_loop(py)?;
     let queue = queue_of(&lp)?;
-    let target = lp.call_method0(intern!(py, "create_future"))?;
     let (cancel_tx, cancel_rx) = oneshot::channel();
-    target.call_method1(
-        intern!(py, "add_done_callback"),
-        (OnCancel(StdMutex::new(Some(cancel_tx))),),
-    )?;
+    let waiter = OnCancel(StdMutex::new(Some(cancel_tx)));
+    let target = if let Some(gate) = withdrawal {
+        drive(py)?
+            .getattr("setup_future")?
+            .call1((&lp, Withdraw { gate, waiter }))?
+    } else {
+        let target = lp.call_method0(intern!(py, "create_future"))?;
+        target.call_method1(intern!(py, "add_done_callback"), (waiter,))?;
+        target
+    };
     let fut_py = target.clone().unbind();
     let held = Held::default();
     let release = Release(held.clone());

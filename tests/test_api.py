@@ -851,3 +851,20 @@ def test_record_policy_and_budget_are_data() -> None:
         record_policy=zmux.RecordPolicy(secure="bound", by_label={"lan": "trusted"}),
         shaping_budget=zmux.shaping.ShapingBudget(no_injection=True),
     )
+
+
+async def test_datagram_queue_delay_and_path_datagram_size() -> None:
+    c = zmux.Config()
+    assert c.datagram_queue_delay == pytest.approx(0.02)
+    assert zmux.Config(datagram_queue_delay=None).datagram_queue_delay is None
+    with pytest.raises((ValueError, zmux.ZmuxError)):
+        async with pair(client=zmux.Config(datagram_queue_delay=0)):
+            pass
+    cfg = zmux.Config(enable_datagrams=True)
+    async with pair(client=cfg, server=cfg) as (client, _server, _):
+        # No carrier datagram channel: every datagram rides the records.
+        assert client.path_datagram_size == client.max_datagram_size
+        send, _ = await client.open_bi()
+        assert send.path_datagram_size(3) == send.max_datagram_size(3)
+    ev = zmux.DatagramPathChanged(1200)
+    assert ev.kind is zmux.EventKind.DATAGRAM_PATH_CHANGED and ev.size == 1200

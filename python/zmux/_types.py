@@ -21,6 +21,7 @@ from typing import (
 )
 
 from . import _zmux
+from ._errors import CredentialsFailedError
 
 if TYPE_CHECKING:
     from ._zmux import (
@@ -217,6 +218,7 @@ class ErrorKind(_Enum):
     """`ZmuxError.kind`: the native error variant. Unknown variants stay plain `str`."""
 
     APPLICATION_CLOSED = "ApplicationClosed"
+    CONNECTION_REFUSED = "ConnectionRefused"
     TRANSPORT_CLOSED = "TransportClosed"
     IDLE_TIMEOUT = "IdleTimeout"
     HANDSHAKE_TIMEOUT = "HandshakeTimeout"
@@ -225,6 +227,8 @@ class ErrorKind(_Enum):
     RESUME_FAILED = "ResumeFailed"
     PIPES_LOST = "PipesLost"
     JOIN_REFUSED = "JoinRefused"
+    JOIN_EVICTED = "JoinEvicted"
+    JOIN_TIMEOUT = "JoinTimeout"
     RESET = "Reset"
     STOPPED = "Stopped"
     REJECTED = "Rejected"
@@ -404,12 +408,14 @@ class RejectInfo:
     or `"pq_auth_required"` (the required post-quantum authentication does not hold);
     `"auth"` is for a failed AEAD or Confirm only. A verifier that could not decide
     closes the carrier without an `on_reject` call. Other reasons are an error class of
-    the handshake or the refusal's name, for example `"unknown_locator"`."""
+    the handshake or the refusal's name, for example `"unknown_locator"`.
+    `error` carries the credential failure for verifier, proof and PQ refusals."""
 
     profile: int | None
     record_mode: RecordMode | None
     reason: str
     source: tuple[str, int] | None
+    error: CredentialsFailedError | None = None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -534,6 +540,61 @@ class LaneStats:
 
 
 @dataclass(frozen=True, slots=True)
+class CarrierId:
+    """Opaque, process-local connection identity for equality and hashing."""
+
+    _value: int = field(repr=False)
+
+
+class CarrierSource(_Enum):
+    """Provider of the carrier connection's statistics."""
+
+    UNKNOWN = "unknown"
+    LINUX_TCP_INFO = "linux_tcp_info"
+    DARWIN_TCP_CONNECTION_INFO = "darwin_tcp_connection_info"
+    WINDOWS_SIO_TCP_INFO = "windows_sio_tcp_info"
+    QUINN = "quinn"
+
+
+@dataclass(frozen=True, slots=True)
+class TcpSegmentCounters:
+    """TCP data segments sent and total segments retransmitted."""
+
+    data_segs_out: int
+    total_retrans: int
+
+
+@dataclass(frozen=True, slots=True)
+class TcpPacketCounters:
+    """TCP packets transmitted and retransmitted."""
+
+    packets_sent: int
+    packets_retransmitted: int
+
+
+@dataclass(frozen=True, slots=True)
+class QuicCounters:
+    """QUIC packets sent and declared lost by the provider."""
+
+    packets_sent: int
+    packets_lost: int
+
+
+@dataclass(frozen=True, slots=True)
+class CarrierSample:
+    """A cached connection snapshot shared by its pipes."""
+
+    carrier_id: CarrierId
+    generation: int
+    direction: Direction
+    source: CarrierSource
+    sampled_at: int
+    """Monotonic nanoseconds. A cached read returns the same timestamp."""
+    counts: TcpSegmentCounters | TcpPacketCounters | QuicCounters | None
+    """The measured pair, or None when the provider cannot supply it."""
+
+
+@dataclass(frozen=True, slots=True)
 class PipeStats:
     """A snapshot of one attachment. Durations in seconds, rates in bytes per
     second, points in time on the `time.monotonic()` clock; estimates and
@@ -604,14 +665,8 @@ class PipeStats:
     no record on a live pipe."""
     records_lost: int | None
     """`bytes_lost` in records, an estimate (rounded up)."""
-    bytes_retransmitted: int | None
-    """The bytes the carrier itself retransmitted (TCP on Linux, Android,
-    Apple platforms and Windows; QUIC, the connection's count on each of its
-    pipes), queried at most once a second; `None` where it reports none."""
-    loss_rate: float | None
-    """The smoothed carrier loss rate, an estimate: the growth of
-    `bytes_retransmitted` over that of `bytes_sent` (EWMA, gain 1/8),
-    sampled at most once a second; `None` before the first sample."""
+    carrier_sample: CarrierSample | None
+    """The carrier connection's most recent on-demand observation."""
     bytes_opportunistic: int
     bytes_redundant: int
     bytes_duplicate_received: int
@@ -669,12 +724,14 @@ class AdmissionVariants:
 @dataclass(frozen=True, slots=True)
 class VariantStats:
     """The admission's verdicts on the carriers it labelled with one
-    variant; they count in the totals of `AdmissionStats` as well."""
+    variant. `takeover` counts dispatches to the byte-stream target.
+    These carriers count in the totals of `AdmissionStats` as well."""
 
     accepted: int = 0
     fallback: int = 0
     stalled: int = 0
     closed: int = 0
+    takeover: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -682,17 +739,22 @@ class AdmissionStats:
     """What a listener's admission decided: counts since it was made, each
     carrier that took a source slot counted once its outcome is known; all 0
     without an admission. `accepted` carriers count once more in the other
-    `ListenerStats` fields; `fallback` includes those stalled for want of a
-    fallback; `stalled` counts when the stall starts; `closed` also counts
+    `ListenerStats` fields. `fallback` counts handoffs to a host, including
+    those routed there after a peek timeout. `takeover` counts handoffs to
+    the byte-stream target when the host callback begins. `stalled` counts
+    stalls when they start and targetless HTTP fallbacks answered with 404.
+    `closed` also counts
     a verdict where it does not apply (an `accept` beyond the prefix, a
     `more` or `DEFER` out of place), a failing decide, one cancelled by the
     listener's close, a message-framed carrier without a first message to
-    decide on, and a deferred decision whose carrier ended first;
-    `stall_overflow` a stall closed at once, its source already stalling
-    `max_pending_per_source - 1` carriers or the listener closing;
-    `too_large` a first message longer than `Admission.max_message`, closed
-    undecided; `peek_timed_out` a prefix, a deferred carrier or a decision
-    past the peek timeout; `handshake_failed` an outer handshake (TLS, HTTP
+    decide on, an oversized first message on an ordinary carrier, and a
+    deferred decision whose carrier ended first. `stall_overflow` counts
+    a stall closed at once when its source already stalls
+    `max_pending_per_source - 1` carriers, stalls occupy half of
+    `max_pending`, or the listener closes. `too_large` counts a deferred
+    first message after an upgrade that exceeds `Admission.max_message`.
+    `peek_timed_out` counts admission that ends at the peek deadline.
+    `handshake_failed` counts an outer handshake (TLS, HTTP
     upgrade, QUIC) that failed or timed out, counted here and not in
     `setup_failures`. A deferral is no outcome of its own."""
 
@@ -704,6 +766,7 @@ class AdmissionStats:
     too_large: int = 0
     peek_timed_out: int = 0
     handshake_failed: int = 0
+    takeover: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -945,6 +1008,7 @@ class EventKind(_Enum):
     CARRIER_CHOSEN = "CarrierChosen"
     EPOCH_COMMITTED = "EpochCommitted"
     EPOCH_DELETED = "EpochDeleted"
+    DATAGRAM_PATH_CHANGED = "DatagramPathChanged"
     UNKNOWN = "Unknown"
 
 
@@ -1163,6 +1227,18 @@ class EpochDeleted(Event):
 
 
 @dataclass(frozen=True, slots=True)
+class DatagramPathChanged(Event):
+    """`Session.path_datagram_size` changed to `size`: the carrier's
+    datagram size changed (path MTU discovery), another pipe carries the
+    datagrams, or they moved between the carrier's datagrams and records.
+    It is noticed when the session sends or its pipes change; `None` when
+    the peer accepts no datagram. The latest when several were not read."""
+
+    kind: ClassVar[EventKind] = EventKind.DATAGRAM_PATH_CHANGED
+    size: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class UnknownEvent(Event):
     """An event this binding does not model yet; `detail` is diagnostic text."""
 
@@ -1194,6 +1270,7 @@ _EVENTS: dict[str, type[Event]] = {
         CarrierChosen,
         EpochCommitted,
         EpochDeleted,
+        DatagramPathChanged,
     )
 }
 
@@ -1217,6 +1294,33 @@ def _event(kind: str, fields: dict[str, Any]) -> Event:
     return cls(**fields)
 
 
+def _carrier_sample(
+    carrier_id: int,
+    generation: int,
+    direction: Direction,
+    source: str,
+    sampled_at: int,
+    pair: tuple[str, int, int] | None,
+) -> CarrierSample:
+    counts: TcpSegmentCounters | TcpPacketCounters | QuicCounters | None = None
+    if pair is not None:
+        kind, sent, lost = pair
+        if kind == "tcp_segments":
+            counts = TcpSegmentCounters(sent, lost)
+        elif kind == "tcp_packets":
+            counts = TcpPacketCounters(sent, lost)
+        elif kind == "quic":
+            counts = QuicCounters(sent, lost)
+    return CarrierSample(
+        CarrierId(carrier_id),
+        generation,
+        direction,
+        CarrierSource(source),
+        sampled_at,
+        counts,
+    )
+
+
 def _pipe_stats(fields: dict[str, Any]) -> PipeStats:
     if fields["inbound"] is not None:
         fields["inbound"] = _enum_of(InboundState, fields["inbound"])
@@ -1224,6 +1328,8 @@ def _pipe_stats(fields: dict[str, Any]) -> PipeStats:
         fields["outbound"] = _enum_of(OutboundState, fields["outbound"])
     if fields["carrier"] is not None:
         fields["carrier"] = _enum_of(CarrierKind, fields["carrier"])
+    if fields["carrier_sample"] is not None:
+        fields["carrier_sample"] = _carrier_sample(*fields["carrier_sample"])
     for k in ("send_priority_source", "standby_source"):
         fields[k] = _enum_of(PrioritySource, fields[k])
     if fields["rtt_source"] is not None:
@@ -2054,6 +2160,11 @@ class Config:
     opened yet; stream queues do not count against it) and
     `datagram_stream_bytes` (512 KiB per stream; `None`: only the count
     bounds a stream queue), each at least 1; the oldest make room.
+    `datagram_queue_delay` (0.02 s; `None`: off; else above 0) bounds how
+    long datagrams wait in every queue, the send queue included: once the
+    datagrams leaving a queue have waited longer for 0.1 s, CoDel
+    (RFC 8289) drops some as they leave, counted; a datagram alone in its
+    queue is never dropped for its delay.
 
     Multipath: `max_pipes` (1, multipath off; 8 recommended),
     `pipe_headroom` (8), `replay_window` (`AUTO`, or at least `max_pipes +
@@ -2091,7 +2202,7 @@ class Config:
     (`EpochPolicy()`), `record_policy` (a `RecordPolicy`; `None`: sealed)
     choosing a joined pipe's record mode and `allow_record_mode(input, mode, admitted)` admitting
     it, `authorize_join(pipe_id)` (on an acceptor, a further check of a
-    join after its authentication and record mode: falsy or an exception
+    join after authentication and before its record mode policy: falsy or an exception
     refuses it), and `allow_connection_window_increase(increase)` (when
     given, the session receive window grows only by increases it approves:
     falsy or an exception refuses). `allow_record_mode`, `authorize_join`
@@ -2134,6 +2245,7 @@ class Config:
     datagram_stream_queue: int = _DEFAULTS["datagram_stream_queue"]
     datagram_receive_bytes: int = _DEFAULTS["datagram_receive_bytes"]
     datagram_stream_bytes: int | None = _DEFAULTS["datagram_stream_bytes"]
+    datagram_queue_delay: float | None = _DEFAULTS["datagram_queue_delay"]
     send_buffer: int = _DEFAULTS["send_buffer"]
     send_buffer_max: int | Auto = AUTO
     max_send_record: int = _DEFAULTS["max_send_record"]
@@ -2158,6 +2270,10 @@ class Config:
     record_policy: RecordPolicy | None = None
     allow_record_mode: (
         Callable[[RecordPolicyInput, RecordMode, Any], bool | Awaitable[bool]] | None
+    ) = field(default=None, compare=False)
+    join_outcome: (
+        Callable[[_zmux.Session, PipeId, BaseException | None], Awaitable[None] | None]
+        | None
     ) = field(default=None, compare=False)
     authorize_join: Callable[[PipeId], bool | Awaitable[bool]] | None = field(
         default=None, compare=False
@@ -2284,16 +2400,14 @@ class ListenerConfig:
     unauthenticated carrier: an unknown Locator, a failed Hello, a refused
     Establish (it may be `async`; past the handshake timeout the carrier is
     closed). Nothing is sent either way. `fallback(takeover)` (it may be
-    `async`) is given every carrier the admission hands back, as a
-    `Takeover`: on `AdmissionVerdict.fallback(value=...)`, or on a prefix
-    `fallback_on_peek_timeout` gave up on, whatever entry took it (a TCP or
-    TLS stream, a WebSocket decided on its first message, the first stream
-    of a QUIC connection or a WebTransport session, an HTTP request carrier
-    decided on its body, a pipe given to `handle_pipe`). An HTTP request
-    carrier decided on its body is answered 200 as an accepted one and taken
-    over as the full-duplex pipe of its request and response bodies (HTTP/1.1,
-    HTTP/2, HTTP/3); one decided on its head gets 404. Without `fallback`
-    such carriers are stalled. The call runs to its end whatever the
+    `async`) receives the carrier itself on an explicit
+    `AdmissionVerdict.takeover(value=...)`. HTTP writes the accepted
+    response head first and hands over the request and response bodies.
+    Without a byte-stream target the carrier stalls. A
+    `AdmissionVerdict.fallback(value=...)` or a prefix timeout configured
+    for fallback uses the normal handler for that carrier: the HTTP
+    adapter's fallback for requests, the byte-stream target for streams.
+    The call runs to its end whatever the
     listener does (its close included); once it returned, what it neither
     took (`into_pipe`, `into_messages`) nor detached is closed, and so is
     what the adapter holds of the carrier (the QUIC connection, the

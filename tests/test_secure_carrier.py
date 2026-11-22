@@ -439,7 +439,7 @@ async def test_a_profile_without_a_key_is_accepted_only_when_listed() -> None:
                 else:
                     with pytest.raises(zmux.NoReplyError) as e:
                         await go
-                    assert isinstance(e.value.__cause__, OSError)
+                    assert isinstance(e.value.__cause__, (EOFError, TimeoutError))
 
 
 async def test_configuration_errors_and_names() -> None:
@@ -603,10 +603,11 @@ async def test_too_much_application_data_fails_and_none_is_unbounded() -> None:
     ) as listener:
         addr = await listener.serve_tcp("127.0.0.1", 0)
         async with asyncio.timeout(10):
-            with pytest.raises(zmux.ZmuxError):
+            with pytest.raises(zmux.SecureCarrierError) as received:
                 await zmux.establish(
                     await zmux.dial_tcp(*addr), verifier=Judge(), handle=HANDLE, psk=PSK
                 )
+            assert received.value.kind == "too_large"
             _, peer = await zmux.establish(
                 await zmux.dial_tcp(*addr),
                 verifier=Judge(),
@@ -720,10 +721,10 @@ async def test_a_rejection_and_a_temporary_failure(
 ) -> None:
     """Only a rejection goes to the reject policy; any exception but
     `VerifyUnavailable` is one."""
-    reasons: list[str] = []
+    refusals: list[zmux.RejectInfo] = []
 
     def on_reject(info: zmux.RejectInfo) -> str:
-        reasons.append(info.reason)
+        refusals.append(info)
         return "close"
 
     gate = Gate()
@@ -741,8 +742,17 @@ async def test_a_rejection_and_a_temporary_failure(
                 async with await zmux.Session.connect(pipe, config=CONFIG) as session:
                     await round_trip(session)
             if rejected:
-                await until(lambda: reasons)
-    assert reasons == (["credentials_failed"] if rejected else [])
+                await until(lambda: refusals)
+    if rejected:
+        (refusal,) = refusals
+        assert refusal.reason == "credentials_failed"
+        assert isinstance(refusal.error, zmux.CredentialsFailedError)
+        assert refusal.error.kind == "credentials_failed"
+        assert refusal.error.reason == "verifier"
+        assert isinstance(refusal.error.__cause__, zmux.VerifyRejectedError)
+        assert f"{raises.__name__}: no" in str(refusal.error.__cause__)
+    else:
+        assert refusals == []
     assert not gate.committed
 
 
@@ -788,7 +798,11 @@ async def test_an_epoch_advance_is_reported() -> None:
         zmux.Config(epoch_policy=zmux.EpochPolicy(joins=-1))
 
 
+# HS-21
 async def test_replace_pipes_replaces_every_pipe() -> None:
+    from dataclasses import replace
+
+    outcomes: asyncio.Queue[tuple[zmux.PipeId, BaseException | None]] = asyncio.Queue()
     where: list[tuple[str, int]] = []
 
     async def redial(direction: zmux.Direction) -> zmux.PipeIo:
@@ -834,13 +848,19 @@ async def test_replace_pipes_replaces_every_pipe() -> None:
             pipe, _ = await zmux.establish(
                 await zmux.dial_tcp(*addr), verifier=Judge(), handle=HANDLE, psk=PSK
             )
-            async with await zmux.Session.connect(pipe, config=config) as session:
+            async with await zmux.Session.connect(
+                pipe,
+                config=replace(
+                    config, join_outcome=lambda _, p, e: outcomes.put_nowait((p, e))
+                ),
+            ) as session:
                 await round_trip(session)
                 extra = await session.add_pipe(
                     await zmux.dial_tcp(*addr),
                     options=zmux.PipeOptions(record_mode="sealed"),
                 )
                 await extra.joined()
+                assert await outcomes.get() == (extra.id, None)
                 before = {p.pipe for p in session.pipe_stats()}
                 await session.replace_pipes()
                 assert session.epoch == 1
@@ -850,6 +870,10 @@ async def test_replace_pipes_replaces_every_pipe() -> None:
                     if p.outbound is zmux.OutboundState.ACTIVE
                 }
                 assert after and not (after & before)
+                assert {await outcomes.get() for _ in after} == {
+                    (p, None) for p in after
+                }
+                assert outcomes.empty()
                 await round_trip(session)
         server.cancel()
 
@@ -903,10 +927,10 @@ async def test_the_server_names_a_credential_refusal_by_its_own_reason(
     """A server judging a client closes that carrier and reports the reason to
     `on_reject` and its statistics; it raises nothing to the application, and
     the client learns nothing from the wire."""
-    reasons: list[str] = []
+    refusals: list[zmux.RejectInfo] = []
 
     def on_reject(info: zmux.RejectInfo) -> str:
-        reasons.append(info.reason)
+        refusals.append(info)
         return "close"
 
     client_key = zmux.SigningKey.generate(zmux.KeyAlg.MLDSA44)
@@ -937,8 +961,17 @@ async def test_the_server_names_a_credential_refusal_by_its_own_reason(
             with pytest.raises(zmux.ZmuxError):
                 async with await zmux.Session.connect(pipe, config=CONFIG) as session:
                     await round_trip(session)
-            await until(lambda: reasons)
-        assert reasons == [reason]
+            await until(lambda: refusals)
+        (refusal,) = refusals
+        assert refusal.reason == reason
+        assert isinstance(refusal.error, zmux.CredentialsFailedError)
+        assert refusal.error.kind == "credentials_failed"
+        assert refusal.error.reason == reason
+        if reason == "proof":
+            assert isinstance(refusal.error.__cause__, zmux.CredentialsFailedError)
+            assert refusal.error.__cause__.kind == "credentials_failed"
+        else:
+            assert refusal.error.__cause__ is None
         await until(lambda: listener.stats().rejected == 1)
         # Nothing reached the application: no session was accepted.
         assert listener.stats().sessions == 0
@@ -952,10 +985,21 @@ async def test_credentials_failed_is_raised_by_the_side_that_judged() -> None:
         config=CONFIG, listener_config=zmux.ListenerConfig(secure_server=server)
     ) as listener:
         addr = await listener.serve_tcp("127.0.0.1", 0)
-        for verifier, pq in (
-            (Judge(zmux.VerifyRejectedError), False),
-            (Judge(zmux.VerifyUnavailableError), False),
-            (Judge(), True),
+        for verifier, pq, reason, cause in (
+            (
+                Judge(zmux.VerifyRejectedError),
+                False,
+                "verifier",
+                zmux.VerifyRejectedError,
+            ),
+            (
+                Judge(zmux.VerifyUnavailableError),
+                False,
+                "verifier",
+                zmux.VerifyUnavailableError,
+            ),
+            (Judge(proof_key=bytes(32)), False, "proof", zmux.CredentialsFailedError),
+            (Judge(), True, "pq_auth_required", zmux.CredentialsFailedError),
         ):
             async with asyncio.timeout(10):
                 with pytest.raises(zmux.CredentialsFailedError) as e:
@@ -967,3 +1011,76 @@ async def test_credentials_failed_is_raised_by_the_side_that_judged() -> None:
                         require_pq_auth=pq,
                     )
             assert e.value.kind == "credentials_failed" and e.value.code is None
+            assert e.value.reason == reason
+            assert isinstance(e.value.__cause__, cause)
+
+
+@pytest.mark.parametrize(
+    ("callback", "message"),
+    [("verifier", 2), ("app_data", 1), ("app_data", 3)],
+)
+async def test_establish_preserves_host_error(callback: str, message: int) -> None:
+    failure = zmux.VerifyUnavailableError("host unavailable")
+
+    class Verifier:
+        def verify(self, _input: zmux.VerifyInput) -> zmux.VerifyVerdict:
+            raise failure
+
+    async def app_data(
+        current: int,
+        _peer: zmux.VerifyInput | None,
+        _verdict: zmux.VerifyVerdict | None,
+    ) -> None:
+        if current == message:
+            raise failure
+
+    server = zmux.SecureServer(Gate(), NODE)
+    async with (
+        asyncio.timeout(5),
+        zmux.Listener(
+            listener_config=zmux.ListenerConfig(secure_server=server)
+        ) as listener,
+    ):
+        addr = await listener.serve_tcp("127.0.0.1", 0)
+        if callback == "verifier":
+            with pytest.raises(zmux.CredentialsFailedError) as credential:
+                await zmux.establish(
+                    await zmux.dial_tcp(*addr),
+                    verifier=Verifier(),
+                    handle=HANDLE,
+                    psk=PSK,
+                )
+            assert credential.value.reason == "verifier"
+            assert credential.value.__cause__ is failure
+        else:
+            with pytest.raises(zmux.VerifyUnavailableError) as app:
+                await zmux.establish(
+                    await zmux.dial_tcp(*addr),
+                    verifier=Judge(),
+                    handle=HANDLE,
+                    psk=PSK,
+                    app_data=app_data,
+                )
+            assert app.value is failure
+
+
+@pytest.mark.parametrize("reply_error", [EOFError, TimeoutError])
+async def test_no_reply_preserves_io_type(reply_error: type[Exception]) -> None:
+    client, peer = zmux.adapter.pipe_pair()
+
+    async def end_after_hello() -> None:
+        assert await peer.read()
+        await peer.write(b"")
+
+    async with asyncio.timeout(5), asyncio.TaskGroup() as tasks:
+        if reply_error is EOFError:
+            tasks.create_task(end_after_hello())
+        with pytest.raises(zmux.NoReplyError) as refused:
+            await zmux.establish(
+                client,
+                verifier=Judge(),
+                handle=HANDLE,
+                psk=PSK,
+                reply_timeout=None if reply_error is EOFError else 0,
+            )
+        assert isinstance(refused.value.__cause__, reply_error)

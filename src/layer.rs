@@ -70,6 +70,14 @@ fn released() -> PyErr {
 
 #[pymethods]
 impl CarrierStream {
+    #[pyo3(name = "_release")]
+    fn release_py<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+        let stream = self.handle();
+        future_into_py(py, async move {
+            stream.release().await;
+            Ok(())
+        })
+    }
     /// Up to `n` bytes; `b""` at the end of the stream (also without a
     /// receiving half).
     #[pyo3(signature = (n=65536))]
@@ -125,6 +133,7 @@ impl CarrierStream {
 /// is one message to Python, which writes it to the layer once; what the
 /// layer reads comes back as messages.
 struct ChanIo {
+    _release: tokio::sync::watch::Sender<()>,
     rx: mpsc::Receiver<Bytes>,
     buf: Bytes,
     tx: Option<mpsc::Sender<Bytes>>,
@@ -196,6 +205,7 @@ impl AsyncWrite for ChanIo {
 /// to the binding.
 #[pyclass(frozen, name = "_LayerEnd", module = "zmux")]
 pub(crate) struct LayerEnd {
+    bridge: crate::Bridge,
     /// The carrier's writes, one message each.
     rx: Arc<Mutex<mpsc::Receiver<Bytes>>>,
     /// Writes of reads cancelled as they completed.
@@ -204,17 +214,20 @@ pub(crate) struct LayerEnd {
     tx: std::sync::Mutex<Option<mpsc::Sender<Bytes>>>,
 }
 
-fn chan_pair() -> (ChanIo, LayerEnd) {
+fn chan_pair(io: &mut zmux::PipeIo) -> (ChanIo, LayerEnd) {
+    let (release, bridge) = crate::Bridge::new(Some(io));
     let (out_tx, out_rx) = mpsc::channel(DEPTH);
     let (in_tx, in_rx) = mpsc::channel(DEPTH);
     (
         ChanIo {
+            _release: release,
             rx: in_rx,
             buf: Bytes::new(),
             tx: Some(out_tx),
             reserve: None,
         },
         LayerEnd {
+            bridge,
             rx: Arc::new(Mutex::new(out_rx)),
             unread: Returned::default(),
             tx: std::sync::Mutex::new(Some(in_tx)),
@@ -224,6 +237,14 @@ fn chan_pair() -> (ChanIo, LayerEnd) {
 
 #[pymethods]
 impl LayerEnd {
+    #[pyo3(name = "_released")]
+    fn released<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
+        self.bridge.released(py)
+    }
+    #[pyo3(name = "_bridge_done")]
+    fn bridge_done(&self) {
+        self.bridge.done();
+    }
     /// The next write of the carrier; `b""` once it ended.
     fn read<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
         let (rx, unread) = (self.rx.clone(), self.unread.queue());
@@ -263,13 +284,13 @@ impl LayerEnd {
 /// `PipeIo.wrap`: runs the Python `layer` over `io` through
 /// `zmux._layer.run`, on `lp`'s loop.
 pub(crate) async fn wrap(
-    io: zmux::PipeIo,
+    mut io: zmux::PipeIo,
     layer: Py<PyAny>,
     server_side: bool,
     lp: LoopRef,
 ) -> io::Result<zmux::PipeIo> {
+    let (chan, end) = chan_pair(&mut io);
     io.wrap(move |stream| async move {
-        let (chan, end) = chan_pair();
         let stream = CarrierStream::new(stream);
         let ours = stream.handle();
         let r = lp

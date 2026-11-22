@@ -94,31 +94,32 @@ async def test_limited_splice_and_a_busy_thread_leave_other_sessions_alive() -> 
         assert done.a_to_b.bytes == 50_000
 
 
-@pytest.mark.skipif(not hasattr(os, "fork"), reason="no fork")
-@pytest.mark.filterwarnings("ignore::DeprecationWarning")
-async def test_a_child_forked_after_use_raises() -> None:
-    async with pair() as (c, _s):
-        await c.ping()
-        r, w = os.pipe()
-        pid = os.fork()
-        if pid == 0:  # pragma: no cover - the child
-            os.close(r)
-            code = 1
+if sys.platform != "win32":
+
+    @pytest.mark.filterwarnings("ignore::DeprecationWarning")
+    async def test_a_child_forked_after_use_raises() -> None:
+        async with pair() as (c, _s):
+            await c.ping()
+            r, w = os.pipe()
+            pid = os.fork()
+            if pid == 0:  # pragma: no cover - the child
+                os.close(r)
+                code = 1
+                try:
+                    asyncio.run(asyncio.wait_for(zmux.dial_tcp("127.0.0.1", 1), 2))
+                except RuntimeError as e:
+                    code = 0 if "fork" in str(e) else 2
+                except BaseException:
+                    code = 3
+                os.write(w, bytes([code]))
+                os._exit(0)
+            os.close(w)
             try:
-                asyncio.run(asyncio.wait_for(zmux.dial_tcp("127.0.0.1", 1), 2))
-            except RuntimeError as e:
-                code = 0 if "fork" in str(e) else 2
-            except BaseException:
-                code = 3
-            os.write(w, bytes([code]))
-            os._exit(0)
-        os.close(w)
-        try:
-            got = await asyncio.wait_for(asyncio.to_thread(os.read, r, 1), 10)
-        finally:
-            os.close(r)
-            os.waitpid(pid, 0)
-        assert got == b"\x00"
+                got = await asyncio.wait_for(asyncio.to_thread(os.read, r, 1), 10)
+            finally:
+                os.close(r)
+                os.waitpid(pid, 0)
+            assert got == b"\x00"
 
 
 def run_child(code: str) -> subprocess.CompletedProcess[str]:

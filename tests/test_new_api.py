@@ -56,20 +56,24 @@ async def test_fallback_on_peek_timeout() -> None:
     assert not zmux.Admission(
         lambda i, p: zmux.AdmissionVerdict.CLOSE
     ).fallback_on_peek_timeout
-    async with zmux.Listener(
-        listener_config=zmux.ListenerConfig(admission=admission)
-    ) as listener:
-        addr = await listener.serve_tcp("127.0.0.1", 0)
-        host, port = addr
-        _, writer = await asyncio.open_connection(host, int(port))
-        writer.write(b"ab")
-        await writer.drain()
-        async with asyncio.timeout(5):
-            while not listener.stats().admission.fallback:
-                await asyncio.sleep(0.01)
-        stats = listener.stats().admission
-        assert (stats.peek_timed_out, stats.fallback) == (1, 1)
-        writer.close()
+    replayed: asyncio.Queue[bytes] = asyncio.Queue()
+    config = zmux.ListenerConfig(
+        admission=admission, fallback=lambda taken: replayed.put_nowait(taken.replayed)
+    )
+    async with asyncio.timeout(5), zmux.Listener(listener_config=config) as listener:
+        reader, writer = await asyncio.open_connection(
+            *await listener.serve_tcp("127.0.0.1", 0)
+        )
+        try:
+            writer.write(b"ab")
+            await writer.drain()
+            assert await replayed.get() == b"ab"
+            assert await reader.read() == b""
+            stats = listener.stats().admission
+            assert (stats.peek_timed_out, stats.fallback, stats.stalled) == (0, 1, 0)
+        finally:
+            writer.close()
+            await writer.wait_closed()
 
 
 async def test_http_split_pair_field() -> None:

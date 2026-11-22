@@ -4,11 +4,12 @@ replay, its framing and its detach."""
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 
 import pytest
 import zmux
 import zmux._zmux
-from test_smoke import Tls, dial_with, serve_admitted
+from test_smoke import Tls, dial_with, serve_admitted, serve_test_http
 
 HELLO = b"HELO"
 
@@ -22,13 +23,15 @@ def tls() -> Tls:
     return zmux.TlsConfig(cert=cert_pem, key=key_pem), zmux.TlsConfig(ca=cert_pem)
 
 
-def decide(info: zmux.CarrierInfo, prefix: bytes) -> zmux.AdmissionVerdict:
+def decide(
+    info: zmux.CarrierInfo, prefix: bytes
+) -> zmux.AdmissionVerdict | zmux.Decision:
     """Defers an upgrade's head; hands a carrier that starts with HELLO to
     the fallback with a value naming the service."""
     if info.stage is zmux.AdmissionStage.HEAD:
         return zmux.AdmissionVerdict.DEFER
     if prefix == HELLO:
-        return zmux.AdmissionVerdict.fallback(value=("echo", 7))
+        return zmux.AdmissionVerdict.takeover(value=("echo", 7)).labelled("relay")
     return zmux.AdmissionVerdict.CLOSE
 
 
@@ -70,6 +73,7 @@ def test_fallback_verdict_values() -> None:
 @pytest.mark.parametrize(
     "carrier", ["tcp", "tls", "http", "h3", "quic", "websocket", "webtransport"]
 )
+# HS-15
 async def test_every_carrier_reaches_the_fallback(carrier: str, tls: Tls) -> None:
     """The host detaches each carrier and serves it after its fallback
     returned: a message-framed one by whole messages, the others as streams,
@@ -98,6 +102,10 @@ async def test_every_carrier_reaches_the_fallback(carrier: str, tls: Tls) -> Non
         await served.put((t.value, head, await read_to_end(s)))
 
     async def fallback(t: zmux.Takeover) -> None:
+        assert listener.stats().admission.takeover == 1
+        assert listener.variant_stats().variants["relay"] == zmux.VariantStats(
+            takeover=1
+        )
         assert t.info.stage is zmux.AdmissionStage.CARRIER
         assert t.replayed == HELLO
         assert not t.detached
@@ -129,7 +137,7 @@ async def test_every_carrier_reaches_the_fallback(carrier: str, tls: Tls) -> Non
         assert tail == (b"" if carrier == "websocket" else b"tail")
         await asyncio.gather(*tasks)
         a = listener.stats().admission
-        assert (a.fallback, a.accepted) == (1, 0)
+        assert (a.takeover, a.fallback, a.accepted) == (1, 0, 0)
 
 
 async def test_a_returned_takeover_is_closed() -> None:
@@ -157,6 +165,7 @@ async def test_a_returned_takeover_is_closed() -> None:
         assert "returned" in repr(t)
 
 
+# HS-10
 async def test_a_taken_carrier_is_the_hosts() -> None:
     """Taken in the call, the carrier outlives it without a detach; the
     takeover then refuses a second take and a detach."""
@@ -190,11 +199,16 @@ async def test_a_taken_carrier_is_the_hosts() -> None:
         await asyncio.gather(*tasks)
 
 
+# HS-07
 async def test_a_failing_fallback_closes_its_carrier(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    raised: list[BaseException | None] = []
-    monkeypatch.setattr("sys.unraisablehook", lambda u: raised.append(u.exc_value))
+    loop = asyncio.get_running_loop()
+    raised = loop.create_future()
+    monkeypatch.setattr(
+        "sys.unraisablehook",
+        lambda u: loop.call_soon_threadsafe(raised.set_result, u.exc_value),
+    )
 
     async def fallback(t: zmux.Takeover) -> None:
         raise RuntimeError("no service")
@@ -206,13 +220,10 @@ async def test_a_failing_fallback_closes_its_carrier(
         await writer.drain()
         assert await asyncio.wait_for(reader.read(), 10) == b""
         writer.close()
-    for _ in range(100):
-        if raised:
-            break
-        await asyncio.sleep(0.01)
-    assert isinstance(raised[0], RuntimeError)
+    assert isinstance(await asyncio.wait_for(raised, 5), RuntimeError)
 
 
+# HS-17
 async def test_handle_pipe_reaches_the_fallback() -> None:
     """A pipe the application hands over goes to the fallback too, with
     every capability it was given."""
@@ -225,12 +236,10 @@ async def test_handle_pipe_reaches_the_fallback() -> None:
         server, client = await socket_pair()
         given = zmux.pipe_from_streams(*server)
         given.reports_failure = True
-        handled: Awaitable[None] = listener.handle_pipe(given)
+        handled: Awaitable[object] = listener.handle_pipe(given)
         client[1].write(HELLO)
         await client[1].drain()
-        # Not admitted to the listener: it went to the fallback.
-        with pytest.raises(zmux.ConnectError):
-            await handled
+        assert await handled is None
         pipe = await asyncio.wait_for(got, 10)
         assert pipe.reports_failure
         s = pipe.into_stream()
@@ -312,3 +321,236 @@ async def test_an_undetached_request_carrier_is_cut(carrier: str, tls: Tls) -> N
         with pytest.raises(zmux.ConnectError):
             await asyncio.wait_for(read_to_end(c), 10)
         assert len(kept) == 1
+
+
+@pytest.mark.parametrize("take", [True, False])
+# HS-12
+async def test_cancelling_handler_after_fallback_dispatch(take: bool) -> None:
+    entered = asyncio.get_running_loop().create_future()
+    resume = asyncio.Event()
+
+    async def fallback(t: zmux.Takeover) -> None:
+        entered.set_result(t)
+        await resume.wait()
+        if take:
+            carrier = t.into_pipe().into_stream()
+            await carrier.write(b"host")
+            await carrier.shutdown()
+
+    async with (
+        asyncio.timeout(5),
+        zmux.Listener(listener_config=config(fallback)) as listener,
+    ):
+        pipe, peer = zmux.adapter.pipe_pair()
+        handler = asyncio.ensure_future(listener.handle_pipe(pipe))
+        await peer.write(HELLO)
+        retained = await entered
+        assert handler.cancel()
+        resume.set()
+        await handler
+        if take:
+            assert await peer.read() == b"host"
+        assert await peer.read() == b""
+        with pytest.raises(zmux.PipeUsedError if take else zmux.TakeoverReturnedError):
+            retained.into_pipe()
+
+
+@pytest.mark.parametrize("raises", [False, True])
+# HS-10, HS-11
+async def test_fallback_result_with_an_undetached_carrier(
+    raises: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if raises:
+        monkeypatch.setattr("sys.unraisablehook", lambda _: None)
+
+    failure = RuntimeError("fallback failed")
+
+    def fallback(_takeover: zmux.Takeover) -> None:
+        if raises:
+            raise failure
+
+    cfg = zmux.ListenerConfig(
+        admission=zmux.Admission(
+            lambda *_: zmux.AdmissionVerdict.fallback(), peek=len(HELLO)
+        ),
+        fallback=fallback,
+    )
+    async with zmux.Listener(listener_config=cfg) as listener:
+        server, client = await socket_pair()
+        handled: Awaitable[object] = listener.handle_pipe(
+            zmux.pipe_from_streams(*server)
+        )
+        client[1].write(HELLO)
+        await client[1].drain()
+        if raises:
+            with pytest.raises(zmux.ConnectError) as caught:
+                await handled
+            assert caught.value.__cause__ is failure
+        else:
+            assert await handled is None
+        assert await asyncio.wait_for(client[0].read(), 10) == b""
+        client[1].close()
+        await client[1].wait_closed()
+
+
+# HS-35
+async def test_listener_close_before_accept_reports_application_zero() -> None:
+    async with zmux.Listener() as listener:
+        server, peer = await socket_pair()
+        _, client = await asyncio.gather(
+            listener.handle_pipe(zmux.pipe_from_streams(*server)),
+            zmux.Session.connect(zmux.pipe_from_streams(*peer)),
+        )
+        listener.close()
+        end = await asyncio.wait_for(client.wait_closed(), 10)
+        assert isinstance(end, zmux.ApplicationClosedError)
+        assert end.remote and end.code == 0
+
+
+# HS-18, HS-19
+async def test_takeover_without_a_target_stalls_until_listener_closes() -> None:
+    cfg = zmux.ListenerConfig(
+        admission=zmux.Admission(
+            lambda *_: zmux.Decision(zmux.AdmissionVerdict.takeover(), variant="relay"),
+            peek=0,
+        )
+    )
+    async with asyncio.timeout(5), zmux.Listener(listener_config=cfg) as listener:
+        stream, peer = zmux.adapter.pipe_pair()
+        with pytest.raises(zmux.ZmuxError):
+            await listener.handle_pipe(stream)
+        a = listener.stats().admission
+        assert (a.takeover, a.fallback, a.stalled) == (0, 0, 1)
+        assert listener.variant_stats().variants["relay"] == zmux.VariantStats(
+            stalled=1
+        )
+        listener.close()
+        assert await peer.read() == b""
+
+
+@pytest.mark.parametrize(
+    ("carrier", "verdict"),
+    [
+        ("http", zmux.AdmissionVerdict.takeover),
+        ("h3", zmux.AdmissionVerdict.takeover),
+        ("websocket", zmux.AdmissionVerdict.takeover),
+        ("websocket", zmux.AdmissionVerdict.fallback),
+        ("webtransport", zmux.AdmissionVerdict.takeover),
+        ("webtransport", zmux.AdmissionVerdict.fallback),
+    ],
+)
+async def test_takeover_or_deferred_fallback_stalls_without_target(
+    carrier: str, verdict: Callable[[], zmux.AdmissionVerdict], tls: Tls
+) -> None:
+    server_tls, client_tls = tls
+    upgrade = carrier in ("websocket", "webtransport")
+
+    def decide(
+        info: zmux.CarrierInfo, _prefix: bytes
+    ) -> zmux.AdmissionVerdict | zmux.Decision:
+        if info.stage is zmux.AdmissionStage.HEAD:
+            assert upgrade
+            return zmux.AdmissionVerdict.DEFER
+        assert info.upgrade is upgrade
+        return verdict().labelled("relay")
+
+    cfg = zmux.ListenerConfig(
+        admission=zmux.Admission(decide, peek=0, stall=(0.1, 0.1))
+    )
+    async with asyncio.timeout(5), zmux.Listener(listener_config=cfg) as listener:
+        addr = await serve_admitted(listener, carrier, server_tls)
+        stream = (await dial_with(carrier, addr, client_tls, None)).into_stream()
+        if upgrade:
+            await stream.write(HELLO)
+            try:
+                assert await stream.read() == b""
+            except zmux.ConnectError:
+                # WebTransport can end by closing the whole session.
+                assert carrier == "webtransport"
+        else:
+            try:
+                with pytest.raises(zmux.ConnectError):
+                    await stream.read()
+            finally:
+                with suppress(zmux.ConnectError):
+                    await stream.shutdown()
+        counts = listener.stats().admission
+        assert (counts.accepted, counts.takeover, counts.fallback, counts.stalled) == (
+            0,
+            0,
+            0,
+            1,
+        )
+        assert listener.variant_stats().variants["relay"] == zmux.VariantStats(
+            stalled=1
+        )
+
+
+@pytest.mark.parametrize("has_target", [False, True])
+async def test_longer_prefix_timeout_replays_or_stalls(has_target: bool) -> None:
+    seen: asyncio.Queue[bytes] = asyncio.Queue()
+    served: asyncio.Queue[bytes] = asyncio.Queue()
+
+    def decide(info: zmux.CarrierInfo, prefix: bytes) -> zmux.Decision:
+        seen.put_nowait(prefix)
+        return zmux.AdmissionVerdict.more(4).labelled("longer")
+
+    def fallback(taken: zmux.Takeover) -> None:
+        served.put_nowait(taken.replayed)
+
+    cfg = zmux.ListenerConfig(
+        admission=zmux.Admission(
+            decide,
+            peek=1,
+            max_peek=4,
+            peek_timeout=0.3,
+            stall=(60, 60),
+            fallback_on_peek_timeout=True,
+        ),
+        fallback=fallback if has_target else None,
+    )
+    async with asyncio.timeout(5), zmux.Listener(listener_config=cfg) as listener:
+        carrier, peer = zmux.adapter.pipe_pair()
+        handling = asyncio.ensure_future(listener.handle_pipe(carrier))
+        await peer.write(b"ab")
+        assert await seen.get() == b"a"
+        if has_target:
+            await handling
+            assert await served.get() == b"ab"
+        else:
+            with pytest.raises(zmux.ZmuxError):
+                await handling
+            # The listener's stall still owns the carrier after setup ended.
+            await peer.write(b"x")
+            assert served.empty()
+        counts = listener.stats().admission
+        expected = (1, 0, 0) if has_target else (0, 1, 0)
+        assert (counts.fallback, counts.stalled, counts.peek_timed_out) == expected
+        variant = listener.variant_stats().variants["longer"]
+        assert (variant.fallback, variant.stalled) == expected[:2]
+        listener.close()
+        assert await peer.read() == b""
+
+
+# HS-13
+async def test_http_fallback_without_http_handler_returns_not_found() -> None:
+    called = asyncio.Event()
+    cfg = zmux.ListenerConfig(
+        admission=zmux.Admission(lambda *_: zmux.AdmissionVerdict.fallback(), peek=1),
+        fallback=lambda _: called.set(),
+    )
+    async with asyncio.timeout(5), zmux.Listener(listener_config=cfg) as listener:
+        addr = await serve_test_http(listener)
+        reader, writer = await asyncio.open_connection(*addr)
+        try:
+            writer.write(
+                b"POST /zmux HTTP/1.1\r\nHost: example\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n"
+            )
+            await writer.drain()
+            assert (await reader.readline()).split()[1] == b"404"
+            assert not called.is_set()
+            counts = listener.stats().admission
+            assert (counts.fallback, counts.stalled, counts.takeover) == (0, 1, 0)
+        finally:
+            writer.close()
+            await writer.wait_closed()

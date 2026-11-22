@@ -127,6 +127,9 @@ enum V {
     Fallback {
         value: Option<Arc<Py<PyAny>>>,
     },
+    Takeover {
+        value: Option<Arc<Py<PyAny>>>,
+    },
     Stall,
     Close,
     More {
@@ -157,6 +160,13 @@ impl AdmissionVerdict {
                 match value {
                     Some(o) => v.with_value(o.clone() as zmux::AdmittedValue),
                     None => v,
+                }
+            }
+            V::Takeover { value } => {
+                let verdict = zmux::AdmissionVerdict::takeover();
+                match value {
+                    Some(o) => verdict.with_value(o.clone() as zmux::AdmittedValue),
+                    None => verdict,
                 }
             }
             V::Stall => zmux::AdmissionVerdict::Stall,
@@ -207,8 +217,17 @@ impl AdmissionVerdict {
     fn DEFER() -> AdmissionVerdict {
         AdmissionVerdict(V::Defer)
     }
-    /// Reads until the prefix holds `need` bytes in all, then decides again
-    /// with the longer prefix.
+    /// Hands the accepted carrier to the byte-stream target, or stalls without one.
+    #[staticmethod]
+    #[pyo3(signature = (value=None))]
+    fn takeover(value: Option<Py<PyAny>>) -> Self {
+        Self(V::Takeover {
+            value: value.map(Arc::new),
+        })
+    }
+
+    /// Waits for a longer prefix before deciding again.
+
     #[staticmethod]
     fn more(#[pyo3(from_py_with = ranged)] need: usize) -> Self {
         AdmissionVerdict(V::More { need })
@@ -240,7 +259,7 @@ impl AdmissionVerdict {
     #[getter]
     fn value(&self, py: Python<'_>) -> Option<Py<PyAny>> {
         match &self.0 {
-            V::Accept { value, .. } | V::Fallback { value } => {
+            V::Accept { value, .. } | V::Fallback { value } | V::Takeover { value } => {
                 value.as_ref().map(|o| o.clone_ref(py))
             }
             _ => None,
@@ -254,7 +273,8 @@ impl AdmissionVerdict {
             (V::Accept { skip: a, value: x }, V::Accept { skip: b, value: y }) => {
                 a == b && same(py, x.as_deref(), y.as_deref())?
             }
-            (V::Fallback { value: x }, V::Fallback { value: y }) => {
+            (V::Fallback { value: x }, V::Fallback { value: y })
+            | (V::Takeover { value: x }, V::Takeover { value: y }) => {
                 same(py, x.as_deref(), y.as_deref())?
             }
             (V::Stall, V::Stall) | (V::Close, V::Close) | (V::Defer, V::Defer) => true,
@@ -275,6 +295,10 @@ impl AdmissionVerdict {
             V::Fallback { value: None } => "AdmissionVerdict.fallback()".into(),
             V::Fallback { value: Some(v) } => {
                 format!("AdmissionVerdict.fallback(value={})", v.bind(py).repr()?)
+            }
+            V::Takeover { value: None } => "AdmissionVerdict.takeover()".into(),
+            V::Takeover { value: Some(v) } => {
+                format!("AdmissionVerdict.takeover(value={})", v.bind(py).repr()?)
             }
             V::Stall => "AdmissionVerdict.STALL".into(),
             V::Close => "AdmissionVerdict.CLOSE".into(),
@@ -304,7 +328,7 @@ pub(crate) struct Decision {
 #[pymethods]
 impl Decision {
     /// `verdict`, labelled `variant`: the label counts the verdict in
-    /// `AdmissionStats.variants` and, on an accept, becomes the carrier's
+    /// `Listener.variant_stats().variants` and, on an accept, becomes the carrier's
     /// variant. One of a few constants of the host, never derived from the
     /// peer's bytes.
     #[new]
@@ -425,6 +449,26 @@ impl zmux::Decide for PyDecide {
         info: zmux::CarrierInfo,
         prefix: &[u8],
     ) -> zmux::Decision<zmux::AdmissionDecision> {
+        self.answer(info, prefix, None)
+    }
+
+    fn decide_with_worker(
+        &self,
+        info: zmux::CarrierInfo,
+        prefix: &[u8],
+        worker: &mut dyn FnMut() -> Box<dyn Send + Sync>,
+    ) -> zmux::Decision<zmux::AdmissionDecision> {
+        self.answer(info, prefix, Some(worker()))
+    }
+}
+
+impl PyDecide {
+    fn answer(
+        &self,
+        info: zmux::CarrierInfo,
+        prefix: &[u8],
+        worker: Option<Box<dyn Send + Sync>>,
+    ) -> zmux::Decision<zmux::AdmissionDecision> {
         let lp = &self.lp;
         let prefix = prefix.to_vec();
         let (decide, settling) = (self.decide.clone(), self.decide.clone());
@@ -433,7 +477,10 @@ impl zmux::Decide for PyDecide {
                 let view = Py::new(py, CarrierInfo(info))?;
                 decide.bind(py).call1((view, PyBytes::new(py, &prefix)))
             },
-            move |py, r| settle(py, &settling, r),
+            move |py, r| {
+                let _worker = worker;
+                settle(py, &settling, r)
+            },
             || zmux::AdmissionVerdict::Close.into(),
         ))
     }

@@ -6,9 +6,10 @@ from __future__ import annotations
 import asyncio
 import collections
 from collections.abc import Awaitable, Callable
-from typing import Any, Protocol, cast
+from typing import Protocol, cast
 
 from ._errors import ZmuxError
+from ._streams import _start_bridge
 from ._zmux import CarrierStream, PipeIo, _LayerEnd
 
 
@@ -25,14 +26,6 @@ Layer = Callable[
     [asyncio.StreamReader, asyncio.StreamWriter],
     Awaitable[tuple[asyncio.StreamReader, LayerWriter]],
 ]
-
-_tasks: set[asyncio.Future[None]] = set()
-
-
-def _keep(coro: Any) -> None:
-    task = asyncio.ensure_future(coro)
-    _tasks.add(task)
-    task.add_done_callback(_tasks.discard)
 
 
 def _receiving(
@@ -238,7 +231,21 @@ async def run(
     """Runs `layer` over `stream`; then pumps between the layer's streams
     and `end` until either ends."""
     reader, writer = _streams(stream, server_side=server_side)
-    r2, w2 = await layer(reader, writer)
+    lower = cast(_CarrierTransport, writer.transport)
+
+    async def release_lower() -> None:
+        lower.abort()
+        await asyncio.gather(lower._reader, lower._writer, return_exceptions=True)
+        await stream._release()
+
+    try:
+        r2, w2 = await layer(reader, writer)
+    except BaseException:
+        try:
+            await release_lower()
+        finally:
+            end._bridge_done()
+        raise
 
     # A failure either way ends that way: the carrier sees its end.
     async def up() -> None:
@@ -251,14 +258,29 @@ async def run(
             end.close()
 
     async def down() -> None:
-        try:
-            while data := await end.read():
-                w2.write(data)
-                await w2.drain()
-        except (OSError, RuntimeError):
-            pass
-        finally:
-            w2.close()
+        while data := await end.read():
+            w2.write(data)
+            await w2.drain()
+        if getattr(w2, "can_write_eof", lambda: False)() and hasattr(w2, "write_eof"):
+            w2.write_eof()
 
-    _keep(up())
-    _keep(down())
+    async def wait_closed() -> None:
+        if wait := getattr(w2, "wait_closed", None):
+            await wait()
+
+    def abort() -> None:
+        transport = getattr(w2, "transport", None)
+        if transport is not None:
+            transport.abort()
+        lower.abort()
+
+    _start_bridge(
+        up,
+        down,
+        end._released,
+        w2.close,
+        wait_closed,
+        abort,
+        end._bridge_done,
+        release_lower,
+    )

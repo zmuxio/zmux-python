@@ -1,11 +1,12 @@
 //! The secure carrier: `establish`, `SecureServer`, the trust of `PinVerifier`, and
 //! hosts' own verifiers and gates in Python, synchronous or `async`.
 
+use std::error::Error as _;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyEOFError, PyOSError, PyTimeoutError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple};
 use zmux::RecordMode;
@@ -13,7 +14,7 @@ use zmux_seal as seal;
 use zmux_seal::{BoxFuture, VerifyError};
 
 use crate::rt::{self, LoopRef, future_into_py};
-use crate::{PipeIo, admission, types};
+use crate::{PipeIo, admission, lock, types};
 use crate::{ranged, ranged_opt};
 
 /// A record mode a pipe can be given: sealed, bound or trusted.
@@ -52,6 +53,7 @@ fn call_method<R, A, O>(
     lp: &LoopRef,
     args: A,
     out: O,
+    failure: Option<ClientCallbackFailure>,
 ) -> impl Future<Output = Result<R, VerifyError>> + Send + 'static + use<R, A, O>
 where
     R: Send + 'static,
@@ -61,7 +63,15 @@ where
     let target = target.clone();
     lp.settled(
         move |py| target.bind(py).call_method1(method, args(py)?),
-        move |py, r| r.and_then(|v| out(&v)).map_err(|e| verify_err(py, &e)),
+        move |py, r| {
+            r.and_then(|v| out(&v)).map_err(|e| {
+                let error = verify_err(py, &e);
+                if let Some(failure) = failure {
+                    *lock(&failure) = Some(CallbackFailure::Verifier(e));
+                }
+                error
+            })
+        },
         || Err(VerifyError::unavailable("the event loop dropped the call")),
     )
 }
@@ -78,50 +88,128 @@ fn verify_err(py: Python<'_>, e: &PyErr) -> VerifyError {
     }
 }
 
-/// A secure carrier error as its exception: `CredentialsFailedError` for a failed
-/// verification or proof, `InvalidArgumentError` of kind `TooLarge` for a handshake message
-/// of this side above 8192 bytes, else `SecureCarrierError` whose `kind` is the error's class
-/// (`"random_failed"`, ...).
-fn secure_err(e: seal::Error) -> PyErr {
-    if matches!(e, seal::Error::TooLarge) {
-        return crate::raise("InvalidArgumentError", &e, false, None);
-    }
-    let name = if matches!(e, seal::Error::CredentialsFailed) {
-        "CredentialsFailedError"
-    } else {
-        "SecureCarrierError"
-    };
-    let class = e.class();
-    rt::decorate(crate::new_err(name, e.to_string()), move |_, v| {
-        let _ = v.setattr("kind", class);
-    })
+/// A Python callback failure belonging to a single client establishment.
+enum CallbackFailure {
+    Verifier(PyErr),
+    AppData(PyErr),
 }
 
-/// The error of a failed Establish: `NoReplyError` (its `__cause__` the end or the
-/// timeout), `ValueError` for a configuration mistake, `CredentialsFailedError` when the
-/// verifier rejected the server or could not decide, a proof failed or the required
-/// post-quantum authentication did not hold, `InvalidArgumentError` of kind `TooLarge`
-/// for a handshake message of this side above 8192 bytes (such as application data too large
-/// for the room left), another `SecureCarrierError`, or the carrier's error.
-fn establish_err(e: std::io::Error) -> PyErr {
+// Rust's VerifyError carries text only and is currently shared by both hooks.
+// Keep the original Python value within the operation that owns the hooks.
+type ClientCallbackFailure = Arc<Mutex<Option<CallbackFailure>>>;
+
+fn secure_err(e: seal::Error) -> PyErr {
+    let class = e.class();
+    if matches!(e, seal::Error::CredentialsFailed) {
+        return credentials_failed(None, None);
+    }
+    rt::decorate(
+        crate::new_err("SecureCarrierError", e.to_string()),
+        move |_, v| {
+            let _ = v.setattr("kind", class);
+        },
+    )
+}
+
+fn credentials_failed(reason: Option<&'static str>, cause: Option<PyErr>) -> PyErr {
+    rt::decorate(
+        crate::new_err("CredentialsFailedError", "credentials_failed"),
+        move |py, v| {
+            let _ = v.setattr("reason", reason);
+            if let Some(cause) = cause {
+                let _ = v.setattr("__cause__", cause.into_value(py));
+            }
+        },
+    )
+}
+
+fn verifier_cause(error: &VerifyError) -> PyErr {
+    let class = if error.is_rejection() {
+        "VerifyRejectedError"
+    } else {
+        "VerifyUnavailableError"
+    };
+    crate::new_err(class, error.to_string())
+}
+
+fn credential_reason(error: &seal::CredentialFailure) -> Option<&'static str> {
+    use seal::CredentialFailureReason as Reason;
+    match error.reason {
+        Reason::Proof => Some("proof"),
+        Reason::PqAuthRequired => Some("pq_auth_required"),
+        Reason::Verifier => Some("verifier"),
+        _ => None,
+    }
+}
+
+fn credential_error(error: &seal::CredentialFailure, cause: Option<PyErr>) -> PyErr {
+    let cause = cause.or_else(|| {
+        error.source().map(|source| {
+            if let Some(error) = source.downcast_ref::<VerifyError>() {
+                verifier_cause(error)
+            } else if let Some(error) = source.downcast_ref::<seal::Error>() {
+                secure_err(*error)
+            } else {
+                PyValueError::new_err(source.to_string())
+            }
+        })
+    });
+    credentials_failed(credential_reason(error), cause)
+}
+
+fn no_reply_cause(e: std::io::Error) -> PyErr {
+    use std::io::ErrorKind;
+    if let Some(inner) = e.get_ref()
+        && inner.is::<PyErr>()
+    {
+        return crate::io_err(e);
+    }
+    let message = e.to_string();
+    match e.kind() {
+        ErrorKind::UnexpectedEof => PyEOFError::new_err(message),
+        ErrorKind::TimedOut => PyTimeoutError::new_err(message),
+        _ => match e.raw_os_error() {
+            Some(errno) => PyOSError::new_err((errno, message)),
+            None => PyOSError::new_err(message),
+        },
+    }
+}
+
+/// Project the error of a failed client Establish at the Python boundary.
+fn establish_err(e: std::io::Error, failure: Option<CallbackFailure>) -> PyErr {
     let Some(inner) = e.get_ref() else {
         return crate::io_err(e);
     };
     if let Some(s) = inner.downcast_ref::<seal::Error>() {
+        if matches!(s, seal::Error::TooLarge) && e.kind() == std::io::ErrorKind::InvalidInput {
+            return crate::raise("InvalidArgumentError", s, false, None);
+        }
         return secure_err(*s);
     }
-    // The client judged the server: a rejection and a temporary failure of the verifier
-    // both fail the establishment with `credentials failed`.
-    if inner.downcast_ref::<VerifyError>().is_some() {
-        return secure_err(seal::Error::CredentialsFailed);
+    if let Some(error) = inner.downcast_ref::<seal::CredentialFailure>() {
+        let cause = match failure {
+            Some(CallbackFailure::Verifier(cause)) => Some(cause),
+            _ => None,
+        };
+        return credential_error(error, cause);
+    }
+    if let Some(error) = inner.downcast_ref::<VerifyError>() {
+        return match failure {
+            Some(CallbackFailure::AppData(cause)) => cause,
+            _ => credentials_failed(Some("verifier"), Some(verifier_cause(error))),
+        };
     }
     if let Some(c) = inner.downcast_ref::<seal::ConfigError>() {
         return PyValueError::new_err(c.to_string());
     }
-    if let Some(n) = inner.downcast_ref::<seal::NoReply>() {
-        let cause = pyo3::exceptions::PyOSError::new_err(n.0.to_string());
-        return rt::decorate(crate::new_err("NoReplyError", n.to_string()), |py, v| {
-            let _ = v.setattr("__cause__", cause.into_value(py));
+    if inner.is::<seal::NoReply>() {
+        let no_reply = e
+            .into_inner()
+            .and_then(|inner| inner.downcast::<seal::NoReply>().ok())
+            .expect("checked above");
+        let err = crate::new_err("NoReplyError", no_reply.to_string());
+        return rt::decorate(err, move |py, v| {
+            let _ = v.setattr("__cause__", no_reply_cause(no_reply.0).into_value(py));
         });
     }
     crate::io_err(e)
@@ -496,7 +584,11 @@ fn signer_of(v: &Bound<'_, PyAny>, lp: &LoopRef) -> PyResult<Arc<dyn seal::Signe
 
 /// A host's verifier: an object with `verify(input)` returning a `VerifyVerdict`, or
 /// raising `VerifyRejectedError` or `VerifyUnavailableError`; any other exception rejects.
-struct PyVerifier(Arc<Py<PyAny>>, LoopRef);
+struct PyVerifier {
+    target: Arc<Py<PyAny>>,
+    lp: LoopRef,
+    failure: Option<ClientCallbackFailure>,
+}
 
 impl seal::Verifier for PyVerifier {
     fn verify<'a>(
@@ -505,27 +597,40 @@ impl seal::Verifier for PyVerifier {
     ) -> BoxFuture<'a, Result<seal::VerifyVerdict, VerifyError>> {
         let input = Input::of(&input);
         Box::pin(call_method(
-            &self.0,
+            &self.target,
             "verify",
-            &self.1,
+            &self.lp,
             move |py| (verify_input_obj(py, &input)?,).into_pyobject(py),
             verdict_of,
+            self.failure.clone(),
         ))
     }
 }
 
-fn verifier_of(v: &Bound<'_, PyAny>, lp: &LoopRef) -> Arc<dyn seal::Verifier> {
+fn verifier_of(
+    v: &Bound<'_, PyAny>,
+    lp: &LoopRef,
+    failure: Option<ClientCallbackFailure>,
+) -> Arc<dyn seal::Verifier> {
     if let Ok(a) = v.cast::<PinVerifier>() {
         return a.get().0.clone();
     }
-    Arc::new(PyVerifier(Arc::new(v.clone().unbind()), lp.clone()))
+    Arc::new(PyVerifier {
+        target: Arc::new(v.clone().unbind()),
+        lp: lp.clone(),
+        failure,
+    })
 }
 
 /// An `app_data=` callable: `(message, peer, verdict)` returning `bytes` or `None`,
 /// synchronously or `async`; `peer` is the `VerifyInput` known by then, `None` for
 /// message 1, and `verdict` the client's verifier's on the server for message 3, `None`
 /// otherwise. An exception fails the handshake.
-fn app_data_of(f: &Bound<'_, PyAny>, lp: &LoopRef) -> seal::AppDataSource {
+fn app_data_of(
+    f: &Bound<'_, PyAny>,
+    lp: &LoopRef,
+    failure: Option<ClientCallbackFailure>,
+) -> seal::AppDataSource {
     let f = Arc::new(f.clone().unbind());
     let lp = lp.clone();
     Arc::new(
@@ -533,13 +638,14 @@ fn app_data_of(f: &Bound<'_, PyAny>, lp: &LoopRef) -> seal::AppDataSource {
             let (f, message) = (f.clone(), r.message);
             let peer = r.peer.map(Input::of);
             let verdict = r.verdict.cloned();
+            let failure = failure.clone();
             Box::pin(lp.settled(
                 move |py| {
                     let peer = peer.as_ref().map(|i| verify_input_obj(py, i)).transpose()?;
                     let verdict = verdict.as_ref().map(|v| verdict_obj(py, v)).transpose()?;
                     f.bind(py).call1((message, peer, verdict))
                 },
-                |py, r| {
+                move |py, r| {
                     r.and_then(|v| {
                         if v.is_none() {
                             Ok(Vec::new())
@@ -547,7 +653,13 @@ fn app_data_of(f: &Bound<'_, PyAny>, lp: &LoopRef) -> seal::AppDataSource {
                             v.extract::<Vec<u8>>()
                         }
                     })
-                    .map_err(|e| verify_err(py, &e))
+                    .map_err(|e| {
+                        let error = verify_err(py, &e);
+                        if let Some(failure) = failure {
+                            *lock(&failure) = Some(CallbackFailure::AppData(e));
+                        }
+                        error
+                    })
                 },
                 || Err(VerifyError::unavailable("the event loop dropped the call")),
             ))
@@ -592,8 +704,9 @@ fn establish<'p>(
     let reply_timeout = reply_timeout
         .map(|s| crate::seconds("reply_timeout", s))
         .transpose()?;
+    let failure = Arc::new(Mutex::new(None));
     let cfg = seal::ClientConfig {
-        verifier: verifier.map(|a| verifier_of(&a, &lp)),
+        verifier: verifier.map(|a| verifier_of(&a, &lp, Some(failure.clone()))),
         allow_psk_only,
         handle,
         psk: psk.into(),
@@ -609,7 +722,7 @@ fn establish<'p>(
         },
         credential,
         local_context,
-        app_data: app_data.map(|f| app_data_of(&f, &lp)),
+        app_data: app_data.map(|f| app_data_of(&f, &lp, Some(failure.clone()))),
         max_app_data,
         require_pq_auth,
         signer: signer.map(|s| signer_of(&s, &lp)).transpose()?,
@@ -622,7 +735,10 @@ fn establish<'p>(
     };
     let io = pipe.take()?;
     future_into_py(py, async move {
-        let (io, peer) = seal::establish(io, &cfg).await.map_err(establish_err)?;
+        let (io, peer) = seal::establish(io, &cfg).await.map_err(|e| {
+            let original = lock(&failure).take();
+            establish_err(e, original)
+        })?;
         Ok(rt::deferred(move |py| {
             let out = (Py::new(py, PipeIo::wrap(io))?, peer_obj(py, &peer)?);
             Ok(out.into_pyobject(py)?.into_any().unbind())
@@ -650,6 +766,7 @@ impl seal::Gate for PyGate {
             &self.1,
             move |py| (PyBytes::new(py, &handle), source_obj(source)).into_pyobject(py),
             |v| v.extract::<Vec<u8>>(),
+            None,
         ))
     }
 
@@ -675,6 +792,7 @@ impl seal::Gate for PyGate {
                     .into_pyobject(py)
             },
             |v| v.extract::<Option<seal::Credential>>(),
+            None,
         ))
     }
 
@@ -697,6 +815,7 @@ impl seal::Gate for PyGate {
                     .into_pyobject(py)
             },
             |v| Ok(Arc::new(v.clone().unbind()) as zmux::AdmittedValue),
+            None,
         ))
     }
 }
@@ -847,13 +966,16 @@ impl SecureServer {
         let verifier = self
             .client_verifier
             .as_ref()
-            .map(|v| verifier_of(v.bind(py), &lp));
+            .map(|v| verifier_of(v.bind(py), &lp, None));
         let signer = self
             .signer
             .as_ref()
             .map(|s| signer_of(s.bind(py), &lp))
             .transpose()?;
-        let app_data = self.app_data.as_ref().map(|f| app_data_of(f.bind(py), &lp));
+        let app_data = self
+            .app_data
+            .as_ref()
+            .map(|f| app_data_of(f.bind(py), &lp, None));
         Ok(self
             .server(
                 Arc::new(PyGate(Arc::new(self.gate.clone_ref(py)), lp)),
@@ -903,11 +1025,26 @@ pub(crate) fn on_reject(f: Py<PyAny>, lp: LoopRef) -> zmux::proto::listener::OnR
                     .record_mode
                     .map(|m| record_mode_obj(py, m))
                     .transpose()?;
+                let error = info
+                    .error
+                    .source()
+                    .and_then(|cause| cause.downcast_ref::<seal::CredentialFailure>());
+                let reason = match error.and_then(credential_reason) {
+                    Some(reason @ ("proof" | "pq_auth_required")) => reason,
+                    _ => info.reason,
+                };
+                let error = error
+                    .map(|error| credential_error(error, None))
+                    .or_else(|| {
+                        (info.reason == "credentials_failed")
+                            .then(|| credentials_failed(None, None))
+                    });
                 let i = types(py)?.getattr("RejectInfo")?.call1((
                     info.profile,
                     mode,
-                    info.reason,
+                    reason,
                     source_obj(info.source),
+                    error.map(|e| e.into_value(py)),
                 ))?;
                 f.call1((i,))
             },

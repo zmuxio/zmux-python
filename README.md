@@ -240,6 +240,14 @@ and the session queue by `datagram_receive_queue` and
 `session.send_datagram(data)` never waits and drops the oldest queued
 datagram when the send queue is full; `await session.send_datagram_wait(data)`
 waits for room instead and is cancellation-safe.
+Every queue, the send queue included, also bounds how long datagrams wait
+(`datagram_queue_delay`, 0.02 s; `None`: off): once the datagrams leaving
+a queue have waited longer for 0.1 s, CoDel drops some as they leave,
+counted, so a slow reader gets fresh datagrams instead of stale ones.
+`session.path_datagram_size` (and `send.path_datagram_size(context)`) is
+the largest payload that leaves as one carrier datagram, a QUIC DATAGRAM as
+path MTU discovery sizes it, instead of in a record; `DatagramPathChanged`
+reports changes. A packet forwarder uses it as its MTU.
 
 ## Streams
 
@@ -452,7 +460,7 @@ same way; a pipe the peer added reads as the join made it, the rest as a
 `PipeOptions` default. It never fails, also after the pipe ended. A pipe's own
 liveness is `PipeOptions(liveness=zmux.PipeLiveness(...))`.
 `await pipe.wait_closed()` waits for a pipe's end, and raises
-`zmux.PipeAbortedError` when this endpoint removed it abruptly (`pipe.abort()`,
+`zmux.PipeAbortedError` (a subclass of `zmux.PipeGoneError`) when this endpoint removed it abruptly (`pipe.abort()`,
 a resource limit, room made for a join); wait before the removal to see it.
 
 Pools: `handle = session.maintain_pipes(zmux.helpers.PipePool(count, dial))` keeps
@@ -533,6 +541,23 @@ pipe through `redial`; bound it with `asyncio.timeout(seconds)`.
 
 ## Admission
 
+`Listener.handle_pipe(pipe)` consumes the carrier on entry. Await it for
+bootstrap admission to the accept queue, join confirmation, lane attachment
+or refusal. A normal fallback return completes setup successfully; a callback error fails setup. The session owns
+the carrier after handoff and can continue I/O after the awaitable returns
+or the listener stops serving. Cancelling the awaiting task withdraws an
+uncommitted setup synchronously. If handoff has already committed, the task receives the
+original success or error, even when cancellation precedes its event-loop delivery.
+Once fallback has received a takeover, its
+callback retains it until it returns. The callback can take or detach it during
+that interval. An untaken, undetached takeover closes on callback return. `await pipe.wait_closed()` waits for the carrier,
+its lanes and its workers to release their resources. A stream bridge keeps
+its inbound direction alive after outbound EOF. When Rust releases the carrier,
+one deadline covers the last write and transport closure. Expiry aborts the
+transport. Byte-stream and message-layer bridges acknowledge completion after their pumps and underlying transport close, even if application code retains the Python writer.
+For HTTP carriers the same wait includes the carrier’s response tasks and final
+exchange acknowledgement. Other carriers on the connection remain independent.
+
 `ListenerConfig(admission=...)` decides on each new carrier at every entry
 before anything is answered, and `dial_x(..., carrier_credential=...)` presents
 what it checks. `PrefixAuth` tokens are the shared mechanism: a token is the
@@ -566,13 +591,25 @@ bounds every carrier before it enters a session.
 (1 to 32, default 32) for IPv4 and `source_prefix_v6` (1 to 128, default 64)
 for IPv6; a value outside its range raises `ValueError`.
 
-`ListenerConfig(fallback=f)` is given every carrier the admission hands
-back (`fallback(value=...)`, or a peek timeout with
-`fallback_on_peek_timeout`) as a `zmux.Takeover`, whatever entry took it: a
-TCP/TLS stream, a WebSocket decided on its first message, a QUIC
-connection's or WebTransport session's first stream, an HTTP request carrier
-decided on its body (answered 200 and taken over as the full-duplex pipe of
-its request and response bodies), a pipe given to `handle_pipe`. It reads
+`listener.drain(reason)` refuses subsequent new sessions in the handshake.
+The client receives a `zmux.ConnectionRefusedError` carrying the reason bytes.
+Repeating the call updates the reason. `listener.undrain()` accepts new sessions
+again until shutdown starts. Established sessions can still join carriers and resume.
+
+Set `Config.join_outcome` to a synchronous or async callback taking the session,
+the pipe ID (`PIPE_UNASSIGNED`, 2**62, before allocation) and an exception (or `None` on
+attachment). Both endpoints report each eligible join once. Its pipe events
+become available after the successful callback returns.
+
+`AdmissionVerdict.fallback()` sends an HTTP request to its adapter's HTTP
+handler. `AdmissionVerdict.takeover(value=...)` sends the carrier to
+`ListenerConfig(fallback=f)`, replaying the prefix. HTTP writes its accepted
+response head first. Both the admission total and its variant count `takeover`
+when the carrier reaches the host. Without a byte-stream target the stall outcome counts.
+Python exposes the byte-stream target through `ListenerConfig.fallback`.
+The HTTP adapter's Next handler has no public Python callback. Rust's
+blocking listener does not accept admission or Tokio fallback configuration.
+The callback receives a `zmux.Takeover`. It reads
 `takeover.value`, `info`, `framing` and `replayed`, and takes the carrier
 with `into_pipe()` (every capability kept, the bytes read replayed first) or,
 when message-framed, `into_messages()` (full duplex: one task may wait in
@@ -666,7 +703,10 @@ that carrier, reports it to `ListenerConfig(on_reject=...)` and the
 statistics, and raises nothing; `RejectInfo.reason` is then
 `"credentials_failed"` (its verifier rejected the client), `"proof"` (a
 required proof is missing or wrong) or `"pq_auth_required"`, and `"auth"` only
-for a failed AEAD or Confirm. A verifier that could not decide closes the
+for a failed AEAD or Confirm. For credential refusals, `RejectInfo.error`
+is a `CredentialsFailedError` with the stable `kind` and the specific
+`reason`. A client-side Python verifier's exception is the
+`__cause__` of the credential error. A verifier that could not decide closes the
 carrier without an `on_reject` call. The side whose credentials were refused
 learns nothing from the wire: its carrier just ends.
 
@@ -700,6 +740,18 @@ except zmux.ApplicationClosedError as e:
 except (zmux.ResumeTimeoutError, zmux.PipesLostError) as e:
     print("lost; last pipe:", e.__cause__)
 ```
+
+QUIC uses the Rust Quinn adapter. A connection's first bidirectional stream
+uses the listener's byte-stream fallback. On HTTP, a normal Fallback uses
+the HTTP handler (404 on the built-in Python server). Takeover hands the
+carrier to the byte-stream target after the accepted response head is flushed.
+
+`AdmissionVerdict.more(need)` reads a longer prefix up to `max_peek` under
+the same peek deadline. Mark a verdict with `.labelled("service")` to group
+it in `Listener.variant_stats()`. With `fallback_on_peek_timeout=True`, a
+byte stream with a partial prefix is replayed to the fallback. Without a
+target it stalls. HTTP request bodies, message-framed carriers and late
+decision callbacks close on timeout.
 
 ## Shaping and early data
 

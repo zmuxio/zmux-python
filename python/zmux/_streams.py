@@ -359,7 +359,6 @@ async def _writev(send: SendStream, buffers: list[Any]) -> int:
 
 
 def _retrieve(task: asyncio.Future[None]) -> None:
-    # The writer keeps a failed send's error and raises it itself.
     if not task.cancelled():
         task.exception()
 
@@ -372,6 +371,7 @@ def _stream_pair(
     )
 
 
+_BRIDGE_FLUSH_TIMEOUT = 2.0
 _bridges: set[asyncio.Future[None]] = set()
 
 
@@ -387,7 +387,8 @@ def pipe_from_streams(
     back, so this is slower than the built-in carriers; use it for
     transports the binding has no carrier for. The bridge lives as long as
     the pipe: it ends, and closes `writer`, once the session lets the pipe
-    go; the end of `reader` ends only the inbound direction. The
+    go; the end of `reader` ends only the inbound direction. Outbound EOF half-closes
+    the writer where supported. Carrier release bounds the last flush and transport close. The
     transport's `get_write_buffer_size()`, where it has one, is the
     carrier's unsent count, taken at each write and drain. `max_record` is
     the largest record plaintext the carrier takes (`PipeIo.set_max_record`:
@@ -398,6 +399,8 @@ def pipe_from_streams(
     count = UnsentCount() if size is not None else None
     pipe, end = pipe_pair(unsent=count, max_record=max_record, exporter=exporter)
 
+    end._track_bridge(pipe)
+
     def note() -> None:
         if count is not None and size is not None:
             # The inspection does not narrow `size` inside the closure.
@@ -405,11 +408,9 @@ def pipe_from_streams(
             count.set(size())
 
     async def inbound() -> None:
-        try:
-            while data := await reader.read(65536):
-                await end.write(data)
-        finally:
-            await end.write(b"")
+        while data := await reader.read(65536):
+            await end.write(data)
+        await end.write(b"")
 
     async def outbound() -> None:
         while data := await end.read():
@@ -418,23 +419,94 @@ def pipe_from_streams(
             await writer.drain()
             note()
 
+        if writer.can_write_eof():
+            writer.write_eof()
+
+    _start_bridge(
+        inbound,
+        outbound,
+        end._released,
+        writer.close,
+        writer.wait_closed,
+        writer.transport.abort,
+        end._bridge_done,
+    )
+    return pipe
+
+
+def _start_bridge(
+    inbound: Callable[[], Awaitable[None]],
+    outbound: Callable[[], Awaitable[None]],
+    release: Callable[[], Awaitable[None]],
+    close: Callable[[], None],
+    wait_closed: Callable[[], Awaitable[None]],
+    abort: Callable[[], None],
+    done: Callable[[], None],
+    finish: Callable[[], Awaitable[None]] | None = None,
+) -> None:
     async def bridge() -> None:
         reading = asyncio.ensure_future(inbound())
+        writing = asyncio.ensure_future(outbound())
+        released = asyncio.ensure_future(release())
+        pumps = {reading, writing}
+        aborted = False
+
+        def abort_once() -> None:
+            nonlocal aborted
+            if not aborted:
+                aborted = True
+                abort()
+
         try:
-            await outbound()
+            while not released.done():
+                completed, _ = await asyncio.wait(
+                    pumps | {released}, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in completed & pumps:
+                    task.result()
+                    pumps.remove(task)
         finally:
             reading.cancel()
-            await asyncio.gather(reading, return_exceptions=True)
-            writer.close()
+            released.cancel()
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + _BRIDGE_FLUSH_TIMEOUT
+            try:
+                async with asyncio.timeout_at(deadline):
+                    await asyncio.shield(writing)
+            except (TimeoutError, asyncio.CancelledError):
+                abort_once()
+            finally:
+                writing.cancel()
+                try:
+                    close()
+                    closing = asyncio.ensure_future(wait_closed())
+                    try:
+                        async with asyncio.timeout_at(deadline):
+                            await asyncio.shield(closing)
+                    except (TimeoutError, asyncio.CancelledError):
+                        # Observe a late exception without delaying carrier release.
+                        closing.add_done_callback(_retrieve)
+                        closing.cancel()
+                        abort_once()
+                finally:
+                    try:
+                        await asyncio.gather(
+                            reading, writing, released, return_exceptions=True
+                        )
+                    finally:
+                        if finish is not None:
+                            await finish()
+
+    def settled(task: asyncio.Future[None]) -> None:
+        _settle(task)
+        done()
 
     task = asyncio.ensure_future(bridge())
     _bridges.add(task)
-    task.add_done_callback(_settle)
-    return pipe
+    task.add_done_callback(settled)
 
 
 def _settle(task: asyncio.Future[None]) -> None:
     # A carrier's failure ends the bridge; the session reports it.
     _bridges.discard(task)
-    if not task.cancelled():
-        task.exception()
+    _retrieve(task)

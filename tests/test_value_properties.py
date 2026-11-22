@@ -133,9 +133,11 @@ UPDATABLE = (
 
 @pytest.mark.parametrize("name", UPDATABLE)
 def test_clear_is_refused_in_every_updatable_option(name: str) -> None:
+    options: dict[str, Any] = {name: zmux.CLEAR}
     with pytest.raises(TypeError):
-        zmux.PipeOptions(**{name: zmux.CLEAR})
-    zmux.PipeOptions(**{name: zmux.INHERIT})
+        zmux.PipeOptions(**options)
+    options[name] = zmux.INHERIT
+    zmux.PipeOptions(**options)
 
 
 async def _no_dial() -> zmux.PipeIo:
@@ -149,7 +151,8 @@ async def _no_dial() -> zmux.PipeIo:
 def test_unsigned_pipe_options_take_a_u64(field: str, value: int) -> None:
     """The tier and the weight of a pipe are unsigned 64-bit integers; the pool
     checks the options where it takes them."""
-    options = zmux.PipeOptions(**{field: value})
+    kwargs: dict[str, Any] = {field: value}
+    options = zmux.PipeOptions(**kwargs)
     assert getattr(options, field) == value
     if 0 <= value < 2**64:
         zmux.helpers.PipePool(1, _no_dial, options=options)

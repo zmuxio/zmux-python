@@ -25,37 +25,61 @@ enum Slot {
     Returned,
 }
 
+/// Revokes a borrowed takeover on every exit, even if the runtime itself stops.
+struct CallbackScope(Arc<StdMutex<Slot>>);
+impl Drop for CallbackScope {
+    fn drop(&mut self) {
+        let returned = {
+            let mut slot = lock(&self.0);
+            if matches!(&*slot, Slot::Held(t) if !t.is_detached()) {
+                Some(std::mem::replace(&mut *slot, Slot::Returned))
+            } else {
+                None
+            }
+        };
+        drop(returned);
+    }
+}
+
 /// The listener's fallback of the Python handler `f`, called on the loop
 /// `lp` with each `Takeover` and awaited there when it returns an
 /// awaitable. Once it returned (or raised: reported as unraisable), what it
 /// neither took nor detached is closed.
 pub(crate) fn fallback(f: Py<PyAny>, lp: LoopRef) -> zmux::Fallback {
     let f = Arc::new(f);
-    zmux::Fallback::new(move |t: zmux::Takeover| {
+    zmux::Fallback::try_new(move |t: zmux::Takeover| {
         let (f, lp) = (f.clone(), lp.clone());
         async move {
             let slot = Arc::new(StdMutex::new(Slot::Held(t)));
             let (given, hook) = (slot.clone(), f.clone());
+            let scope = CallbackScope(slot);
             let r = lp
-                .call(
+                .settled(
                     move |py| {
                         let t = Py::new(py, Takeover::new(py, given)?)?;
                         hook.bind(py).call1((t,))
                     },
-                    |_| Ok(()),
+                    move |_, result| {
+                        drop(scope);
+                        result.map(|_| ())
+                    },
+                    || {
+                        Err(pyo3::exceptions::PyRuntimeError::new_err(
+                            "fallback loop closed",
+                        ))
+                    },
                 )
                 .await;
             if let Err(e) = r {
+                let original = Python::attach(|py| e.clone_ref(py));
                 lp.post(move |py| {
                     if !e.is_instance_of::<pyo3::exceptions::asyncio::CancelledError>(py) {
                         e.write_unraisable(py, Some(f.bind(py)));
                     }
                 });
+                return Err(std::io::Error::other(original));
             }
-            let mut s = lock(&slot);
-            if matches!(&*s, Slot::Held(t) if !t.is_detached()) {
-                *s = Slot::Returned;
-            }
+            Ok(())
         }
     })
 }
@@ -88,8 +112,15 @@ impl Takeover {
     }
 
     /// Takes the carrier.
-    fn take(&self) -> PyResult<zmux::Takeover> {
+    fn take(&self, records: bool) -> PyResult<zmux::Takeover> {
         let mut s = lock(&self.slot);
+        if records
+            && matches!(&*s, Slot::Held(t) if t.framing() != zmux::proto::record::Framing::Records)
+        {
+            return Err(pyo3::exceptions::PyTypeError::new_err(
+                "the carrier is a byte stream: use into_pipe()",
+            ));
+        }
         match std::mem::replace(&mut *s, Slot::Taken) {
             Slot::Held(t) => Ok(t),
             other => {
@@ -160,21 +191,16 @@ impl Takeover {
     /// The carrier as a pipe input, what was read replayed first.
     #[allow(clippy::wrong_self_convention)] // Python's name; the carrier is taken
     fn into_pipe(&self) -> PyResult<PipeIo> {
-        Ok(PipeIo::wrap(self.take()?.into_pipe()))
+        Ok(PipeIo::wrap(self.take(false)?.into_pipe()))
     }
     /// A message-framed carrier read and written by whole messages.
     #[allow(clippy::wrong_self_convention)] // Python's name; the carrier is taken
     fn into_messages(&self) -> PyResult<TakeoverMessages> {
-        let t = self.take()?;
-        match t.into_messages() {
-            Ok(m) => Ok(TakeoverMessages::new(m)),
-            Err(t) => {
-                *lock(&self.slot) = Slot::Held(t);
-                Err(pyo3::exceptions::PyTypeError::new_err(
-                    "the carrier is a byte stream: use into_pipe()",
-                ))
-            }
-        }
+        let messages = self
+            .take(true)?
+            .into_messages()
+            .expect("framing checked during claim");
+        Ok(TakeoverMessages::new(messages))
     }
     fn __repr__(&self, py: Python<'_>) -> String {
         let state = match &*lock(&self.slot) {

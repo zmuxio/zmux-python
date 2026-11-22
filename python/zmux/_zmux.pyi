@@ -65,6 +65,8 @@ DEFAULT_SUSPECT_FLOOR: float
 """Default floor of a pipe's suspicion, seconds."""
 MAX_FIRST_BYTES: int
 """The most bytes `classify_first_bytes` needs (5)."""
+PIPE_UNASSIGNED: int
+"""JoinOutcome pipe ID for a failure before allocation."""
 MAX_STREAM_CREDIT: int
 """The largest stream count the protocol can count, 2**60: the value that
 grants the peer as many streams as it can, in effect no limit. It is the top
@@ -96,6 +98,8 @@ DEFAULT_LANES: int
 as lanes (4)."""
 DEFAULT_JOIN_TIMEOUT: float
 """Default join deadline, seconds (10)."""
+DEFAULT_FIRST_RECORD_TIMEOUT: float
+"""Default first-record timeout of a listener, seconds (2)."""
 MIN_MAX_LEN: int
 """Smallest shaping `max_len` honoured, bytes (64)."""
 DEFAULT_MAX_DELAY: float
@@ -126,6 +130,9 @@ def _config_defaults() -> dict[str, Any]:
 async def _panic() -> None:
     """Internal, only in builds with the `test-hooks` feature: a future that
     panics (tests how a panic reaches its awaiter)."""
+
+def _error_data() -> list[BaseException]:
+    """Internal, only in test builds. Returns native errors for field tests."""
 
 def _listener_defaults() -> dict[str, Any]:
     """Internal: the library's defaults of the `zmux.ListenerConfig` fields."""
@@ -265,6 +272,7 @@ class CarrierStream:
     carrier with message framing each write is one message and reads
     return the messages' bytes in order."""
 
+    async def _release(self) -> None: ...
     async def read(self, n: int = 65536) -> bytes:
         """Up to `n` bytes; `b""` at the end (also without a receiving half)."""
     async def write(self, data: Buffer) -> None:
@@ -277,6 +285,8 @@ class CarrierStream:
 class _LayerEnd:
     """Internal: the Python side of the stream a `PipeIo.wrap` layer returns."""
 
+    def _bridge_done(self) -> None: ...
+    async def _released(self) -> None: ...
     async def read(self) -> bytes: ...
     async def write(self, data: Buffer) -> None: ...
     def close(self) -> None: ...
@@ -304,6 +314,9 @@ class PipeHint:
 class PipeEnd:
     """The application's end of `pipe_pair()`."""
 
+    def _track_bridge(self, pipe: PipeIo) -> None: ...
+    def _bridge_done(self) -> None: ...
+    async def _released(self) -> None: ...
     async def read(self, n: int = 65536) -> bytes:
         """Up to `n` bytes the session wrote; `b""` once it closed."""
     async def write(self, data: Buffer) -> None:
@@ -414,6 +427,9 @@ class AdmissionVerdict:
         fallback the carrier is stalled; an HTTP request decided on its
         head gets 404, and the value reaches no HTTP handler."""
     @staticmethod
+    def takeover(value: Any = None) -> AdmissionVerdict:
+        """Hand the carrier to the byte-stream fallback, or stall without one."""
+    @staticmethod
     def more(need: int) -> AdmissionVerdict:
         """Reads until the prefix holds `need` bytes in all (or the carrier
         ends, or the peek timeout passes, all rounds sharing it), then decides
@@ -515,7 +531,7 @@ class Decision:
     def __init__(
         self, verdict: AdmissionVerdict, *, variant: str | None = None
     ) -> None:
-        """A label counts the verdict in `AdmissionStats.variants` and, on an
+        """A label counts the verdict in `Listener.variant_stats().variants` and, on an
         accept, becomes the carrier's variant. It is one of a few constants of
         the host, never derived from the peer's bytes."""
     @property
@@ -552,9 +568,10 @@ class Admission:
     `max_pending_per_source` (beyond it, it is closed at once).
     A byte-stream carrier whose prefix has not arrived when the peek timeout
     ends is closed, or with `fallback_on_peek_timeout` taken to the fallback
-    with the bytes read replayed (counted in both `peek_timed_out` and
-    `fallback`). A message-framed carrier, an HTTP request carrier and a
-    decision that does not return in time are closed either way."""
+    with the bytes read replayed, or stalled without a byte-stream target.
+    The final outcome counts once in `AdmissionStats`. A message-framed
+    carrier, an HTTP request carrier and a decision that does not return
+    in time are closed either way."""
 
     def __init__(
         self,
@@ -1330,6 +1347,11 @@ class SendStream:
         """The largest payload the peer currently accepts in a datagram of
         this stream with the context ID `context`; `None` without datagram
         flows. Never fails for a write in progress."""
+    def path_datagram_size(self, context: int = 0) -> int | None:
+        """The largest payload of a datagram of this stream with the
+        context ID `context` that leaves as one carrier datagram instead of
+        in a record (`Session.path_datagram_size` less the stream's flow),
+        at most `max_datagram_size`; `None` without datagram flows."""
     def send_datagram(self, payload: Buffer, context: int = 0) -> None:
         """Sends a datagram of the stream with the context ID `context`;
         `payload` is any buffer-protocol object, copied unless it is `bytes`.
@@ -1507,7 +1529,9 @@ class Pipe:
     async def wait_closed(self) -> None:
         """Waits until the pipe ended: returns once every direction closed
         (or the session released it); `PipeError` if it failed or the
-        session ended first. The end is stable: a wait that starts after the
+        session ended first. Completion also waits for release of the carrier,
+        its lanes and its workers, including a stream bridge and its transport.
+        The end is stable: a wait that starts after the
         pipe retired reports the same end as one registered before (after
         `abort()`, `PipeAbortedError`)."""
     def update(
@@ -1538,8 +1562,9 @@ class Pipe:
     def abort(self) -> None:
         """Removes the pipe at once: its data is reinjected elsewhere."""
     def stats(self) -> PipeStats | None:
-        """A snapshot; `None` once the pipe is retired or the session
-        released it (reads never raise; operations then raise `PipeError`)."""
+        """A snapshot, including the cached carrier sample. Reads never wait
+        for a native statistics refresh. Receive-only pipes and carriers without a
+        connection identity have no carrier sample. Returns `None` once retired or released."""
     async def __aenter__(self) -> Self: ...
     async def __aexit__(
         self,
@@ -1716,6 +1741,15 @@ class Session:
     @property
     def max_datagram_size(self) -> int | None:
         """The largest datagram payload; `None` without datagram support."""
+    @property
+    def path_datagram_size(self) -> int | None:
+        """The largest datagram payload that leaves as one datagram of the
+        carrier instead of in a record: on a carrier with a datagram channel
+        (QUIC, HTTP/3, WebTransport) what one of its datagrams takes as the
+        carrier last reported it, path MTU discovery included; elsewhere
+        `max_datagram_size`. A packet forwarder uses it as its MTU;
+        `DatagramPathChanged` reports changes. `None` without datagram
+        support."""
     def close(self, code: int = 0, reason: bytes = b"") -> None:
         """Starts the graceful close with the application error `code` and
         `reason` (the defaults: a close without error; a reason above 1024
@@ -1860,7 +1894,7 @@ class Session:
     def pipes(self) -> list[Pipe]:
         """The session's pipes."""
     def pipe_stats(self) -> list[PipeStats]:
-        """A snapshot of every pipe."""
+        """A snapshot of every pipe, with cached connection statistics."""
     @property
     def zero_rtt(self) -> ZeroRtt | None:
         """For sessions from `QuicClient.connect`: what became of the 0-RTT data."""
@@ -2019,9 +2053,17 @@ class Listener:
         directly connected peer, `source` the client the application resolved
         (unset, the peer; the peer unset, `127.0.0.1:0`). It takes a source
         slot and goes through the listener's admission, joins and
-        resumptions too. Returns once the carrier is done; a carrier the
-        admission does not accept (stalled, closed, or given to
-        `ListenerConfig.fallback`) raises `ConnectError`."""
+        resumptions too. Ownership transfers on entry. Returns once the session
+        is queued or the join or lane attaches. Cancellation wins only before
+        commit. A committed result is delivered even if the task cancels before delivery.
+        The session owns the carrier after handoff. A dispatched fallback owns
+        its callback interval even when this awaiter is cancelled. A normal
+        fallback return completes setup successfully. A callback exception,
+        a stall, or an admission close raises `ConnectError`."""
+    def drain(self, reason: bytes) -> None:
+        """Refuse subsequent bootstraps with these reason bytes."""
+    def undrain(self) -> None:
+        """Accept new sessions again unless shutdown has begun."""
     async def shutdown(self, code: int = 0, reason: bytes = b"") -> None:
         """Closes gracefully: new sessions are refused at once while joins
         and resumptions of the live sessions are still taken; every session
@@ -2031,7 +2073,8 @@ class Listener:
         """The next established session; `ListenerClosedError` once closed."""
     def close(self) -> None:
         """Closes at once: everything new is refused, joins and resumptions
-        included, and the `serve_*` loops end."""
+        included, and the `serve_*` loops end. Accepted sessions retain their
+        attached carriers."""
     def variant_stats(self) -> _t.AdmissionVariants:
         """The admission's verdicts on the carriers it labelled, per label."""
     def stats(self) -> ListenerStats:
@@ -2446,9 +2489,11 @@ async def establish(
     `CredentialsFailedError` (a `SecureCarrierError`, `kind == "credentials_failed"`; the
     verifier rejected it or could not decide, a proof failed, or `require_pq_auth` did not
     hold; only the side that judged raises it, so a server raises nothing: it closes the
-    carrier and reports it to `on_reject`); another handshake failure raises
-    `SecureCarrierError` with its `kind`; a
-    configuration mistake raises `ValueError` naming it.
+    carrier and reports it to `on_reject`). A Python verifier exception is
+    available as the credential error's `__cause__`. Another handshake failure
+    raises `SecureCarrierError` with its `kind`; a configuration mistake raises
+    `ValueError` naming it. If the client application-data callback raises, the
+    original exception propagates.
     `static_key` is the client's `StaticKey` (left out: a key generated once per
     process, shared by this process's clients); `record_mode` the
     record mode of the session's first pipe (`None`: `RecordMode.SEALED`).

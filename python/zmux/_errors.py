@@ -5,6 +5,7 @@ asyncio and the standard library raise for the same condition."""
 from __future__ import annotations
 
 import asyncio
+import builtins
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -14,6 +15,7 @@ __all__ = [
     "ApplicationClosedError",
     "CarrierChoiceError",
     "ConnectError",
+    "ConnectionRefusedError",
     "CredentialsFailedError",
     "DatagramBlockedError",
     "DatagramError",
@@ -26,6 +28,7 @@ __all__ = [
     "IdleTimeoutError",
     "IncompleteReadError",
     "InvalidArgumentError",
+    "JoinEvictedError",
     "JoinPendingError",
     "JoinRefusedError",
     "JoinSecretSetError",
@@ -103,8 +106,8 @@ class ConnectError(ZmuxError, ConnectionError):
 
 
 class NoReplyError(ConnectError):
-    """The secure carrier's server ended or timed out before message 2;
-    `__cause__` is the end or the timeout."""
+    """The secure carrier failed before receiving message 2. `__cause__`
+    is the transport exception, an `EOFError`, or a `TimeoutError`."""
 
 
 class SessionClosedError(ZmuxError, ConnectionError):
@@ -125,7 +128,15 @@ class ApplicationClosedError(SessionClosedError):
 
 
 class TransportClosedError(SessionClosedError):
-    """A protocol error ended the session."""
+    """A protocol error ended the session. `frame_type` identifies the frame
+    involved, and `details` contains the diagnostic key/value pairs."""
+
+    frame_type: int = 0
+    details: tuple[tuple[str, int], ...] = ()
+
+
+class ConnectionRefusedError(TransportClosedError, builtins.ConnectionRefusedError):
+    """The listener refused a new session with its drain reason."""
 
 
 class IdleTimeoutError(SessionClosedError):
@@ -156,7 +167,10 @@ class StreamError(ZmuxError):
 
 
 class StreamResetError(StreamError, ConnectionError):
-    """The peer reset the stream; `code` is its error code."""
+    """The peer reset the stream. `code` is its error code and
+    `reliable_size` is the length of the reliable prefix."""
+
+    reliable_size: int = 0
 
 
 class StreamStoppedError(StreamError, ConnectionError):
@@ -217,14 +231,16 @@ class SecureCarrierError(ZmuxError):
 
 
 class CredentialsFailedError(SecureCarrierError):
-    """The establishment failed with `credentials failed`: the verifier
-    rejected the server or could not decide, a proof the verdict requires was
-    wrong, or `require_pq_auth` did not hold. Only the side that judged the
-    peer raises it, so only `establish` does: a server closes the carrier,
-    reports it to `on_reject` and the statistics, and raises nothing. `kind` is
-    `"credentials_failed"`."""
+    """The peer failed credential verification. `kind` is
+    `"credentials_failed"`. `reason` gives the specific local failure when
+    available. `__cause__` carries the underlying error when available.
+    Client establishment preserves the original Python verifier exception.
+    Listener refusals carry the verifier error category and message from Rust."""
 
     kind = "credentials_failed"
+
+    # "verifier", "proof", or "pq_auth_required" when supplied by the handshake.
+    reason: str | None = None
 
 
 class NotNegotiatedError(ZmuxError):
@@ -279,6 +295,10 @@ class JoinPendingError(PipeError):
     missing."""
 
 
+class JoinEvictedError(PipeError):
+    """A newer join displaced this pending join."""
+
+
 class JoinRefusedError(PipeError):
     """The peer refused the join; the join backoff started."""
 
@@ -291,7 +311,7 @@ class PipeGoneError(PipeError):
     """No such pipe: it was retired."""
 
 
-class PipeAbortedError(PipeError):
+class PipeAbortedError(PipeGoneError):
     """This endpoint removed the pipe abruptly (`Pipe.abort()`, a resource
     limit, or room made for a new join): how the pipe's `wait_closed()`
     reports its end."""

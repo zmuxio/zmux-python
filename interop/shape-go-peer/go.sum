@@ -1,6 +1,6 @@
-github.com/djylb/netx v0.0.0-20261118191910-b28403c6c1bd h1:6WRc/FnVVU7P/np9wgennlWQ4lCgAsji4FpOzuTjbeE=
-github.com/djylb/netx v0.0.0-20261118191910-b28403c6c1bd/go.mod h1:Zi8xVsLCr7IPHcf3i+iSygxEeW623tZPjrFOcQ8T0no=
-github.com/djylb/timeshim v0.0.0-20261114151544-5e7682ca67cc h1:sDzU+rT2s2drGdRiHb/0gAIAkPmAD3krLKkHE3vTrRE=
-github.com/djylb/timeshim v0.0.0-20261114151544-5e7682ca67cc/go.mod h1:btb4BaMuOhpcFZzNgd0ZiXt621fpdKjgi6uClfmtZek=
-github.com/zmuxio/zmux-go v1.5.4 h1:HZZ/mMUmawvBdy3DLWFMX4vBLKBC6eff4R4DKqN7p9g=
-github.com/zmuxio/zmux-go v1.5.4/go.mod h1:eUoY7fIjEY0/XVJEoAV+NtnKl1S8ilR4wAydQ3/7cf0=
+github.com/djylb/netx v0.0.0-20261122060433-15b3713d94e6 h1:mHb/y9U7xHk5/ia6MKjEiRThKaQf43KwWkdFgND7Lic=
+github.com/djylb/netx v0.0.0-20261122060433-15b3713d94e6/go.mod h1:y0BAyZQbOnhThRfqyku3Jnnai06ENRHBzYKobkyuunM=
+github.com/djylb/timeshim v0.0.0-20261121052148-1ed9b7a27ad0 h1:BBQv+m6gL1FL9PH25D1OC/SQP4O2I6kY5vzwWI7NGmM=
+github.com/djylb/timeshim v0.0.0-20261121052148-1ed9b7a27ad0/go.mod h1:btb4BaMuOhpcFZzNgd0ZiXt621fpdKjgi6uClfmtZek=
+github.com/zmuxio/zmux-go v1.5.6 h1:Zt6497kCuXivZio35nYXMu5shmBHsZZjjJhRHztbJos=
+github.com/zmuxio/zmux-go v1.5.6/go.mod h1:3E6fA5L/mTPOuomMti0Km/SuiYyG2UvHl+ca+q3GlFU=
