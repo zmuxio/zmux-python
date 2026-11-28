@@ -1,16 +1,12 @@
-//! The stream helpers of the crate: carrier streams, splicing with Python
-//! limiters, and the resolution of duplicate sessions.
+//! Stream pipes and the resolution of duplicate sessions.
 
-use std::future::Future;
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError};
-use std::task::{Context, Poll, Waker};
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use crate::ranged;
-use crate::rt::{LoopRef, future_into_py};
+use crate::rt::LoopRef;
 use crate::{PipeIo, RecvStream, SendStream, Session, kind_of, types};
 
 /// Locks `m`, recovering the data of a poisoned lock: every guarded value is
@@ -20,283 +16,63 @@ pub(crate) fn lock<T>(m: &StdMutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// A Python `zmux.Limiter` as the Rust limiter of a splice direction. The
-/// runtime never calls it itself: its methods run on the loop of the
-/// splice, and what they take is held here until the direction uses it.
-/// `poll_acquire` asks `acquire(min, max)` on the loop for what is not held
-/// and waits for its answer. `try_acquire`, which must answer at once (a
-/// datagram passes or is dropped), answers from what is held and asks the
-/// loop's `try_acquire` for the shortfall, for the datagrams that follow.
-/// What a direction refunds, and what is held when the splice ends, goes
-/// back with `refund`. Nothing is answered that the Python limiter did not
-/// grant. A failing `acquire` (an exception, or a grant that is not an int
-/// in `1..=max`) fails the direction; a failing `try_acquire` grants
-/// nothing; a failing `refund` changes nothing. Each failure is reported as
-/// unraisable.
-struct PyLimiter(Arc<Held>);
+type Handles<'p> = (Bound<'p, SendStream>, Bound<'p, RecvStream>);
+type Halves = (zmux::SendStream, zmux::RecvStream);
 
-/// What a [`PyLimiter`] took from its Python limiter and has not handed on.
-struct Held {
-    obj: Arc<Py<PyAny>>,
-    lp: LoopRef,
-    st: StdMutex<HeldState>,
-}
-
-#[derive(Default)]
-struct HeldState {
-    /// Bytes granted and not handed on.
-    bytes: u64,
-    /// An `acquire` is under way.
-    asking: bool,
-    /// An `acquire` granted since a `poll_acquire` last took: what is held
-    /// is handed on even when it is below the least asked.
-    answered: bool,
-    /// The failure of the last `acquire`, handed on by the next poll.
-    failed: Option<zmux::LimitError>,
-    /// A `try_acquire` of the shortfall is under way.
-    topping: bool,
-    waker: Option<Waker>,
-}
-
-impl Held {
-    /// Settles an `acquire` on the loop: adds its grant, or keeps its
-    /// failure, and wakes the waiting direction.
-    fn answer(&self, r: Result<u64, zmux::LimitError>) {
-        let waker = {
-            let mut st = lock(&self.st);
-            match r {
-                Ok(n) => st.bytes = st.bytes.saturating_add(n),
-                Err(e) => st.failed = Some(e),
-            }
-            st.asking = false;
-            st.answered = true;
-            st.waker.take()
-        };
-        if let Some(w) = waker {
-            w.wake();
-        }
+fn validate_pair(
+    send: &zmux::SendStream,
+    recv: &zmux::RecvStream,
+    unread: &crate::Unread,
+) -> PyResult<()> {
+    if !send.same_stream(recv) {
+        return Err(PyValueError::new_err("the parts of two different streams"));
     }
-
-    /// Adds what a `try_acquire` of the shortfall granted, on the loop.
-    fn topped(&self, n: u64) {
-        let mut st = lock(&self.st);
-        st.bytes = st.bytes.saturating_add(n);
-        st.topping = false;
+    if !lock(unread).is_empty() {
+        return Err(PyValueError::new_err(
+            "read the stream's buffered bytes before transferring it",
+        ));
     }
-}
-
-/// The claim of a `try_acquire` of the shortfall on the loop. A loop that
-/// never runs the call (not bound, closed, or closing with it queued) drops
-/// it: the claim is then released, so the next datagram asks again.
-struct Topping(Option<Arc<Held>>);
-
-impl Topping {
-    /// The call runs: its answer releases the claim.
-    fn finish(mut self) -> Arc<Held> {
-        self.0.take().expect("a claim is finished once")
-    }
-}
-
-impl Drop for Topping {
-    fn drop(&mut self) {
-        if let Some(h) = self.0.take() {
-            lock(&h.st).topping = false;
-        }
-    }
-}
-
-impl Drop for Held {
-    fn drop(&mut self) {
-        let n = std::mem::take(&mut lock(&self.st).bytes);
-        if n > 0 {
-            let obj = self.obj.clone();
-            self.lp.post(move |py| refund(py, &obj, n));
-        }
-    }
-}
-
-/// `refund(n)` of the Python limiter, on its loop; a failure changes
-/// nothing.
-fn refund(py: Python<'_>, obj: &Py<PyAny>, n: u64) {
-    if let Err(e) = obj.call_method1(py, "refund", (n,)) {
-        e.write_unraisable(py, Some(obj.bind(py)));
-    }
-}
-
-/// The grant a limiter call returned, asked for at most `max`: an int in
-/// `0..=max`. A grant above `max` is refunded at once.
-fn grant(
-    py: Python<'_>,
-    obj: &Py<PyAny>,
-    r: PyResult<Bound<'_, PyAny>>,
-    max: u64,
-) -> PyResult<u64> {
-    let n = r?.extract::<u64>()?;
-    if n > max {
-        refund(py, obj, n);
-        return Err(PyValueError::new_err(format!(
-            "the limiter granted {n} bytes, more than the {max} asked"
-        )));
-    }
-    Ok(n)
-}
-
-impl PyLimiter {
-    fn shared(obj: Py<PyAny>, lp: LoopRef) -> Arc<dyn zmux::Limiter> {
-        Arc::new(PyLimiter(Arc::new(Held {
-            obj: Arc::new(obj),
-            lp,
-            st: StdMutex::default(),
-        })))
-    }
-}
-
-impl zmux::Limiter for PyLimiter {
-    fn poll_acquire(
-        &self,
-        cx: &mut Context<'_>,
-        min: u64,
-        max: u64,
-    ) -> Poll<Result<u64, zmux::LimitError>> {
-        let held = &self.0;
-        let mut st = lock(&held.st);
-        if let Some(e) = st.failed.take() {
-            st.answered = false;
-            return Poll::Ready(Err(e));
-        }
-        // A grant taken meanwhile by `try_acquire` is asked for again.
-        if st.bytes >= min || (st.answered && st.bytes > 0) {
-            st.answered = false;
-            let take = st.bytes.min(max);
-            st.bytes -= take;
-            return Poll::Ready(Ok(take));
-        }
-        st.answered = false;
-        st.waker = Some(cx.waker().clone());
-        if !st.asking {
-            st.asking = true;
-            // Only what is not held: both stay at least 1, as `min` > held.
-            let (lo, hi) = (min - st.bytes, max - st.bytes);
-            drop(st);
-            let (obj, h, gone) = (held.obj.clone(), held.clone(), held.clone());
-            let call = held.lp.settled(
-                move |py| obj.bind(py).call_method1("acquire", (lo, hi)),
-                move |py, r| {
-                    let r = grant(py, &h.obj, r, hi).and_then(|n| {
-                        if n == 0 {
-                            Err(PyValueError::new_err("the limiter granted 0 bytes"))
-                        } else {
-                            Ok(n)
-                        }
-                    });
-                    h.answer(r.map_err(|e| {
-                        e.clone_ref(py).write_unraisable(py, Some(h.obj.bind(py)));
-                        zmux::LimitError::new(e)
-                    }));
-                    true
-                },
-                || false,
-            );
-            // Runs to the answer even when the direction stops waiting:
-            // what it grants is held, and refunded at the end. A loop that
-            // dropped the call granted nothing.
-            tokio::spawn(async move {
-                if !call.await {
-                    gone.answer(Err(zmux::LimitError::new(PyValueError::new_err(
-                        "the event loop dropped the limiter call",
-                    ))));
-                }
-            });
-        }
-        Poll::Pending
-    }
-
-    fn try_acquire(&self, min: u64, max: u64) -> u64 {
-        let held = &self.0;
-        let mut st = lock(&held.st);
-        if st.bytes >= min {
-            let take = st.bytes.min(max);
-            st.bytes -= take;
-            return take;
-        }
-        if !st.topping {
-            st.topping = true;
-            let (lo, hi) = (min - st.bytes, max - st.bytes);
-            let top = Topping(Some(held.clone()));
-            held.lp.post(move |py| {
-                let h = top.finish();
-                let r = h.obj.bind(py).call_method1("try_acquire", (lo, hi));
-                let n = grant(py, &h.obj, r, hi).unwrap_or_else(|e| {
-                    e.write_unraisable(py, Some(h.obj.bind(py)));
-                    0
-                });
-                h.topped(n);
-            });
-        }
-        0
-    }
-
-    fn refund(&self, n: u64) {
-        if n > 0 {
-            let obj = self.0.obj.clone();
-            self.0.lp.post(move |py| refund(py, &obj, n));
-        }
-    }
-}
-
-/// Aborts the splices given it with a chosen application error code: the
-/// first `abort` decides the code and wakes every splice sharing the handle.
-#[pyclass(frozen, module = "zmux")]
-#[derive(Default)]
-pub(crate) struct SpliceAbort(zmux::helpers::SpliceAbort);
-
-#[pymethods]
-impl SpliceAbort {
-    #[new]
-    fn new() -> Self {
-        Self::default()
-    }
-
-    /// Aborts with `code` (< 2**62, 0 included); later calls change nothing.
-    fn abort(&self, #[pyo3(from_py_with = ranged)] code: u64) -> PyResult<()> {
-        self.0.abort(crate::varint(code)?);
-        Ok(())
-    }
-
-    /// The code of the abort, or `None` while not aborted.
-    #[getter]
-    fn code(&self) -> Option<u64> {
-        self.0.code().map(zmux::VarInt::into_inner)
-    }
-
-    fn __repr__(&self) -> String {
-        match self.code() {
-            Some(c) => format!("SpliceAbort(code={c})"),
-            None => "SpliceAbort()".to_owned(),
-        }
-    }
+    Ok(())
 }
 
 /// The parts of a bidirectional stream, taken out of their handles.
-pub(crate) fn pair(
-    send: &Bound<'_, SendStream>,
-    recv: &Bound<'_, RecvStream>,
-) -> PyResult<(zmux::SendStream, zmux::RecvStream)> {
-    let (s, r) = (&send.get().0, &recv.get().0);
-    // Both locks first, so that a failure takes neither part.
-    let mut sg = crate::rt::when_free(|| s.try_lock()).map_err(|_| crate::busy())?;
-    let mut rg = crate::rt::when_free(|| r.try_lock()).map_err(|_| crate::busy())?;
-    match (sg.as_ref(), rg.as_ref()) {
-        (Some(a), Some(b)) => {
-            if let (Some(x), Some(y)) = (a.id(), b.id())
-                && x != y
-            {
-                return Err(PyValueError::new_err("the parts of two different streams"));
-            }
-        }
-        _ => return Err(crate::stream_err(zmux::StreamError::ClosedLocally)),
+pub(crate) fn pair(send: &Bound<'_, SendStream>, recv: &Bound<'_, RecvStream>) -> PyResult<Halves> {
+    crate::take_parts(&send.get().0, &recv.get().0, |s, r| {
+        validate_pair(s, r, &recv.get().1)
+    })
+}
+
+/// Take both streams as one transaction. A busy or invalid half leaves
+/// every handle available.
+pub(crate) fn splice_pairs(a: &Handles<'_>, b: &Handles<'_>) -> PyResult<(Halves, Halves)> {
+    if a.0.is(&b.0) || a.1.is(&b.1) {
+        return Err(PyValueError::new_err(
+            "a stream cannot be spliced into itself",
+        ));
     }
-    Ok((sg.take().expect("checked"), rg.take().expect("checked")))
+    let (mut sa, mut ra, mut sb, mut rb) = crate::rt::when_free(|| {
+        Ok::<_, tokio::sync::TryLockError>((
+            a.0.get().0.try_lock()?,
+            a.1.get().0.try_lock()?,
+            b.0.get().0.try_lock()?,
+            b.1.get().0.try_lock()?,
+        ))
+    })
+    .map_err(|_| crate::busy())?;
+    validate_pair(
+        sa.as_ref().ok_or_else(crate::taken)?,
+        ra.as_ref().ok_or_else(crate::taken)?,
+        &a.1.get().1,
+    )?;
+    validate_pair(
+        sb.as_ref().ok_or_else(crate::taken)?,
+        rb.as_ref().ok_or_else(crate::taken)?,
+        &b.1.get().1,
+    )?;
+    Ok((
+        (sa.take().expect("validated"), ra.take().expect("validated")),
+        (sb.take().expect("validated"), rb.take().expect("validated")),
+    ))
 }
 
 /// A bidirectional stream as a pipe input: one that carries `PIPE_CARRIER`,
@@ -305,139 +81,6 @@ pub(crate) fn pair(
 fn stream_pipe(send: &Bound<'_, SendStream>, recv: &Bound<'_, RecvStream>) -> PyResult<PipeIo> {
     let (s, r) = pair(send, recv)?;
     Ok(PipeIo::wrap(zmux::PipeIo::from_stream(s, r)))
-}
-
-fn direction<'p>(py: Python<'p>, f: &zmux::helpers::SpliceDirection) -> PyResult<Bound<'p, PyAny>> {
-    use zmux::helpers::SpliceEnd as E;
-    let (end, code) = match f.end {
-        E::Finished => ("finished", None),
-        E::Reset(c) => ("reset", Some(c.into_inner())),
-        E::Stopped(c) => ("stopped", Some(c.into_inner())),
-        E::UpstreamLost => ("upstream_lost", None),
-        E::DownstreamLost => ("downstream_lost", None),
-        E::Cancelled(c) => ("cancelled", Some(c.into_inner())),
-        E::LimiterFailed => ("limiter_failed", None),
-        other => return Err(PyValueError::new_err(format!("{other:?}"))),
-    };
-    types(py)?.getattr("SpliceDirection")?.call1((
-        f.bytes,
-        f.datagram_bytes,
-        f.datagrams_dropped,
-        f.datagrams_too_large,
-        f.datagrams_limited,
-        f.datagrams_as_capsules,
-        end,
-        code,
-    ))
-}
-
-/// Forwards two bidirectional streams into each other until both
-/// directions ended; the handles are used up.
-#[pyfunction]
-#[pyo3(signature = (a, b, *, chunk=65536, a_to_b=None, b_to_a=None, abort=None))]
-fn splice<'p>(
-    py: Python<'p>,
-    a: (Bound<'p, SendStream>, Bound<'p, RecvStream>),
-    b: (Bound<'p, SendStream>, Bound<'p, RecvStream>),
-    chunk: usize,
-    a_to_b: Option<Py<PyAny>>,
-    b_to_a: Option<Py<PyAny>>,
-    abort: Option<&Bound<'p, SpliceAbort>>,
-) -> PyResult<Bound<'p, PyAny>> {
-    splice_with(py, a, b, chunk, a_to_b, b_to_a, abort, false)
-}
-
-/// Relays two packet streams: `splice`, where a stream datagram that does
-/// not fit the next hop goes on as a DATAGRAM capsule.
-#[pyfunction]
-#[pyo3(signature = (a, b, *, chunk=65536, a_to_b=None, b_to_a=None, abort=None))]
-fn splice_packets<'p>(
-    py: Python<'p>,
-    a: (Bound<'p, SendStream>, Bound<'p, RecvStream>),
-    b: (Bound<'p, SendStream>, Bound<'p, RecvStream>),
-    chunk: usize,
-    a_to_b: Option<Py<PyAny>>,
-    b_to_a: Option<Py<PyAny>>,
-    abort: Option<&Bound<'p, SpliceAbort>>,
-) -> PyResult<Bound<'p, PyAny>> {
-    splice_with(py, a, b, chunk, a_to_b, b_to_a, abort, true)
-}
-
-fn splice_with<'p>(
-    py: Python<'p>,
-    a: (Bound<'p, SendStream>, Bound<'p, RecvStream>),
-    b: (Bound<'p, SendStream>, Bound<'p, RecvStream>),
-    chunk: usize,
-    a_to_b: Option<Py<PyAny>>,
-    b_to_a: Option<Py<PyAny>>,
-    abort: Option<&Bound<'p, SpliceAbort>>,
-    packets: bool,
-) -> PyResult<Bound<'p, PyAny>> {
-    if chunk == 0 {
-        return Err(PyValueError::new_err("chunk is at least 1"));
-    }
-    if a.0.is(&b.0) || a.1.is(&b.1) {
-        return Err(PyValueError::new_err(
-            "a stream cannot be spliced into itself",
-        ));
-    }
-    let lp = if a_to_b.is_some() || b_to_a.is_some() {
-        Some(LoopRef::running(py, "splice with a limiter")?)
-    } else {
-        None
-    };
-    let lim =
-        |l: Option<Py<PyAny>>| l.map(|o| PyLimiter::shared(o, lp.clone().expect("a running loop")));
-    let mut opts = zmux::helpers::SpliceOptions::default();
-    opts.chunk = chunk;
-    opts.a_to_b = lim(a_to_b);
-    opts.b_to_a = lim(b_to_a);
-    opts.abort = abort.map(|a| a.get().0.clone());
-    let sa = pair(&a.0, &a.1)?;
-    let sb = pair(&b.0, &b.1)?;
-    future_into_py(py, async move {
-        let r = if packets {
-            zmux::helpers::splice_packets(sa, sb, opts).await
-        } else {
-            zmux::helpers::splice(sa, sb, opts).await
-        }
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        Ok(crate::rt::deferred(move |py| {
-            Ok(types(py)?
-                .getattr("SpliceResult")?
-                .call1((direction(py, &r.a_to_b)?, direction(py, &r.b_to_a)?))?
-                .unbind())
-        }))
-    })
-}
-
-fn dial_err(e: PyErr) -> std::io::Error {
-    std::io::Error::other(e.to_string())
-}
-
-/// `Config(redial=...)`: an async callable given the `Direction` that
-/// returns the carrier replacing the lost pipe, run on the Config's loop.
-pub(crate) fn redial_of(v: &Bound<'_, PyAny>, lp: &LoopRef) -> zmux::Redial {
-    let (f, lp) = (Arc::new(v.clone().unbind()), lp.clone());
-    zmux::Redial::new(move |req: zmux::DialRequest| {
-        let f = f.clone();
-        let need = req.direction;
-        let call = call_pipe(&lp, move |py| {
-            f.bind(py).call1((crate::direction_obj(py, need),))
-        });
-        async move { call.await.map_err(dial_err) }
-    })
-}
-
-/// `f` called on `lp`'s loop and awaited there: the carrier it returns.
-pub(crate) fn call_pipe<F>(
-    lp: &LoopRef,
-    f: F,
-) -> impl Future<Output = PyResult<zmux::PipeIo>> + Send + 'static + use<F>
-where
-    F: for<'py> FnOnce(Python<'py>) -> PyResult<Bound<'py, PyAny>> + Send + 'static,
-{
-    lp.call(f, |v| v.cast::<PipeIo>()?.get().take())
 }
 
 /// Resolves two sessions between the same endpoints that raced (both
@@ -463,8 +106,11 @@ fn resolve_duplicate<'p>(
         let f = Arc::new(f);
         opts.rejoin = Some(zmux::Dial::new(move |_req| {
             let f = f.clone();
-            let call = call_pipe(&lp, move |py| f.bind(py).call0());
-            async move { call.await.map_err(dial_err) }
+            let call = lp.call(
+                move |py| f.bind(py).call0(),
+                |v| v.cast::<PipeIo>()?.get().take(),
+            );
+            async move { call.await.map_err(crate::py_io) }
         }));
     }
     let r = {
@@ -500,10 +146,7 @@ pub(crate) fn snake(name: &str) -> String {
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<SpliceAbort>()?;
     m.add_function(wrap_pyfunction!(stream_pipe, m)?)?;
-    m.add_function(wrap_pyfunction!(splice, m)?)?;
-    m.add_function(wrap_pyfunction!(splice_packets, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_duplicate, m)?)?;
     Ok(())
 }

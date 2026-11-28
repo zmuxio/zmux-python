@@ -2,12 +2,14 @@
 
 import asyncio
 import contextlib
+from collections.abc import Callable
 
 import pytest
 import zmux
 from zmux.helpers import SendPolicy, Sent, SpliceEnd
 
-from test_api import pair, until
+from support import tcp_pair as pair
+from support import WATCHDOG
 from test_packet import DGRAM, accept_packets
 
 
@@ -15,11 +17,14 @@ class Recording:
     """Grants what is asked (or `grant(min, max)`), records every call and
     counts what it granted and got back."""
 
+    max_burst_bytes = (1 << 64) - 1
+
     def __init__(self, grant: object = None) -> None:
         self.calls: list[tuple[str, int, int]] = []
         self.granted = 0
         self.refunded = 0
         self.grant = grant
+        self._changed = asyncio.Event()
 
     def _grant(self, lo: int, hi: int) -> int:
         n = hi if self.grant is None else self.grant(lo, hi)  # type: ignore[operator]
@@ -28,16 +33,25 @@ class Recording:
         return n
 
     async def acquire(self, lo: int, hi: int, /) -> int:
+        self._changed.set()
         self.calls.append(("acquire", lo, hi))
         return self._grant(lo, hi)
 
     def try_acquire(self, lo: int, hi: int, /) -> int:
+        self._changed.set()
         self.calls.append(("try_acquire", lo, hi))
         return self._grant(lo, hi)
 
     def refund(self, n: int, /) -> None:
+        self._changed.set()
         self.calls.append(("refund", n, n))
         self.refunded += n
+
+    async def wait_for(self, predicate: Callable[[], bool]) -> None:
+        async with asyncio.timeout(WATCHDOG):
+            while not predicate():
+                self._changed.clear()
+                await self._changed.wait()
 
     @property
     def used(self) -> int:
@@ -59,20 +73,31 @@ async def relay_one(
             return await f(a, b, chunk=chunk, a_to_b=limiter)  # type: ignore[arg-type]
 
         async def sink() -> bytes:
-            send, recv = await server.accept_bi()
+            reply, incoming = await server.accept_bi()
             try:
-                return await recv.read_to_end()
+                return await incoming.read_to_end()
             finally:
-                await send.finish()
+                await reply.finish()
 
         tasks = asyncio.gather(relay(), sink(), return_exceptions=True)
-        send, recv = await c.open_bi()
-        await send.write(payload)
-        await send.finish()
-        with contextlib.suppress(zmux.ZmuxError):
-            await asyncio.wait_for(recv.read_to_end(), 10)
-        done, got = await asyncio.wait_for(tasks, 10)
+        try:
+            send, recv = await c.open_bi()
+            stopped = False
+            try:
+                await send.write(payload)
+                await send.finish()
+            except zmux.StreamStoppedError as error:
+                assert error.code == zmux.ApplicationErrorCode.ZMUX_CANCELLED
+                stopped = True
+            with contextlib.suppress(zmux.ZmuxError):
+                await asyncio.wait_for(recv.read_to_end(), 10)
+            done, got = await asyncio.wait_for(tasks, 10)
+        finally:
+            tasks.cancel()
+            await asyncio.gather(tasks, return_exceptions=True)
         assert isinstance(done, zmux.helpers.SpliceResult)
+        if stopped:
+            assert done.a_to_b.end is SpliceEnd.LIMITER_FAILED
         if done.a_to_b.end is SpliceEnd.FINISHED:
             assert got == payload
         return done
@@ -92,7 +117,18 @@ async def test_stream_splice_reserves_and_refunds() -> None:
     assert done.a_to_b.end is SpliceEnd.FINISHED and done.a_to_b.bytes == 3000
     assert_clamped(lim.calls, 256)
     assert {k for k, _, _ in lim.calls} >= {"acquire"}
-    await until(lambda: lim.used == 3000)
+    await lim.wait_for(lambda: lim.used == 3000)
+    handoffs = done.a_to_b.handoffs
+    assert handoffs is not None and done.b_to_a.handoffs is None
+    assert handoffs.snapshot() == zmux.helpers.SpliceHandoffStats(
+        accepted_bytes=3000,
+        first_carrier_bytes=3000,
+        unsent_bytes=0,
+        pending_bytes=0,
+        unsent_refunded_bytes=0,
+        native_count=0,
+        record_count=0,
+    )
 
 
 async def test_packet_splice_takes_each_capsule_whole() -> None:
@@ -121,25 +157,35 @@ async def test_packet_splice_takes_each_capsule_whole() -> None:
     assert_clamped(lim.calls, 1024)
 
 
-async def test_burst_grant_below_min_still_forwards_the_capsule() -> None:
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+async def test_burst_grant_below_min_is_refunded_without_forwarding() -> None:
     lim = Recording(grant=lambda lo, hi: 1)
-    async with pair() as (c, relay_in, _l1), pair() as (relay_out, server, _l2):
+    async with (
+        asyncio.timeout(WATCHDOG),
+        pair() as (c, relay_in, _l1),
+        pair() as (relay_out, server, _l2),
+        asyncio.TaskGroup() as tasks,
+    ):
 
         async def relay() -> zmux.helpers.SpliceResult:
             a = await relay_in.accept_bi()
             b = await relay_out.open_bi()
+            await b.send.flush()
             return await zmux.helpers.splice_packets(a, b, a_to_b=lim)
 
-        task = asyncio.ensure_future(relay())
+        task = tasks.create_task(relay())
         p = await c.open_packet_stream(policy=SendPolicy.STREAM_ONLY)
         assert await p.send(b"whole capsule") is Sent.CAPSULE
-        await p.close()
-        q = await asyncio.wait_for(accept_packets(server), 5)
-        assert [x.payload async for x in q] == [b"whole capsule"]
+        q = await accept_packets(server)
+        with pytest.raises(zmux.StreamResetError) as failed:
+            await q.recv()
         await q.close()
-        assert await asyncio.wait_for(p.recv(), 5) is None
-        done = await asyncio.wait_for(task, 10)
-    assert done.a_to_b.end is SpliceEnd.FINISHED
+        assert await p.recv() is None
+        done = await task
+    assert failed.value.code == zmux.ApplicationErrorCode.ZMUX_CANCELLED
+    assert done.a_to_b.end is SpliceEnd.LIMITER_FAILED
+    assert done.a_to_b.bytes == 0
+    assert lim.calls == [("acquire", 16, 16), ("refund", 1, 1)]
 
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
@@ -151,7 +197,7 @@ async def test_invalid_acquire_grant_fails_the_direction(bad: object) -> None:
     assert done.a_to_b.bytes == 0 and done.a_to_b.code is None
     if bad == "over":
         # The grant above max was taken back at once.
-        await until(lambda: lim.refunded > 0)
+        assert lim.refunded > 0
 
 
 class Raising(Recording):
@@ -166,13 +212,10 @@ class Raising(Recording):
 
     def try_acquire(self, lo: int, hi: int, /) -> int:
         if self.where == "try_acquire":
+            self._changed.set()
+            self.calls.append(("try_acquire", lo, hi))
             raise RuntimeError("no")
         return super().try_acquire(lo, hi)
-
-    def refund(self, n: int, /) -> None:
-        super().refund(n)
-        if self.where == "refund":
-            raise RuntimeError("ignored")
 
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
@@ -182,19 +225,12 @@ async def test_raising_acquire_fails_the_direction() -> None:
 
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
-async def test_raising_refund_is_ignored() -> None:
-    # Large grants leave something to refund after each chunk.
-    lim = Raising("refund")
-    done = await relay_one(lim, b"r" * 2000, chunk=4096)
-    assert done.a_to_b.end is SpliceEnd.FINISHED and done.a_to_b.bytes == 2000
-
-
-@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
 async def test_raising_try_acquire_grants_nothing() -> None:
     lim = Raising("try_acquire")
     async with (
         pair(DGRAM, DGRAM) as (c, relay_in, _l1),
         pair(DGRAM, DGRAM) as (relay_out, server, _l2),
+        asyncio.TaskGroup() as tasks,
     ):
 
         async def relay() -> zmux.helpers.SpliceResult:
@@ -202,11 +238,15 @@ async def test_raising_try_acquire_grants_nothing() -> None:
             b = await relay_out.open_bi()
             return await zmux.helpers.splice_packets(a, b, a_to_b=lim)
 
-        task = asyncio.ensure_future(relay())
+        task = tasks.create_task(relay())
         p = await c.open_packet_stream()
-        for _ in range(3):
+
+        async def policed(attempts: int) -> None:
+            await lim.wait_for(lambda: len(lim.calls) >= attempts)
+
+        for count in range(1, 4):
             assert await p.send(b"dgram") is Sent.DATAGRAM
-            await asyncio.sleep(0.05)
+            await policed(count)
         await p.close()
         q = await asyncio.wait_for(accept_packets(server), 5)
         assert [x async for x in q] == []
@@ -215,20 +255,24 @@ async def test_raising_try_acquire_grants_nothing() -> None:
         done = await asyncio.wait_for(task, 10)
     f = done.a_to_b
     assert f.end is SpliceEnd.FINISHED
-    assert f.datagrams_limited == 3 == f.datagrams_dropped
-    assert all(lo == hi == 6 for k, lo, hi in lim.calls if k == "try_acquire")
+    assert f.drops.dropped_limiter == 3 == f.drops.total
+    assert [call for call in lim.calls if call[0] == "try_acquire"] == [
+        ("try_acquire", 5, 5)
+    ] * 3
 
 
 class Budget:
     """A shared budget of `left` bytes: grants only what is left, waits
     for a top-up when nothing is."""
 
+    max_burst_bytes = (1 << 64) - 1
+
     def __init__(self, left: int) -> None:
         self.left = left
         self.granted = 0
         self.refunded = 0
-        self.waiting = 0
         self._more = asyncio.Event()
+        self.exhausted = asyncio.Event()
 
     def _take(self, lo: int, hi: int) -> int:
         if self.left < lo:
@@ -241,11 +285,9 @@ class Budget:
     async def acquire(self, lo: int, hi: int, /) -> int:
         while (n := self._take(lo, hi)) == 0:
             self._more.clear()
-            self.waiting += 1
-            try:
-                await self._more.wait()
-            finally:
-                self.waiting -= 1
+            if self.left == 0:
+                self.exhausted.set()
+            await self._more.wait()
         return n
 
     def try_acquire(self, lo: int, hi: int, /) -> int:
@@ -263,7 +305,11 @@ class Budget:
 async def test_shared_limiter_never_over_grants() -> None:
     budget = Budget(1500)
     received = [0, 0]
-    async with pair() as (c, relay_in, _l1), pair() as (relay_out, server, _l2):
+    async with (
+        pair() as (c, relay_in, _l1),
+        pair() as (relay_out, server, _l2),
+        asyncio.TaskGroup() as tasks,
+    ):
 
         async def relay() -> zmux.helpers.SpliceResult:
             a = await relay_in.accept_bi()
@@ -271,19 +317,18 @@ async def test_shared_limiter_never_over_grants() -> None:
             return await zmux.helpers.splice(a, b, chunk=128, a_to_b=budget)
 
         async def sink(i: int) -> None:
-            send, recv = await server.accept_bi()
-            while data := await recv.read(4096):
+            reply, incoming = await server.accept_bi()
+            while data := await incoming.read(4096):
                 received[i] += len(data)
-            await send.finish()
+            await reply.finish()
 
-        relays = [asyncio.ensure_future(relay()) for _ in range(2)]
-        sinks = [asyncio.ensure_future(sink(i)) for i in range(2)]
+        relays = [tasks.create_task(relay()) for _ in range(2)]
+        sinks = [tasks.create_task(sink(i)) for i in range(2)]
         streams = [await c.open_bi() for _ in range(2)]
         for send, _ in streams:
             await send.write(b"s" * 1000)
             await send.finish()
-        await until(lambda: budget.waiting > 0 and budget.left == 0)
-        await asyncio.sleep(0.2)
+        await budget.exhausted.wait()
         assert sum(received) <= budget.granted - budget.refunded <= 1500
         budget.add(500)
         for _, recv in streams:
@@ -292,4 +337,4 @@ async def test_shared_limiter_never_over_grants() -> None:
         await asyncio.wait_for(asyncio.gather(*sinks), 10)
     assert received == [1000, 1000]
     assert sum(d.a_to_b.bytes for d in done) == 2000
-    await until(lambda: budget.granted - budget.refunded == 2000)
+    assert budget.granted - budget.refunded == 2000

@@ -10,11 +10,14 @@ from ._types import (
     ShapingAccount,
     ShapingBudget,
     ShapingLimits,
+    ShapingProfileLimits,
     ShapingSizeLimits,
+    ShapingLedgerStats,
+    ShapingStats,
+    ShapingWindowStats,
     UnitPlan,
 )
 from ._zmux import (
-    DEFAULT_MAX_DELAY,
     DEFAULT_MAX_SLOTS,
     MIN_MAX_LEN,
     InstalledShaper,
@@ -23,7 +26,6 @@ from ._zmux import (
 )
 
 __all__ = [
-    "DEFAULT_MAX_DELAY",
     "DEFAULT_MAX_SLOTS",
     "MIN_MAX_LEN",
     "InstalledShaper",
@@ -31,8 +33,12 @@ __all__ = [
     "ShapingAccount",
     "ShapingBudget",
     "ShapingBundle",
+    "ShapingLedgerStats",
     "ShapingLimits",
+    "ShapingProfileLimits",
     "ShapingSizeLimits",
+    "ShapingStats",
+    "ShapingWindowStats",
     "UnitPlan",
     "shaping_limits_from_json",
 ]

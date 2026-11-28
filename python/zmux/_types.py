@@ -17,6 +17,7 @@ from typing import (
     NamedTuple,
     NewType,
     Protocol,
+    TypedDict,
     runtime_checkable,
 )
 
@@ -34,6 +35,8 @@ if TYPE_CHECKING:
         SendStream,
         ShapingBundle,
         Takeover,
+        SpliceDecision,
+        SpliceUnit,
     )
 
 
@@ -103,6 +106,81 @@ class RecordMode(_Enum):
     TRUSTED = "trusted"
     UNMANAGED = "unmanaged"
     """A first pipe outside the secure carrier; no join has this mode."""
+
+
+class PrefixBinding(_Enum):
+    """How a ticket presentation is bound to its carrier."""
+
+    BOUND = "bound"
+    """Bind to the carrier's 1-RTT TLS 1.3 or QUIC exporter."""
+    ENCRYPTED = "encrypted"
+    """Use a bearer ticket on an encrypted carrier."""
+    ALLOW_CLEARTEXT = "allow_cleartext"
+    """Also allow a bearer ticket as a binary prefix on cleartext carriers."""
+
+
+class PrefixRejection(_Enum):
+    """What the listener does with an invalid or unredeemable ticket."""
+
+    CLOSE = "close"
+    STALL = "stall"
+    FALLBACK = "fallback"
+
+
+class PrefixClaim(NamedTuple):
+    """The exact transaction a ticket authority must commit or resolve."""
+
+    id: bytes
+    nonce: bytes
+    commit_id: bytes
+    version: int
+    schedule: int
+    generation: int
+    issue_slot: int
+    checked_slot: int
+    local_slot: int
+
+
+class PrefixStore(Protocol):
+    """A shared, linearizable authority for one ticket admission domain.
+
+    `local_schedule` is synchronous and may be called from a native worker.
+    It returns a cached snapshot and a lower bound for the rollback floor.
+    The other methods run on the admission's asyncio event loop.
+    """
+
+    @property
+    def window(self) -> _zmux.PrefixWindow:
+        """Immutable clock window of this admission domain."""
+        ...
+
+    def local_schedule(self) -> tuple[_zmux.PrefixSchedule, int]:
+        """Return the published outer schedule and local floor hint."""
+        ...
+
+    def floor(self, attempt: _zmux.PrefixDeadline, /) -> int | Awaitable[int]:
+        """Read the authoritative rollback floor."""
+        ...
+
+    def lookup(
+        self, id: bytes, attempt: _zmux.PrefixDeadline, /
+    ) -> _zmux.PrefixTicket | Awaitable[_zmux.PrefixTicket | None] | None:
+        """Look up a ticket version without changing authority state."""
+        ...
+
+    def claim(
+        self, claim: PrefixClaim, attempt: _zmux.PrefixDeadline, /
+    ) -> bool | Awaitable[bool]:
+        """Check the deadline, effective slot, schedule, generation, ticket and
+        replay state atomically. Record the nonce, consume a single-use ticket
+        and advance the floor in the same commit when accepting."""
+        ...
+
+    def resolve(
+        self, claim: PrefixClaim, attempt: _zmux.PrefixDeadline, /
+    ) -> bool | Awaitable[bool]:
+        """Read the receipt of the original operation; raise if its outcome is unknown."""
+        ...
 
 
 class RejectAction(_Enum):
@@ -237,6 +315,10 @@ class ErrorKind(_Enum):
     NOT_NEGOTIATED = "NotNegotiated"
     NOT_ESTABLISHED = "NotEstablished"
     BLOCKED = "Blocked"
+    BORROW_LIMIT = "BorrowLimit"
+    MEMORY_BUDGET = "MemoryBudget"
+    DROPPED = "Dropped"
+    SEQUENCE_EXHAUSTED = "SequenceExhausted"
     INVALID_OPTIONS = "InvalidOptions"
     TOO_LARGE = "TooLarge"
     INVALID_ARGUMENT = "InvalidArgument"
@@ -602,6 +684,13 @@ class PipeStats:
 
     record_mode: RecordMode | None
     pipe: PipeId
+    health: PipeHealth
+    """Directional service and stability from the same capture."""
+    accounting: PipeAccounting | None
+    """Attribution and live or retired lane totals when enabled."""
+    carrier_loss: CarrierLoss | None
+    """A qualified loss interval scoped to the physical carrier, if available."""
+
     local: bool
     """This endpoint joined the attachment."""
     peer_attached: bool
@@ -794,6 +883,15 @@ class CarrierKind(_Enum):
     QUIC = "quic"
     HTTP3 = "http3"
     WEBTRANSPORT = "webtransport"
+    RAW = "raw"
+    """A reliable ordered byte connection with no framing of its own (TCP, TLS)."""
+
+
+class CarrierRetryProfile(_Enum):
+    """Explicit deployment profiles for carrier retry."""
+
+    SHORT_DROP_RESILIENT = "short_drop_resilient"
+    """Uses 30 s to 30 min exponential backoff with symmetric jitter and a short-drop floor."""
 
 
 class CacheOutcome(_Enum):
@@ -805,7 +903,13 @@ class CacheOutcome(_Enum):
     FAILED = "failed"
     """An ordinary failure: the backoff doubles."""
     REJECTED = "rejected"
-    """A definite verdict of the host: skipped for the longest backoff."""
+    """A definitive path rejection."""
+    SURVIVED = "survived"
+    SHORT_DROP = "short_drop"
+    LATE_DROP = "late_drop"
+    LIFETIME = "lifetime"
+    PERFORMANCE = "performance"
+    RECOVERED = "recovered"
 
 
 class ReplayVerdict(_Enum):
@@ -987,6 +1091,13 @@ class SessionStats:
 class EventKind(_Enum):
     """`Event.kind` values."""
 
+    PIPE_HEALTH_CHANGED = "PipeHealthChanged"
+    TARGET_CHANGED = "TargetChanged"
+    BATCH_RESERVED = "BatchReserved"
+    BATCH_ROLLED_BACK = "BatchRolledBack"
+    DRAIN_COMMITTED = "DrainCommitted"
+    ATTEMPT_STARTED = "AttemptStarted"
+    ATTEMPT_FINISHED = "AttemptFinished"
     PIPE_ADDED = "PipeAdded"
     PIPE_JOINED = "PipeJoined"
     PIPE_SUSPECT = "PipeSuspect"
@@ -1162,7 +1273,7 @@ class SessionResumed(Event):
 
 @dataclass(frozen=True, slots=True)
 class ResumeUnattended(Event):
-    """The session, which can rejoin, suspended with neither a `redial` hook nor a
+    """The session can rejoin and suspended without a
     running pipe pool: nothing will dial, and it ends at the grace period unless the
     application adds a pipe. It follows `SessionSuspended` and is also logged as a
     warning."""
@@ -1228,14 +1339,98 @@ class EpochDeleted(Event):
 
 @dataclass(frozen=True, slots=True)
 class DatagramPathChanged(Event):
-    """`Session.path_datagram_size` changed to `size`: the carrier's
-    datagram size changed (path MTU discovery), another pipe carries the
-    datagrams, or they moved between the carrier's datagrams and records.
-    It is noticed when the session sends or its pipes change; `None` when
-    the peer accepts no datagram. The latest when several were not read."""
+    """The eligible original-copy or native channel datagram capacity changed."""
 
     kind: ClassVar[EventKind] = EventKind.DATAGRAM_PATH_CHANGED
-    size: int | None
+    path: DatagramPath
+
+
+@dataclass(frozen=True, slots=True)
+class PipeHealthChanged(Event):
+    """A committed health change for one local attachment direction."""
+
+    kind: ClassVar[EventKind] = EventKind.PIPE_HEALTH_CHANGED
+    change: PipeHealthChange
+
+
+@dataclass(frozen=True, slots=True)
+class TargetChanged(Event):
+    """A managed session committed a controller binding or target revision."""
+
+    kind: ClassVar[EventKind] = EventKind.TARGET_CHANGED
+    generation: int
+    """The session-local identity of the binding."""
+    revision: int
+    """The installed target revision."""
+    initial: bool
+    """Whether this is the binding's initial target."""
+    predecessor: int | None
+    """The replaced binding on takeover, when present."""
+
+
+@dataclass(frozen=True, slots=True)
+class BatchReserved(Event):
+    """A controller reserved work for a target revision."""
+
+    kind: ClassVar[EventKind] = EventKind.BATCH_RESERVED
+    generation: int
+    """The originating controller binding."""
+    revision: int
+    """The target revision."""
+    batch: int
+    """The session-local capacity batch identifier."""
+
+
+@dataclass(frozen=True, slots=True)
+class BatchRolledBack(Event):
+    """A controller rolled back a capacity batch."""
+
+    kind: ClassVar[EventKind] = EventKind.BATCH_ROLLED_BACK
+    generation: int
+    """The originating controller binding."""
+    batch: int
+    """The session-local capacity batch identifier."""
+
+
+@dataclass(frozen=True, slots=True)
+class DrainCommitted(Event):
+    """A controller committed a member retirement."""
+
+    kind: ClassVar[EventKind] = EventKind.DRAIN_COMMITTED
+    generation: int
+    """The originating controller binding."""
+    batch: int
+    """The session-local capacity batch identifier."""
+    member: int
+    """The retiring member."""
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptStarted(Event):
+    """A controller started a carrier opener."""
+
+    kind: ClassVar[EventKind] = EventKind.ATTEMPT_STARTED
+    generation: int
+    """The originating controller binding."""
+    batch: int
+    """The session-local capacity batch identifier."""
+    attempt: int
+    """The session-local attempt identifier."""
+
+
+@dataclass(frozen=True, slots=True)
+class AttemptFinished(Event):
+    """A controller settled one attempt. Attempt zero means refusal before opener entry."""
+
+    kind: ClassVar[EventKind] = EventKind.ATTEMPT_FINISHED
+    generation: int
+    """The originating controller binding."""
+    batch: int
+    """The session-local capacity batch identifier."""
+    attempt: int
+    """The session-local attempt identifier."""
+    reason: str
+    """The terminal reason."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1271,6 +1466,13 @@ _EVENTS: dict[str, type[Event]] = {
         EpochCommitted,
         EpochDeleted,
         DatagramPathChanged,
+        PipeHealthChanged,
+        TargetChanged,
+        BatchReserved,
+        BatchRolledBack,
+        DrainCommitted,
+        AttemptStarted,
+        AttemptFinished,
     )
 }
 
@@ -1360,18 +1562,15 @@ class EpochPolicy:
 
     period: float | None = _DEFAULTS["epoch_policy"][0]
     joins: int | None = _DEFAULTS["epoch_policy"][1]
-    after_first_pipe: bool = True
-    after_resume: bool = True
+    after_first_pipe: bool = _DEFAULTS["epoch_policy"][2]
+    after_resume: bool = _DEFAULTS["epoch_policy"][3]
     MANUAL: ClassVar[EpochPolicy]
 
     def __post_init__(self) -> None:
-        if self.period == 0:
-            raise ValueError("epoch_policy.period is positive, or None for never")
-        if self.joins == 0:
-            raise ValueError("epoch_policy.joins is positive, or None for never")
+        _zmux._check_epoch_policy(self)
 
 
-EpochPolicy.MANUAL = EpochPolicy(None, None, False, False)
+EpochPolicy.MANUAL = EpochPolicy(*_DEFAULTS["manual_epoch_policy"])
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1380,6 +1579,8 @@ class ShapingAccount:
     Padding that goes with a record is never refused and does not draw on it. `initial` is
     at most 2**53, the others 2**43 (`ValueError` otherwise, at construction)."""
 
+    ceiling: int = 0
+    """Maximum balance, in bytes."""
     initial: int = 0
     """Available from the start."""
     per_mb: int = 0
@@ -1388,14 +1589,7 @@ class ShapingAccount:
     """Added per second."""
 
     def __post_init__(self) -> None:
-        for k, most in (
-            ("initial", 1 << 53),
-            ("per_mb", 1 << 43),
-            ("per_sec", 1 << 43),
-        ):
-            v = getattr(self, k)
-            if not isinstance(v, int) or isinstance(v, bool) or not 0 <= v <= most:
-                raise ValueError(f"{k} is an integer in [0, {most}]")
+        _zmux._check_shaping_account(self)
 
 
 def _count(k: str, v: object) -> None:
@@ -1403,11 +1597,65 @@ def _count(k: str, v: object) -> None:
         raise ValueError(f"{k} is a non-negative integer")
 
 
-def _wait(v: float | None) -> None:
-    if v is not None and (
-        not isinstance(v, (int, float)) or isinstance(v, bool) or not v > 0
-    ):
-        raise ValueError("max_delay is a positive number of seconds")
+class ShapingWindowStats(TypedDict):
+    """Overhead recorded in one effective shaping window."""
+
+    profile: ShapingProfileLimits
+    baseline_bytes: int
+    allowance_bytes: int
+    consumed_bytes: int
+    reserved_bytes: int
+    history_complete: bool
+
+
+class ShapingLedgerStats(TypedDict):
+    """Outbound costs at zmux's adapter handoff."""
+
+    boundary: Literal["zmux_handoff"]
+    precision: Literal["exact", "unavailable"]
+    measured_bytes: int
+    baseline_bytes: int
+    policy: ShapingWindowStats | None
+    local: ShapingWindowStats | None
+
+
+class ShapingStats(TypedDict):
+    """Profile accounting and handoff statistics for outbound session shaping."""
+
+    wire_spent: int
+    stall_spent: float
+    max_added_delay: float
+    generation: int
+    ledger: ShapingLedgerStats
+    clamped: int
+    faults: int
+    handshake_unplanned: int
+    handshake_measured_bytes: int
+    handshake_reserved_bytes: int
+    handshake_unresolved_bytes: int
+    injection_accepted_bytes: int
+    injection_sent_bytes: int
+    injection_accepted_requests: int
+    injection_rejected: int
+    injection_rejected_by_reason: tuple[int, ...]
+    runtime_reasons: tuple[int, ...]
+
+
+@dataclass(frozen=True, kw_only=True)
+class ShapingProfileLimits:
+    """Outbound bounds."""
+
+    window_seconds: int = _DEFAULTS["shaping_lightweight"][0]
+    """Number of one-second buckets in the sliding window."""
+    extra_bytes_ppm: int = _DEFAULTS["shaping_lightweight"][1]
+    """Extra bytes per million proved baseline bytes."""
+    floor_bytes: int = _DEFAULTS["shaping_lightweight"][2]
+    """Minimum overhead allowance per window, in bytes."""
+    max_added_delay: float = _DEFAULTS["shaping_lightweight"][3]
+    """Maximum additional local wait per unit, in seconds."""
+
+    def __post_init__(self) -> None:
+        _zmux._check_shaping_profile(self)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1415,20 +1663,16 @@ class ShapingLimits:
     """Local bounds on shaping (`Config(shaping_limits=...)`), set by the application and
     never sent; a configuration cannot widen them. Durations are seconds."""
 
-    wire: ShapingAccount = ShapingAccount()
-    """What injections may spend."""
-    max_delay: float | None = _zmux.DEFAULT_MAX_DELAY
-    """The bound on one wait, and so on the lowest rate of a gate (positive;
-    `None`: no bound)."""
+    wire: ShapingAccount | None = None
+    """What cover injections may spend."""
+    profile: ShapingProfileLimits | None = None
+    """Additional local profile cap, if configured."""
     no_padding: bool = False
     """No padding at all, on handshakes and injections too."""
     no_pause: bool = False
     """No pause or delay."""
     no_injection: bool = False
     """No injection."""
-
-    def __post_init__(self) -> None:
-        _wait(self.max_delay)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1437,15 +1681,12 @@ class ShapingBudget:
     the same for every session; a `ShapingBundle` draws one per session). It cannot
     widen `ShapingLimits`."""
 
-    wire: ShapingAccount = ShapingAccount()
-    """What injections may spend."""
-    max_delay: float | None = None
-    """The configuration's bound on one wait in seconds; `None`: none."""
+    wire: ShapingAccount | None = None
+    """What cover injections may spend."""
+    profile: ShapingProfileLimits | None = None
+    """Optional profile limits."""
     no_injection: bool = False
     """The configuration allows no injection."""
-
-    def __post_init__(self) -> None:
-        _wait(self.max_delay)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1644,7 +1885,7 @@ class Liveness:
 
     keep_alive_period: float | None = _LIVENESS["keep_alive_period"]
     suspect_floor: float = _LIVENESS["suspect_floor"]
-    dead_timeout: float | Auto | None = AUTO
+    dead_timeout: float | Auto | None = _LIVENESS["dead_timeout"]
     standby_probe: float | None = _LIVENESS["standby_probe"]
     probe_interval: float | None = _LIVENESS["probe_interval"]
     probe_jitter: float = _LIVENESS["probe_jitter"]
@@ -1669,190 +1910,6 @@ class PipeLiveness:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class PoolMember:
-    """A member of a pipe pool in a `PoolView`: a dialled pipe, or the group of
-    pipes a `join` function joined. Durations in seconds. A policy's tests
-    build one directly."""
-
-    pipe: PipeId = PipeId(0)
-    """The ID of its first pipe (0 included), which identifies the member: what
-    `PoolDecision.retire_pipes` names."""
-    age: float = 0.0
-    """Seconds since its oldest pipe was attached."""
-    idle: float = 0.0
-    """The least seconds since a traffic frame on any of its pipes (since
-    attachment for a pipe without traffic)."""
-    pipes: int = 0
-    """Its pipes: 1 for a dialled pipe, the group's size for a joined member."""
-    bytes_sent: int = 0
-    bytes_received: int = 0
-    usable: bool = False
-    """Every pipe serves its direction and the peer attached it."""
-    replacing: bool = False
-    """A replacement of it is being dialled or joined."""
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class PoolView:
-    """What a pool's policy is asked about (`PoolPolicy.decide`): the pool's
-    state at one look, as durations and counts, so that a policy reads no
-    clock of its own. A policy's tests build one directly."""
-
-    members: tuple[PoolMember, ...] = ()
-    """The pool's members; a replacement being joined is not one until it
-    replaces its member."""
-    failures: int = 0
-    """Consecutive failed dial attempts of the pool (redials and replacements
-    alike); 0 once a dial gives a usable member."""
-    since_last_dial: float | None = None
-    """Seconds since the start of the pool's last dial attempt; `None` before
-    the first."""
-    dialing: int = 0
-    """Dial attempts in progress that would add a member (redials and first
-    dials; replacements are not counted)."""
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "members", tuple(self.members))
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class PoolDecision:
-    """What a pool's policy decides at one look; every field left at its default
-    keeps the pool's own behaviour, so `PoolDecision()` changes nothing.
-    Durations are seconds. A value out of range raises `ValueError`.
-
-    `count`: the members to keep (at least 1; `INHERIT`: the pool's). Above
-    it, the pool shrinks: dials that would add a member are cancelled first,
-    the latest first, then members close gracefully, those in `retire_pipes`
-    first, then the longest `idle`, ties broken by the fewest `pipes`, the
-    least `age`, the highest `pipe`. `dial_after`: the wait from the start of
-    the last dial attempt (of the pool before the first) to the next dial, in
-    place of the backoff's wait, at most the backoff's `max` (0 or more;
-    `INHERIT`: the backoff). `retire_pipes`: members to replace now, make
-    before break, by `PoolMember.pipe`; one that is not usable or already
-    being replaced is skipped. `recheck`: look again no later than this after
-    the decision even when nothing happens (at least 1 ns and `MIN_RECHECK`
-    in effect, no upper bound; `None`: no extra look). `liveness`: the
-    `PipeLiveness` of the pipes the pool dials after this decision; a field
-    left to `INHERIT` keeps the pool's options, else the session's."""
-
-    count: int | Inherit = INHERIT
-    dial_after: float | Inherit = INHERIT
-    retire_pipes: Sequence[PipeId] = ()
-    recheck: float | None = None
-    liveness: PipeLiveness = field(default_factory=lambda: PipeLiveness())
-
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "retire_pipes", tuple(self.retire_pipes))
-        _zmux._check_pool_decision(self)
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class PoolEvaluation:
-    """What a `MachinePoolPolicy` evaluates for a `PoolView`
-    (`MachinePoolPolicy.evaluate`), its values as the policy file gives them,
-    out of range ones included (`MachinePoolPolicy.decide` builds a
-    `PoolDecision` from them, which refuses such a value). `None` is unset.
-    Durations in seconds: `probe_interval` is the idle-probe interval of the
-    pipes added from now on (0: none), `probe_jitter` a fraction."""
-
-    count: int | None = None
-    dial_after: float | None = None
-    retire: tuple[int, ...] = ()
-    recheck: float | None = None
-    probe_interval: float | None = None
-    probe_jitter: float | None = None
-
-
-class PoolPolicy(Protocol):
-    """A pool's policy (`PipePool(policy=...)`): an object, not a bare function,
-    so that it can keep state between looks. `decide(view)` runs on the event
-    loop that runs `maintain_pipes`, at each look of the pool: at once when a
-    pipe of the session changes state or the session is suspended or resumed,
-    after each dial attempt, no later than the `recheck` of the last decision,
-    and every 100 ms. The pool waits for the answer without a bound and holds
-    no thread while it waits (one that does not return holds the looks of its
-    own pool and nothing else; stopping the pool ends the wait and cancels the
-    call), so `decide` should return promptly; it must not
-    call into the session. It returns a `PoolDecision`; an exception, or a
-    decision that is not one, rejects the look: the pool applies the default
-    decision for it, hands the exception to `PipePool(decision_rejected=...)`,
-    or without one logs it at warning level through the session's logger. A
-    `MachinePoolPolicy` is one the binding runs natively."""
-
-    def decide(self, view: PoolView, /) -> PoolDecision | Awaitable[PoolDecision]:
-        """The decision for `view`; a coroutine function is awaited on the loop."""
-        ...
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class PipeOptions:
-    """Every option of a pipe (`Session.add_pipe`, `PipePool`); durations in
-    seconds. Invalid values raise `ValueError` where the options are used.
-
-    Fixed when the pipe is added: `direction` (`Direction.BIDI`), the
-    directions the pipe carries; `record_mode` (`INHERIT`:
-    `Config.record_policy`, else sealed); `key_group` (`INHERIT`: the local
-    preference), the key group of the join; `label`, the application's name
-    for the pipe (`None`: none); `fate_group` (0: independent), pipes that
-    fail together; `return_on_reply` (`False`): `add_pipe` returns once the
-    Reply is verified instead of once the peer attached the pipe (then wait
-    with `Pipe.wait_attached()` before closing the session's other pipes).
-
-    Changeable on a live pipe with `Pipe.update`: each is `INHERIT`, the
-    default, which is the unset setting (`Pipe.update(field=CLEAR)` returns a
-    field to it, and `Pipe.options` reads it back as `INHERIT`), or a value.
-    `CLEAR` belongs to `Pipe.update`; in a `PipeOptions` it raises
-    `TypeError`. `send_priority`, the tier of the local outbound direction,
-    lower preferred (`INHERIT`: the peer's request, else 0);
-    `receive_priority`, the tier requested for the peer's outbound direction
-    (`INHERIT`: 0); `send_standby`, the local outbound direction takes data
-    only on failover (`INHERIT`: the peer's request, else available);
-    `receive_standby`, asks the peer to do so (`INHERIT`: no); `weight`, its
-    share among the pipes of a tier (`INHERIT`: 1; 0 excludes the pipe);
-    `probation` (`INHERIT`: the session's; `AUTO`: derived from the pipe's
-    RTT; `None` off; else the base in seconds); `liveness` (a `PipeLiveness`,
-    each of whose fields is `INHERIT` or a value; `INHERIT`: the session's);
-    `quality_band` (a `QualityBand`; `INHERIT`: the session's; `None`: no
-    reports for this pipe whatever the session's band is)."""
-
-    direction: Direction = Direction.BIDI
-    record_mode: RecordMode | str | Inherit = INHERIT
-    key_group: KeyGroup | int | Inherit = INHERIT
-    send_priority: int | Inherit = INHERIT
-    receive_priority: int | Inherit = INHERIT
-    send_standby: bool | Inherit = INHERIT
-    receive_standby: bool | Inherit = INHERIT
-    weight: int | Inherit = INHERIT
-    probation: float | Auto | Inherit | None = INHERIT
-    liveness: PipeLiveness | Inherit = INHERIT
-    quality_band: QualityBand | Inherit | None = INHERIT
-    label: str | None = None
-    fate_group: int = 0
-    return_on_reply: bool = False
-
-    def __post_init__(self) -> None:
-        for name in _PIPE_UPDATABLE:
-            if getattr(self, name) is CLEAR:
-                raise TypeError(
-                    f"{name}=CLEAR is for Pipe.update; a PipeOptions leaves a "
-                    "field unset with INHERIT"
-                )
-
-
-_PIPE_UPDATABLE = (
-    "send_priority",
-    "receive_priority",
-    "send_standby",
-    "receive_standby",
-    "weight",
-    "probation",
-    "liveness",
-    "quality_band",
-)
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
 class QualityBand:
     """When to report a pipe's quality (`PipeQualityChanged`): once its
     smoothed RTT moved by more than `rtt` seconds (at least 1 ns), or its delivery
@@ -1873,19 +1930,715 @@ class QualityBand:
         _zmux._check_quality_band(self)
 
 
+_PIPE_DEFAULTS: Final[dict[str, Any]] = _zmux._pipe_option_defaults()
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PipeOptions:
+    """Every option of a pipe (`Session.add_pipe`, `AttachmentSpec`); durations in
+    seconds. Invalid values raise `ValueError` where the options are used.
+
+    Fixed when the pipe is added: `direction` (`Direction.BIDI`), the
+    directions the pipe carries; `record_mode` (`INHERIT`:
+    `Config.record_policy`, else sealed); `key_group` (`INHERIT`: the local
+    preference), the key group of the join; `label`, the application's name
+    for the pipe (`None`: none); `fate_group` (0: independent), pipes that
+    fail together.
+
+    Changeable on a live pipe with `Pipe.update`: each is `INHERIT`, the
+    default, which is the unset setting (`Pipe.update(field=CLEAR)` returns a
+    field to it, and `Pipe.options` reads it back as `INHERIT`), or a value.
+    `CLEAR` belongs to `Pipe.update`; in a `PipeOptions` it raises
+    `TypeError`. `send_priority`, the tier of the local outbound direction,
+    lower preferred (`INHERIT`: the peer's request, else 0);
+    `receive_priority`, the tier requested for the peer's outbound direction
+    (`INHERIT`: 0); `send_standby`, the local outbound direction takes data
+    only on failover (`INHERIT`: the peer's request, else available);
+    `receive_standby`, asks the peer to do so (`INHERIT`: no); `weight`, its
+    share among the pipes of a tier (`INHERIT`: 1; 0 excludes the pipe);
+    `probation` (`INHERIT`: the session's; `AUTO`: derived from the pipe's
+    RTT; `None` off; else the base in seconds); `liveness` (a `PipeLiveness`,
+    each of whose fields is `INHERIT` or a value; `INHERIT`: the session's);
+    `quality_band` (a `QualityBand`; `INHERIT`: the session's; `None`: no
+    reports for this pipe whatever the session's band is)."""
+
+    direction: Direction = _PIPE_DEFAULTS["direction"]
+    record_mode: RecordMode | str | Inherit = _PIPE_DEFAULTS["record_mode"]
+    key_group: KeyGroup | int | Inherit = _PIPE_DEFAULTS["key_group"]
+    send_priority: int | Inherit = _PIPE_DEFAULTS["send_priority"]
+    receive_priority: int | Inherit = _PIPE_DEFAULTS["receive_priority"]
+    send_standby: bool | Inherit = _PIPE_DEFAULTS["send_standby"]
+    receive_standby: bool | Inherit = _PIPE_DEFAULTS["receive_standby"]
+    weight: int | Inherit = _PIPE_DEFAULTS["weight"]
+    probation: float | Auto | Inherit | None = _PIPE_DEFAULTS["probation"]
+    liveness: PipeLiveness | Inherit = _PIPE_DEFAULTS["liveness"]
+    quality_band: QualityBand | Inherit | None = _PIPE_DEFAULTS["quality_band"]
+    label: str | None = _PIPE_DEFAULTS["label"]
+    fate_group: int = _PIPE_DEFAULTS["fate_group"]
+
+    def __post_init__(self) -> None:
+        _zmux._check_pipe_option_sentinels(self)
+
+
+class Directions(enum.IntFlag):
+    """Local sending and receiving directions in a capacity observation."""
+
+    NONE = 0
+    SEND = 1
+    RECEIVE = 2
+    BOTH = SEND | RECEIVE
+
+
+class DatagramCopyPolicy(_Enum):
+    """Requests a single datagram or the session's adaptive replica policy."""
+
+    SINGLE = "single"
+    ADAPTIVE = "adaptive"
+
+
+class DatagramCarrier(_Enum):
+    """Chooses whether the datagram may use a reliable carrier."""
+
+    PREFER_NATIVE = "prefer_native"
+    REQUIRE_NATIVE = "require_native"
+
+
+_DATAGRAM: Final[dict[str, Any]] = _DEFAULTS["datagram"]
+_DATAGRAM_PRIORITY = Priority(*_DATAGRAM["priority"])
+
+
+class DirectionHealth(NamedTuple):
+    """Current service state and stability evidence for a local direction."""
+
+    state: str
+    reason: str
+    since: float | None
+    can_carry: bool
+    """Whether the direction can provide service in this observation."""
+    proof_kind: str | None
+    settled: bool
+    evidence: DirectionEvidence | None
+    """The service generation and its start, including on a health event."""
+
+
+class DirectionEvidence(NamedTuple):
+    """Sequence and monotonic start time of a directional service interval."""
+
+    generation: int
+    since: float
+
+
+class PipeHealth(NamedTuple):
+    """Committed health of an attachment, including explicitly absent directions."""
+
+    seq: int
+    send: DirectionHealth
+    receive: DirectionHealth
+    peer_attached: bool
+    joined_at: float | None
+    attached_at: float | None
+    send_evidence: DirectionEvidence | None
+    receive_evidence: DirectionEvidence | None
+    eligible_for_new_data: bool
+    """Whether the outbound path can be scheduled for new data. A temporary
+    scheduling penalty can clear this flag while `send.can_carry` stays true."""
+    since_join: float
+    failure: str | None
+    settled: bool
+
+
+class CarrierFailure(NamedTuple):
+    """A physical connection failure committed by the session."""
+
+    connection: int
+    round: int
+    kind: str
+    retry_after: float | None
+    at: float
+    retry_at: float | None
+
+
+class PipeHealthChange(NamedTuple):
+    """One directional service transition with its before and after evidence.
+
+    Scheduling penalties can change the current snapshot's eligibility while
+    leaving the service generation intact. A sequence gap calls for a fresh
+    health snapshot.
+    """
+
+    seq: int
+    pipe: int
+    half: PipeHalf
+    before: DirectionHealth
+    after: DirectionHealth
+    reason: str
+    at: float
+    since_join: float
+    failure: str | None
+    physical_failure: CarrierFailure | None
+
+
+class CarrierLoss(NamedTuple):
+    """Paired counters for an actual carrier connection and observation interval."""
+
+    connection: int
+    generation: int
+    source: CarrierSource
+    unit: str
+    since: float
+    at: float
+    sent: int
+    lost: int
+
+
+class CarrierHalfSource(NamedTuple):
+    """Immutable attribution for one carrier half. An adapter supplies connection identity."""
+
+    connection: int | None = None
+    kind: CarrierKind | str | None = None
+    route: str | None = None
+
+
+class HalfTotals(NamedTuple):
+    """Complete records and known partial bytes in one directional source segment."""
+
+    source: CarrierHalfSource
+    bytes: int
+    records: int
+    active_complete_record_bytes: int
+    retired_complete_record_bytes: int
+    partial_bytes: int
+    imprecise: bool
+    source_overflow: bool
+
+
+class PipeAccounting(NamedTuple):
+    """Record accounting of both halves, including retired lanes."""
+
+    pipe: int
+    send: tuple[HalfTotals, ...]
+    receive: tuple[HalfTotals, ...]
+
+
+class JoinFirstBatch(NamedTuple):
+    """Structure of the authenticated batch, before flow control and stream checks."""
+
+    encoded_bytes: int
+    stream_frames: int
+    stream_bytes: int
+    malformed: bool
+
+
+class JoinAuthorization(NamedTuple):
+    """Authenticated Join facts captured before any state from this Join is committed."""
+
+    session: int
+    auth_generation: int
+    join_epoch: int
+    pipe_id: int
+    direction: Direction
+    record_mode: RecordMode
+    carrier_kind: CarrierKind | str | None
+    send: CarrierHalfSource
+    receive: CarrierHalfSource
+    principal: object | None
+    admitted: object | None
+    first_batch: JoinFirstBatch
+
+
+class Cooldown(NamedTuple):
+    """One active retry decision with nominal and sampled waits in seconds."""
+
+    reason: str | None
+    started_at: float | None
+    nominal_wait: float
+    sampled_wait: float | None
+    retry_at: float
+    remaining: float
+
+
+class RetryMetrics(NamedTuple):
+    """Candidate retry pacing and counters. Durations are in seconds."""
+
+    attempted_starts: int
+    recovery_nominal: float
+    recovery_sampled: float
+    recovery_retry_at: float | None
+    faults: int
+    suppressions: Mapping[str, int]
+    elapsed: float | None
+    remaining: float
+
+
+class CarrierMeasurementSource(_Enum):
+    """How the cache acquired a performance sample."""
+
+    PROTOCOL = "protocol"
+    """Observed on an attached member."""
+
+    HOST_REPORT = "host_report"
+    """Reported through a registered host source."""
+
+
+class CarrierMeasurement(NamedTuple):
+    """One performance sample with its original age and effective validity in seconds.
+
+    The source is unknown for an imported version 2 sample. A sample with
+    `age >= valid_for` has expired.
+    """
+
+    value: float
+    age: float
+    valid_for: float
+    source: CarrierMeasurementSource | None
+
+
+class CarrierScore(NamedTuple):
+    """Current carrier score, decayed sample weights and local cooldown.
+
+    `age` is the age of the scoring history in seconds, when known.
+    `rtt.value` is in seconds and `rate.value` in bytes per second.
+    """
+
+    score: float
+    attempts: int
+    weight: float
+    success_weight: float
+    window_survived: float
+    short_drops: float
+    post_window_faults: float
+    age: float | None
+    cooldown: Cooldown | None
+    post_window_seconds: float
+    rtt: CarrierMeasurement | None
+    rate: CarrierMeasurement | None
+
+
+class DatagramPath(NamedTuple):
+    """Current original-copy payload and native channel bounds in bytes."""
+
+    payload: int | None
+    native_payload: int | None
+    native_room: int | None
+
+
+class DatagramDrop(_Enum):
+    """Why the sender dropped an original datagram."""
+
+    NO_NATIVE_PATH = "no_native_path"
+    QUEUE_OVERFLOW = "queue_overflow"
+    LIMITER = "limiter"
+    CODEL = "codel"
+    DEADLINE = "deadline"
+    SEQUENCE_EXHAUSTED = "sequence_exhausted"
+    CLOSED_FLOW = "closed_flow"
+    SIZE = "size"
+    CARRIER_REJECTED = "carrier_rejected"
+    CARRIER_CANCELLED = "carrier_cancelled"
+
+
+class DatagramDrops(NamedTuple):
+    """Outgoing originals dropped locally, grouped by Rust's decision."""
+
+    no_native_path: int
+    queue_overflow: int
+    limiter: int
+    codel: int
+    deadline: int
+    sequence_exhausted: int
+    closed_flow: int
+    size: int
+    carrier_rejected: int
+    carrier_cancelled: int
+
+
+class DatagramReplicaDegradation(NamedTuple):
+    """Extra copies that could not be sent."""
+
+    budget: int
+    no_eligible_pipe: int
+    fate: int
+    open_fence: int
+    size: int
+    deadline: int
+    carrier_rejected: int
+    carrier_cancelled: int
+
+
+class DatagramDispatchStats(NamedTuple):
+    """Original and replica dispatch and handoff counts for one representation."""
+
+    originals: int
+    original_bytes: int
+    originals_accepted: int
+    original_bytes_accepted: int
+    originals_failed: int
+    replicas: int
+    replica_bytes: int
+    replicas_accepted: int
+    replica_bytes_accepted: int
+    replicas_failed: int
+
+
+class DatagramStats(NamedTuple):
+    """Datagram drops, replica degradation, handoffs and deduplication counts."""
+
+    duplicates_dropped: int
+    stale_dropped: int
+    drops: DatagramDrops
+    replica_degradation: DatagramReplicaDegradation
+    record: DatagramDispatchStats
+    native: DatagramDispatchStats
+
+
+class DatagramEvidenceSource(_Enum):
+    """Source of a datagram path timing measurement."""
+
+    DATAGRAM_ACK = "DatagramAck"
+
+
+class DatagramFeedback(NamedTuple):
+    """Bounded evidence for one outgoing pipe and carrier mode.
+
+    Report RTT includes the return path. Missing or expired reports leave
+    forward loss unknown. Times and durations use monotonic seconds.
+    """
+
+    tracking: int
+    awaiting: int
+    arrived: int
+    expired: int
+    report_rtt: float | None
+    report_variation: float | None
+    sampled_at: float | None
+    sample_age: float | None
+    samples: int
+    sample_source: DatagramEvidenceSource | str | None
+
+
+class DatagramArrivals(NamedTuple):
+    """Reportable frames and payload bytes before deduplication and delivery."""
+
+    frames: int
+    bytes: int
+    last_at: float
+
+
+class MemberSnapshot(NamedTuple):
+    """Current membership and confirmed directional coverage."""
+
+    id: int
+    candidate: str | None
+    expected: Directions
+    pipes: tuple[int, ...]
+    covered: Directions
+    stable: Directions
+    complete: bool
+
+
+class OpenRequest(NamedTuple):
+    """The actual carrier opener invocation and its reserved layout."""
+
+    attempt: int
+    cause: str
+    need: Directions
+    stage: str
+    layout: tuple[AttachmentSpec, ...]
+    deadline: float
+
+
+class AttemptResult(NamedTuple):
+    """Terminal state, assigned attachments and their final accounting tickets."""
+
+    id: int
+    generation: int | None
+    """The originating controller binding for managed work."""
+    batch: int
+    """The session-local capacity batch identifier."""
+    reason: str
+    error: BaseException | None
+    open_error: BaseException | None
+    member: int | None
+    pipes: tuple[int, ...]
+    tickets: tuple[_zmux.AccountingTicket, ...]
+
+
+class AttemptSnapshot(NamedTuple):
+    """Current progress and the retained terminal result, if any."""
+
+    id: int
+    cause: str
+    need: Directions
+    candidate: str | None
+    member: int
+    pipes: tuple[int, ...]
+    replied: tuple[int, ...]
+    confirmed: tuple[int, ...]
+    started: float | None
+    ended: float | None
+    result: AttemptResult | None
+    generation: int | None
+    """The originating controller binding for managed work."""
+    batch: int
+    """The session-local capacity batch identifier."""
+
+
+class QuotaDeficit(NamedTuple):
+    """Count of missing complete members in a target quota."""
+
+    group: str
+    quota: str
+    missing: int
+
+
+class ChangeResult(NamedTuple):
+    """Committed retirement identities and the resulting capacity observation."""
+
+    draining: tuple[int, ...]
+    capacity: CapacitySnapshot
+
+
+class ControllerSnapshot(NamedTuple):
+    """The controller's latest committed plan and associated core observation.
+
+    A takeover snapshot identifies the previous binding in `predecessor`.
+    `capacity.covered` and `capacity.stable` describe service observed at
+    the same commit as `paths` and `members`.
+    """
+
+    generation: int
+    predecessor: int | None
+    revision: int
+    capacity: CapacitySnapshot
+    members: tuple[MemberSnapshot, ...]
+    paths: tuple[_zmux.ControllerPath, ...]
+    deficits: tuple[QuotaDeficit, ...]
+    attempts: tuple[int, ...]
+    last_attempt: AttemptResult | None
+    blocked: str | None
+    next_retry: float | None
+    host_calls_in_flight: int
+    """Opener slots still charged to this binding."""
+    cleanup_in_flight: int
+    """Attachment cleanup permits still charged to this binding."""
+    domain_openers: int
+    """Opener slots charged across the controller domain."""
+    domain_cleanup: int
+    """Attachment cleanup permits charged across the controller domain."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AccountingPolicy:
+    """Opt-in final and live record accounting with an attribution limit."""
+
+    enabled: bool = False
+    source_limit: int = 0
+    strict: bool = False
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CarrierObservation:
+    """Original monotonic sample time, lifetime and protocol performance evidence."""
+
+    at: float | None = None
+    duration: float = 0.0
+    rtt: float = 0.0
+    rate: int = 0
+    valid_for: float = 0.0
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CapacityLimits:
+    """Local attachment and carrier limits."""
+
+    steady_attachments: int = 1
+    join_headroom: int = 8
+    local_carriers: int | None = None
+    pending_peer_joins: int = 4
+    recovery_burst: int = 4
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CapacitySnapshot:
+    """An atomic observation of session limits, reservations and coverage."""
+
+    observed: int
+    reserved_attachments: int
+    policy_revision: int
+    auth_generation: int
+    protocol_envelope: int
+    local_carrier_limit: int
+    local_attachments: int
+    peer_attachments: int
+    pending_peer_joins: int
+    peer_retry_at: float | None
+    authorizing_peer_joins: int
+    local_carriers: int
+    limits: CapacityLimits
+    required: Directions
+    covered: Directions
+    stable: Directions
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SessionPolicy:
+    """Versioned local limits and authenticated Join authorization."""
+
+    revision: int = 0
+    auth_generation: int = 0
+    limits: CapacityLimits = CapacityLimits()
+    authorize_join: Callable[[JoinAuthorization], bool | Awaitable[bool]] | None = (
+        field(default=None, compare=False, repr=False)
+    )
+    join_source_routes: tuple[str, ...] | None = None
+    candidate_exclusions: tuple[tuple[str, Directions], ...] = ()
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PathPreference:
+    """Tier, standby flag and relative weight for one local direction."""
+
+    tier: int = 0
+    standby: bool = False
+    weight: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class TargetCandidate:
+    """A registered candidate and optional per-direction scheduling preferences."""
+
+    id: str
+    send: PathPreference | None = field(default=None, kw_only=True)
+    receive: PathPreference | None = field(default=None, kw_only=True)
+
+
+@dataclass(frozen=True, slots=True)
+class MemberQuota:
+    """Desired number of complete members with interchangeable candidates."""
+
+    id: str
+    count: int = field(kw_only=True)
+    directions: Directions = field(kw_only=True)
+    candidates: tuple[TargetCandidate, ...] = field(kw_only=True)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class RotationPolicy:
+    """Age or record-byte thresholds for replacing complete members."""
+
+    max_age: float | None = None
+    send_bytes: int | None = None
+    receive_bytes: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GroupTarget:
+    """A named group of quotas that replaces one member at a time."""
+
+    id: str
+    quotas: tuple[MemberQuota, ...] = field(kw_only=True)
+    rotation: RotationPolicy = field(default=RotationPolicy(), kw_only=True)
+
+
+@dataclass(frozen=True, slots=True)
+class ReplaceIntent:
+    """Requests make-before-break replacement of a set of existing members."""
+
+    id: str
+    members: tuple[int, ...] = field(kw_only=True)
+    min_epoch: int = field(default=0, kw_only=True)
+    evidence: tuple[_zmux.QualityEvidence, ...] = field(default=(), kw_only=True)
+    """Original path observations relied on for the replacement."""
+
+
+@dataclass(frozen=True, slots=True)
+class SessionTarget:
+    """A revision of the desired member composition and explicit replacements."""
+
+    revision: int = 0
+    groups: tuple[GroupTarget, ...] = field(default=(), kw_only=True)
+    replace: tuple[ReplaceIntent, ...] = field(default=(), kw_only=True)
+
+
+@dataclass(frozen=True, slots=True)
+class AttachmentSpec:
+    """One carrier's expected local directions and Join options."""
+
+    directions: Directions
+    options: PipeOptions = field(default=PipeOptions(), kw_only=True)
+
+
+@dataclass(frozen=True, slots=True)
+class MemberSpec:
+    """The exact attachment layout of a complete new member."""
+
+    attachments: tuple[AttachmentSpec, ...]
+    candidate: str | None = field(default=None, kw_only=True)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ChangeRequest:
+    """A capacity transaction based on a session observation."""
+
+    policy_revision: int
+    observed: int
+    timeout: float = 0
+    add: tuple[MemberSpec, ...] = ()
+    drain: tuple[int, ...] = ()
+    min_epoch: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class Duplicate:
+    """Requests the given total copies, subject to the session's send budget."""
+
+    count: int
+
+
+@dataclass(frozen=True, slots=True)
+class DatagramDeadline:
+    """An absolute local monotonic deadline, in seconds."""
+
+    at: float
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DatagramSendOptions:
+    """Local send overrides. A duration is a hop-local TTL. None explicitly clears the deadline."""
+
+    copies: DatagramCopyPolicy | Duplicate | Literal["single", "adaptive"] | None = None
+    urgent: bool | None = None
+    independent_fate: bool | None = None
+    deadline: float | DatagramDeadline | Inherit | None = INHERIT
+    carrier: DatagramCarrier | Literal["prefer_native", "require_native"] | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class DatagramConfig:
+    """Outgoing datagram defaults and queue bounds, plus the receive deduplication window."""
+
+    dedup_window: int = _DATAGRAM["dedup_window"]
+    send_bytes: int = _DATAGRAM["send_bytes"]
+    send_flow_queue: int = _DATAGRAM["send_flow_queue"]
+    send_flow_bytes: int = _DATAGRAM["send_flow_bytes"]
+    stream_receive_bytes: int | None = _DATAGRAM["stream_receive_bytes"]
+    hold_packets: int | None = _DATAGRAM["hold_packets"]
+    hold_time: float | None = _DATAGRAM["hold_time"]
+    copy_limit: int = _DATAGRAM["copy_limit"]
+    replica_percent: int = _DATAGRAM["replica_percent"]
+    replica_standby: bool = _DATAGRAM["replica_standby"]
+    priority: Priority = _DATAGRAM_PRIORITY
+    defaults: DatagramSendOptions = DatagramSendOptions()
+
+
 @dataclass(frozen=True, slots=True)
 class Backoff:
-    """The retry backoff of redials and pools (`Config.redial_backoff`,
-    `PipePool(backoff=...)`) and of the exchange carrier
-    (`ExchangeOptions(backoff=...)`): an exponential wait from `min`
-    doubling up to `max` seconds, each shortened by a random
-    fraction of up to `jitter` (0 gives the fixed schedule tests use). A
-    `min` of zero or above `max`, or a `jitter` negative, 1
-    or more, or NaN, raises `ValueError` where the backoff is used."""
+    """An exponential retry wait with nominal bounds and optional jitter on either side."""
 
     min: float = _zmux.DEFAULT_MIN_BACKOFF
-    max: float = _zmux.DEFAULT_MAX_BACKOFF
-    jitter: float = _zmux.DEFAULT_BACKOFF_JITTER
+    max: float = field(default=_zmux.DEFAULT_MAX_BACKOFF, kw_only=True)
+    jitter: float = field(default=_zmux.DEFAULT_BACKOFF_JITTER, kw_only=True)
+    jitter_up: float = field(default=0.0, kw_only=True)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -1907,42 +2660,149 @@ class CapacityFloor:
             raise ValueError("recovery_ratio is a finite number of at least 1")
 
 
+SpliceKind = Literal["stream"] | Literal["capsule"] | Literal["datagram"]
+"""The shape of a splice input."""
+
+SpliceRoute = Literal["a_to_b"] | Literal["b_to_a"]
+"""The direction that owns a splice input."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SpliceMeta:
+    """Snapshot of an input's metadata at admission."""
+
+    route: SpliceRoute
+    """Direction that admitted the input."""
+    kind: SpliceKind
+    """Input shape."""
+    capsule_type: int | None
+    """Protocol Type of a reliable capsule."""
+    context: int | None
+    """Context ID of a datagram or DATAGRAM capsule."""
+    sequence: int
+    """Direction-local input sequence."""
+    generation: int
+    """Hook generation at admission."""
+    source_offset: int | None
+    """Offset of the original reliable input, if applicable."""
+    injected: bool
+    """Whether the input came from the local control channel."""
+    source_stream: int | None
+    """Source hop's Stream ID, if assigned."""
+    target_stream: int | None
+    """Target hop's Stream ID, if assigned."""
+    replayable: bool
+    """Whether the source can carry replayable data."""
+    preamble: Preamble
+    """The inbound stream's opening metadata."""
+    label: str
+    """The application-supplied route label."""
+
+
+class SpliceHook(Protocol):
+    """A synchronous chain step on the splice's asyncio event loop."""
+
+    def __call__(self, unit: SpliceUnit, /) -> SpliceDecision:
+        """Inspect the group and decide how it proceeds."""
+        ...
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SpliceHooks:
+    """One direction's hook chains. Entries run in tuple order."""
+
+    stream: tuple[SpliceHook, ...] = ()
+    """Steps for reliable byte blocks in byte mode."""
+    capsule: tuple[SpliceHook, ...] = ()
+    """Steps for complete reliable capsules in packet mode."""
+    datagram: tuple[SpliceHook, ...] = ()
+    """Steps for stream datagrams in either mode."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SpliceLimits:
+    """Per-direction budgets for a controlled splice. None selects a size-derived
+    default for byte budgets. Waits are measured from first admission."""
+
+    hook_steps: int | None = None
+    """Maximum steps in each chain."""
+    group_items: int | None = None
+    """Maximum outputs in a replacement group."""
+    group_bytes: int | None = None
+    """Maximum logical bytes per group including capsule headers."""
+    group_backing_bytes: int | None = None
+    """Maximum distinct backing capacity per group."""
+    descriptors: int | None = None
+    """Maximum payload fragments per unit or group."""
+    queue_items: int | None = None
+    """Maximum pending items per direction."""
+    queue_bytes: int | None = None
+    """Maximum distinct backing capacity per direction."""
+    reliable_cleanup_slots: int | None = None
+    """Maximum in-flight reliable limiter acquisitions per direction."""
+    datagram_cleanup_slots: int | None = None
+    """Maximum in-flight datagram limiter acquisitions per direction."""
+    datagram_delay: bool = False
+    """Allow hooks to defer datagrams."""
+    wait_cap: float | None = 0
+    """Safety cap in seconds. Zero selects the default and None disables it."""
+
+
+class SpliceSample(NamedTuple):
+    """A sampled input from a diagnostic mirror."""
+
+    kind: SpliceKind
+    """Input shape."""
+    capsule_type: int | None
+    """Protocol Type of a reliable capsule."""
+    context: int | None
+    """Context ID of a datagram or DATAGRAM capsule."""
+    sequence: int
+    """Direction-local input sequence."""
+    generation: int
+    """Hook generation at admission."""
+    prefix: bytes | memoryview
+    """Captured prefix of the input payload."""
+
+
 class Limiter(Protocol):
     """A rate limiter of a splice direction (`zmux.splice(a_to_b=...)`),
     reserve then refund, in bytes. `acquire(min, max)` waits until it can
-    grant and takes and returns n bytes, `min <= n <= max` (or fewer than
-    `min` when its burst never allows `min` at once); `try_acquire(min,
+    grant and takes and returns n bytes, `min <= n <= max`; `try_acquire(min,
     max)` does the same without waiting, or returns 0 with nothing taken;
-    `refund(n)` gives back `n` bytes granted and not forwarded. The binding
-    calls them with `1 <= min <= max` only, and never with `max` 0: an empty
-    datagram passes without a call. `(n, n)` asks for a whole capsule or
-    datagram; a grant then lets all of it pass.
+    `refund(n)` gives back unused bytes, including prepaid bytes that lose
+    their final local carrier opportunity. The binding calls the acquire methods
+    with `1 <= min <= max`. An empty datagram passes without a limiter call.
+    `(n, n)` asks for a whole capsule or
+    datagram. If the limiter cannot grant that amount, `acquire` raises and
+    `try_acquire` returns 0.
 
-    Each runs on the event loop of the splice and must not block; `acquire`
-    may also be a plain method. The binding holds what it took until the
-    direction forwards it: answering a datagram at once, it takes the
-    shortfall with `try_acquire` for the datagrams that follow (so the first
-    one after the allowance ran out is dropped), and what it holds when the
-    splice ends goes back with `refund`. The parameters are positional-only,
-    so an implementation names them freely.
+    Each runs on the splice's event loop and must allow the loop to make
+    progress. A plain method can also supply an immediate `acquire` result.
+    `try_acquire` decides the current datagram. The parameters are
+    positional-only.
 
     A limiter that fails is reported as unraisable: an `acquire` that raises
-    or grants anything but an int in `1..=max` ends the direction with
+    or grants anything but an int in `min..=max` ends the direction with
     `SpliceEnd.LIMITER_FAILED`; a `try_acquire` that raises grants nothing;
-    a `refund` that raises changes nothing. A grant above `max` is refunded
-    at once."""
+    a `refund` that raises changes nothing. An invalid positive grant is
+    refunded at once."""
 
-    async def acquire(self, min: int, max: int, /) -> int:
-        """Waits for a grant of `min..=max` bytes and takes it."""
+    @property
+    def max_burst_bytes(self) -> int:
+        """Maximum atomic grant, regardless of the current balance."""
         ...
 
-    def try_acquire(self, min: int, max: int, /) -> int:
-        """Takes a grant of `min..=max` bytes now; 0, taking nothing, when
-        it would wait."""
+    def acquire(self, minimum: int, maximum: int, /) -> int | Awaitable[int]:
+        """Waits for and takes a grant between the minimum and maximum."""
+        ...
+
+    def try_acquire(self, minimum: int, maximum: int, /) -> int:
+        """Takes a grant between the minimum and maximum. Returns zero when it would wait."""
         ...
 
     def refund(self, n: int, /) -> None:
-        """Gives back `n` bytes granted and not forwarded; never raises."""
+        """Returns `n` unused bytes. This method must never raise."""
         ...
 
 
@@ -1959,35 +2819,129 @@ class SpliceEnd(_Enum):
     LIMITER_FAILED = "limiter_failed"
     """The direction's limiter failed (see `Limiter`): the downstream part
     was reset and the upstream part stopped with `ZMUX_CANCELLED`."""
+    HOOK_RESET = "hook_reset"
+    """A hook reset the target and stopped the source with its chosen code."""
+    HOOK_FAILED = "hook_failed"
+    """A hook failed or exceeded its output budget."""
+    WAIT_TIMEOUT = "wait_timeout"
+    """A reliable input expired while waiting."""
+    PACKET_ERROR = "packet_error"
+    """A malformed capsule ended the direction with `ZMUX_PACKET_ERROR`."""
 
 
-@dataclass(frozen=True, slots=True)
+class SpliceDropReason(_Enum):
+    """Why the relay discarded an input before publication."""
+
+    HOOK = "dropped_hook"
+    EXPIRED = "dropped_expired"
+    QUEUE_FULL = "dropped_queue_full"
+    LIMITER = "dropped_limiter"
+    BLOCKED = "dropped_blocked"
+    TOO_LARGE = "dropped_too_large"
+    NO_PATH = "dropped_no_path"
+    SEQUENCE_EXHAUSTED = "dropped_sequence_exhausted"
+    FLOW_CLOSED = "dropped_flow_closed"
+    CODEL = "dropped_codel"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SpliceDrops:
+    """Counts of datagram groups discarded before target publication."""
+
+    dropped_hook: int
+    dropped_expired: int
+    dropped_queue_full: int
+    dropped_limiter: int
+    dropped_blocked: int
+    dropped_too_large: int
+    dropped_no_path: int
+    dropped_sequence_exhausted: int
+    dropped_flow_closed: int
+    dropped_codel: int
+
+    @property
+    def total(self) -> int:
+        """Number of groups discarded for all reasons."""
+        return sum(dataclasses.astuple(self))
+
+
+class SpliceHandoffStats(NamedTuple):
+    """One snapshot of target acceptance and local carrier settlement."""
+
+    accepted_bytes: int
+    """Logical bytes accepted by the target."""
+    first_carrier_bytes: int
+    """Logical bytes handed off completely to a local carrier for the first time."""
+    unsent_bytes: int
+    """Accepted bytes that lost their final local carrier opportunity."""
+    pending_bytes: int
+    """Accepted bytes still waiting for their first local carrier outcome."""
+    unsent_refunded_bytes: int
+    """Prepaid bytes the relay returned after their final carrier opportunity."""
+    native_count: int
+    """Datagrams first handed off in native form."""
+    record_count: int
+    """Datagrams first handed off in a record."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class SpliceDirection:
-    """What one direction of a splice forwarded, and how it ended; `code` is
-    the reset, stop or abort code with `SpliceEnd.RESET`, `SpliceEnd.STOPPED`
-    and `SpliceEnd.CANCELLED`."""
+    """Forwarding and accounting for a finished splice direction."""
 
     bytes: int
     datagram_bytes: int
-    datagrams_dropped: int
-    """Stream datagrams not forwarded, for any cause."""
-    datagrams_too_large: int
-    """Not forwarded for their size: larger than a datagram of the downstream
-    stream (`splice`), or, in a packet relay, which writes such a datagram as
-    a capsule instead, larger than `DEFAULT_MAX_PACKET`. A datagram whose
-    capsule could not be written for another reason (the downstream stream
-    ended or was reset, the splice ended, or its capsule queue was full) is
-    counted only in `datagrams_dropped`."""
-    datagrams_limited: int
-    """Not forwarded: refused by a limiter."""
     datagrams_as_capsules: int
-    """Forwarded by a packet relay as DATAGRAM capsules (also counted in
-    `datagram_bytes`); always 0 for `splice`."""
-    end: SpliceEnd | str
-    code: int | None = None
+    input_units: int
+    input_bytes: int
+    enqueued_items: int
+    replacements: int
+    drops: SpliceDrops
+    mirror_misses: int
+    wait_time: float
+    """Time spent waiting on hook readiness in seconds."""
+    capsule_count: int
+    accepted_bytes: int
+    """Logical bytes accepted by the target, including capsule headers."""
+    handoffs: _zmux.SpliceHandoffs | None
+    """Live settlement for controlled or limited directions."""
+    payload_copy_bytes: int
+    encode_bytes: int
+    mirror_copy_bytes: int
+    pre_admission_refunded_bytes: int
+    """Bytes refunded by the relay before target acceptance at direction end."""
+    end: SpliceEnd
+    code: int | None
+    cause: str | None
+    """Local budget failure, when it caused the direction to end."""
 
-    def __post_init__(self) -> None:
-        object.__setattr__(self, "end", _enum_of(SpliceEnd, str(self.end)))
+
+class SpliceDisposition(NamedTuple):
+    """Local target outcome of an admitted injection.
+
+    A submitted injection may still be pending in the direction's handoffs.
+    """
+
+    status: Literal["submitted", "dropped", "direction_ended"]
+    sequence: int
+    generation: int
+    accepted_bytes: int
+    """Logical bytes accepted by the target, including a partial write."""
+    enqueued_items: int
+    """Complete items accepted by the target."""
+    drop_reason: SpliceDropReason | None
+    end: SpliceEnd | None
+    code: int | None
+
+
+class SpliceEvent(NamedTuple):
+    """A committed event from the direction owner."""
+
+    route: SpliceRoute
+    kind: Literal["hooks_replaced", "pause_acknowledged", "direction_finished"]
+    generation: int | None
+    token: int | None
+    end: SpliceEnd | None
+    code: int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -2016,8 +2970,6 @@ class Sent(_Enum):
 
     DATAGRAM = "datagram"
     CAPSULE = "capsule"
-    DROPPED = "dropped"
-    """Not at all: a datagram limiter refused it."""
 
 
 class Packet(NamedTuple):
@@ -2126,6 +3078,10 @@ class Tracer:
         raise from then on); nothing of it follows."""
 
 
+_DEFAULT_SCHEDULER = _enum_of(Scheduler, _DEFAULTS["scheduler"])
+_DEFAULT_REDUNDANCY = _enum_of(Redundancy, _DEFAULTS["redundancy"])
+
+
 @dataclass(frozen=True, kw_only=True)
 class Config:
     """Session configuration: one field per knob and knob parameter. A
@@ -2153,76 +3109,27 @@ class Config:
     (`STAGED`: 16 at first and 256 once the application accepts one; or a
     count, 0 for none, at most `MAX_STREAM_CREDIT`).
 
-    Datagrams: `enable_datagrams` (`False`) and the queues
-    `datagram_send_queue` (64), `datagram_receive_queue` (128),
-    `datagram_stream_queue` (32 per stream), `datagram_receive_bytes`
-    (1 MiB, the session queue and the datagrams held for streams not
-    opened yet; stream queues do not count against it) and
-    `datagram_stream_bytes` (512 KiB per stream; `None`: only the count
-    bounds a stream queue), each at least 1; the oldest make room.
-    `datagram_queue_delay` (0.02 s; `None`: off; else above 0) bounds how
-    long datagrams wait in every queue, the send queue included: once the
-    datagrams leaving a queue have waited longer for 0.1 s, CoDel
-    (RFC 8289) drops some as they leave, counted; a datagram alone in its
-    queue is never dropped for its delay.
+    Enable datagrams with `enable_datagrams`. `datagram` configures the
+    local send defaults, per-flow limits and receive deduplication.
+    CoDel uses `datagram_queue_delay` for standing queue delay.
 
-    Multipath: `max_pipes` (1, multipath off; 8 recommended),
-    `pipe_headroom` (8), `replay_window` (`AUTO`, or at least `max_pipes +
-    pipe_headroom`), `max_lanes` (258, at least 1). Multipath needs
-    `pipe_auth` (a `PipeAuth`; `None`: no join credentials) unless the
-    first pipe is on the secure carrier; `join_early_hello` (8 KiB;
-    `None`: no first batch). `resume_timeout` (`None`: off; else at least
-    0.001) with `redial`, an async callable given the direction that
-    returns the `PipeIo` replacing a lost pipe, with the backoff
-    `redial_backoff` (a `Backoff`: 1 s doubling up to 60 s, jitter 0.2).
+    `session_policy` sets local attachment limits, direction exclusions
+    and authenticated Join authorization. `stability_hold` is the
+    continuous healthy interval required to replace a member.
+    `accounting` opts into live record totals and final accounting tickets
+    on attachments. `accounting_tickets` collects tickets from attachment
+    handoff, including bootstrap. `resume_timeout` allows the session to rejoin after
+    losing all carriers. A `SessionController` can restore coverage.
 
-    Every Python hook of a `Config` runs on one event loop: the one running
-    when the `Config` is made, else the one running when it is first used
-    (given to a connect, a `Listener`, a `session_config` answer); it stays
-    bound to that loop while the loop is open. What reaches a hook before
-    then waits for it. Once that loop closes (the end of an `asyncio.run`),
-    what reaches a hook is answered at once without it: a deciding hook
-    refuses, a call such as `redial` fails, and the events of `logger` and
-    `tracer` are dropped and not reported. The next use from a running
-    loop binds the `Config` to that loop.
+    `scheduler`, `probation`, `overflow_delay` and `redundancy` govern local
+    streams and pipes. Set `carrier_early_data` to allow replayable
+    transport early data on carriers that support it. `hold_first_flight`
+    stages a flight before it is released. The session's `protocols` are
+    the supported application protocols.
 
-    Scheduling: `scheduler` (`Scheduler.AFFINITY`), `spread_chunk`,
-    `probation` (`AUTO`, derived from the pipe's RTT; `None` off; else the
-    base in seconds), `overflow_delay` (1 s), `redundancy`
-    (`Redundancy.URGENT`).
-
-    Early data: `early_data` (`False`) declares the peer a zmux endpoint
-    (stream data before its parameters), `carrier_early_data` (`False`)
-    allows the carrier's own early data (replayable; see
-    `RecvStream.is_replayable`), and `hold_first_flight` (`False`, a client
-    with early data) keeps the bootstrap pipe's first write until
-    `Session.release_first_flight()` or the handshake timeout.
-
-    Security: `session_crypto` (`SessionCrypto.LOCAL`), `epoch_policy`
-    (`EpochPolicy()`), `record_policy` (a `RecordPolicy`; `None`: sealed)
-    choosing a joined pipe's record mode and `allow_record_mode(input, mode, admitted)` admitting
-    it, `authorize_join(pipe_id)` (on an acceptor, a further check of a
-    join after authentication and before its record mode policy: falsy or an exception
-    refuses it), and `allow_connection_window_increase(increase)` (when
-    given, the session receive window grows only by increases it approves:
-    falsy or an exception refuses). `allow_record_mode`, `authorize_join`
-    and `allow_connection_window_increase` may be `async`; they run on the
-    `Config`'s event loop and are cancelled when the join's deadline or the
-    session ends, which refuses.
-
-    Hooks: `protocols`, the application protocols offered; `logger` (a
-    `logging.Logger`) receives zmux's warnings; `tracer` (a `Tracer`)
-    receives every event in order beside the event stream. Both run on the
-    `Config`'s event loop, never on the library's threads: what
-    they are told waits for the loop, each session's tracer events in a
-    backlog of 256 (fixed; past it the event that arrives is dropped and
-    counted in `Tracer.dropped`; `established`, `dropped` and `closed` are
-    never dropped) and its log lines in a backlog of 256 (fixed; a lost line is
-    counted in `SessionStats.log_lines_dropped`, never in `Tracer.dropped`);
-    `shaping_limits`, `shaping_budget`, `shaping` (definitions by carrier
-    kind, `None` key the default), `shaping_by_variant` (by carrier variant,
-    first), `handshake_shaper` and `shaping_bundle`. A hook left at `None`
-    is not used. Use `config.replace(...)` to derive a variant.
+    The `shaping_limits` and `shaping_budget` bound the effect of the
+    configured shaping programs. A `Tracer` and logger observe activity
+    on the configuration's event loop.
     """
 
     handshake_timeout: float | None = _DEFAULTS["handshake_timeout"]
@@ -2230,39 +3137,41 @@ class Config:
     max_idle_timeout: float | None = _DEFAULTS["max_idle_timeout"]
     liveness: Liveness = Liveness()
     initial_stream_receive_window: int = _DEFAULTS["initial_stream_receive_window"]
-    max_stream_receive_window: int | Auto = AUTO
+    max_stream_receive_window: int | Auto = _DEFAULTS["max_stream_receive_window"]
     latency_budget: float = _DEFAULTS["latency_budget"]
     initial_connection_receive_window: int = _DEFAULTS[
         "initial_connection_receive_window"
     ]
-    max_connection_receive_window: int | Auto = AUTO
+    max_connection_receive_window: int | Auto = _DEFAULTS[
+        "max_connection_receive_window"
+    ]
     memory_budget: int | None = _DEFAULTS["memory_budget"]
     max_incoming_streams: int = _DEFAULTS["max_incoming_streams"]
-    max_incoming_uni_streams: int | Staged = STAGED
-    enable_datagrams: bool = False
+    max_incoming_uni_streams: int | Staged = _DEFAULTS["max_incoming_uni_streams"]
+    enable_datagrams: bool = _DEFAULTS["enable_datagrams"]
     datagram_send_queue: int = _DEFAULTS["datagram_send_queue"]
     datagram_receive_queue: int = _DEFAULTS["datagram_receive_queue"]
     datagram_stream_queue: int = _DEFAULTS["datagram_stream_queue"]
+    datagram: DatagramConfig | None = None
     datagram_receive_bytes: int = _DEFAULTS["datagram_receive_bytes"]
-    datagram_stream_bytes: int | None = _DEFAULTS["datagram_stream_bytes"]
     datagram_queue_delay: float | None = _DEFAULTS["datagram_queue_delay"]
     send_buffer: int = _DEFAULTS["send_buffer"]
-    send_buffer_max: int | Auto = AUTO
+    send_buffer_max: int | Auto = _DEFAULTS["send_buffer_max"]
     max_send_record: int = _DEFAULTS["max_send_record"]
-    max_pipes: int = _DEFAULTS["max_pipes"]
-    pipe_headroom: int = _DEFAULTS["pipe_headroom"]
-    replay_window: int | Auto = AUTO
     max_lanes: int = _DEFAULTS["max_lanes"]
-    resume_timeout: float | None = None
-    redial: Callable[[Direction], Awaitable[PipeIo]] | None = field(
-        default=None, compare=False
+    resume_timeout: float | None = _DEFAULTS["resume_timeout"]
+    session_policy: SessionPolicy = SessionPolicy()
+    clock_domain: _zmux.ClockDomain | None = None
+    stability_hold: float = _DEFAULTS["stability_hold"]
+    accounting: AccountingPolicy = AccountingPolicy()
+    accounting_tickets: _zmux.AccountingTickets | None = field(
+        default=None, repr=False, compare=False
     )
-    redial_backoff: Backoff = Backoff()
-    scheduler: Scheduler | str = Scheduler.AFFINITY
+    scheduler: Scheduler | str = _DEFAULT_SCHEDULER
     spread_chunk: int = _DEFAULTS["spread_chunk"]
-    probation: float | Auto | None = AUTO
+    probation: float | Auto | None = _DEFAULTS["probation"]
     overflow_delay: float = _DEFAULTS["overflow_delay"]
-    redundancy: Redundancy | str = Redundancy.URGENT
+    redundancy: Redundancy | str = _DEFAULT_REDUNDANCY
     pipe_auth: PipeAuth | None = field(default=None, repr=False)
     join_early_hello: int | None = _DEFAULTS["join_early_hello"]
     session_crypto: SessionCrypto = SessionCrypto.LOCAL
@@ -2271,23 +3180,15 @@ class Config:
     allow_record_mode: (
         Callable[[RecordPolicyInput, RecordMode, Any], bool | Awaitable[bool]] | None
     ) = field(default=None, compare=False)
-    join_outcome: (
-        Callable[[_zmux.Session, PipeId, BaseException | None], Awaitable[None] | None]
-        | None
-    ) = field(default=None, compare=False)
-    authorize_join: Callable[[PipeId], bool | Awaitable[bool]] | None = field(
-        default=None, compare=False
-    )
     allow_connection_window_increase: Callable[[int], bool | Awaitable[bool]] | None = (
         field(default=None, compare=False)
     )
-    early_data: bool = False
-    carrier_early_data: bool = False
-    hold_first_flight: bool = False
+    carrier_early_data: bool = _DEFAULTS["carrier_early_data"]
+    hold_first_flight: bool = _DEFAULTS["hold_first_flight"]
     protocols: tuple[str, ...] | None = None
     logger: logging.Logger | None = field(default=None, repr=False, compare=False)
     tracer: Tracer | None = field(default=None, repr=False, compare=False)
-    shaping_limits: ShapingLimits = ShapingLimits()
+    shaping_limits: ShapingLimits | None = None
     shaping_budget: ShapingBudget | None = None
     handshake_shaper: ShapingBundle | None = field(
         default=None, repr=False, compare=False
@@ -2307,11 +3208,8 @@ class Config:
             object.__setattr__(self, "protocols", tuple(kw["protocols"]))
             kw["protocols"] = list(kw["protocols"])
         if kw["shaping"] is not None:
-            object.__setattr__(self, "shaping", dict(kw["shaping"]))
-            kw["shaping"] = {
-                k.value if isinstance(k, CarrierKind) else k: v
-                for k, v in kw["shaping"].items()
-            }
+            kw["shaping"] = dict(kw["shaping"])
+            object.__setattr__(self, "shaping", kw["shaping"])
         if kw["shaping_by_variant"] is not None:
             kw["shaping_by_variant"] = dict(kw["shaping_by_variant"])
             object.__setattr__(self, "shaping_by_variant", kw["shaping_by_variant"])
@@ -2348,10 +3246,13 @@ class ListenerLimits:
 
     max_pending: int | None = _LISTENER["max_pending"]
     max_pending_per_source: int = _LISTENER["max_pending_per_source"]
-    max_pending_per_session: int = _LISTENER["max_pending_per_session"]
     max_suspended: int = _LISTENER["max_suspended"]
     first_record_timeout: float = _LISTENER["first_record_timeout"]
     memory_budget: int | None = _LISTENER["memory_budget"]
+    session_receive_growth_limit: int = _LISTENER["session_receive_growth_limit"]
+    """Additional physical receive bytes per session above its bootstrap grant.
+    Zero uses a quarter of the listener budget, or unlimited with no budget.
+    A negative value removes the per-session cap. Updates affect new grants."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -2485,10 +3386,7 @@ class Shaper:
     budget: ShapingBudget | None = None
 
     def __post_init__(self) -> None:
-        if self.definition is not None and (
-            self.by_kind is not None or self.by_variant is not None
-        ):
-            raise ValueError("definition and by_kind or by_variant exclude each other")
+        _zmux._check_shaper_sources(self)
 
 
 @runtime_checkable

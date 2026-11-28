@@ -47,18 +47,20 @@ func shape(c *zmux.Conn) {
 	if err != nil {
 		die("%v", err)
 	}
-	f, err := machine.NewFactory(b, machine.Options{})
+	f, err := machine.ParseCandidate(b, nil, machine.SizeLimits{})
 	if err != nil {
 		die("def: %v", err)
 	}
-	c.SetShaper(f, nil)
+	if err := c.SetShaper(f.Compile(machine.Options{}).Policy()); err != nil {
+		die("set shaper: %v", err)
+	}
 }
 
 func report(c *zmux.Conn) {
 	st := c.ShapingStats()
-	fmt.Printf("STATS padding=%d injected=%d dropped=%d clamped=%d faults=%d\n",
-		st.WireSpent, st.Injected, st.InjectDropped, st.Clamped, st.Faults)
-	if os.Getenv("SHAPE_DEF") != "" && (st.WireSpent == 0 || st.Faults != 0) {
+	overhead := c.ShapingMeters().ConsumedBytes
+	fmt.Printf("STATS extra_bytes=%d clamped=%d faults=%d\n", overhead, st.Clamped, st.Faults)
+	if os.Getenv("SHAPE_DEF") != "" && (overhead == 0 || st.Faults != 0) {
 		die("not shaped")
 	}
 }
@@ -130,9 +132,9 @@ func client(ctx context.Context, addr string) {
 		})
 	}
 	wg.Wait()
-	time.Sleep(300 * time.Millisecond) // injections run on a timer
-	report(c)
 	c.Close()
+	<-c.Context().Done()
+	report(c)
 	fmt.Println("OK")
 }
 

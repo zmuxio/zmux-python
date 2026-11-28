@@ -5,14 +5,14 @@ import asyncio
 import dataclasses
 import json
 import pathlib
-import socket
 import sys
-import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 
 import pytest
 import pytest_asyncio
 import zmux
+from support import session_pair
+from support import until
 
 KEY = b"k" * 32
 SHAPE = '{"machines":[{"start":0,"states":[{"record":{"pad_to":1000}}]}]}'
@@ -22,23 +22,10 @@ def exporter(label: str, context: bytes, length: int) -> bytes:
     return (label.encode() + context + bytes(length))[:length]
 
 
-async def until(cond: Callable[[], object], limit: float = 5.0) -> None:
-    async with asyncio.timeout(limit):
-        while not cond():
-            await asyncio.sleep(0.005)
-
-
 @pytest_asyncio.fixture
 async def sessions() -> AsyncIterator[tuple[zmux.Session, zmux.Session]]:
-    async with zmux.Listener() as listener:
-        addr = await listener.serve_tcp("127.0.0.1", 0)
-        c = await zmux.Session.connect(await zmux.dial_tcp(*addr))
-        s = await listener.accept()
-        try:
-            yield c, s
-        finally:
-            c.close()
-            s.close()
+    async with session_pair() as pair:
+        yield pair
 
 
 def test_pipe_auth_deferred() -> None:
@@ -50,7 +37,10 @@ def test_pipe_auth_deferred() -> None:
 
 async def test_deferred_secret_joins_after_set() -> None:
     cfg = zmux.Config(
-        max_pipes=4, pipe_auth=zmux.PipeAuth.deferred_psk().with_end_to_end()
+        session_policy=zmux.SessionPolicy(
+            limits=zmux.CapacityLimits(steady_attachments=4)
+        ),
+        pipe_auth=zmux.PipeAuth.deferred_psk().with_end_to_end(),
     )
     async with zmux.Listener(config=cfg) as listener:
         addr = await listener.serve_tcp("127.0.0.1", 0)
@@ -58,10 +48,7 @@ async def test_deferred_secret_joins_after_set() -> None:
             await zmux.Session.connect(await zmux.dial_tcp(*addr), config=cfg) as c,
             await listener.accept() as s,
         ):
-            await until(lambda: c.join_pending and s.join_pending)
-            with pytest.raises(zmux.PipeError) as e:
-                await c.add_pipe(await zmux.dial_tcp(*addr))
-            assert e.value.kind == zmux.ErrorKind.JOIN_PENDING
+            assert c.join_pending and s.join_pending
             with pytest.raises(zmux.InvalidArgumentError) as short:
                 c.set_join_secret(b"short")
             assert short.value.kind == zmux.ErrorKind.INVALID_ARGUMENT
@@ -73,7 +60,6 @@ async def test_deferred_secret_joins_after_set() -> None:
             assert e.value.kind == zmux.ErrorKind.JOIN_SECRET_SET
             assert c.session_binding == s.session_binding
             assert len(c.session_binding or b"") == 32
-            await until(lambda: zmux.adapter.join_ready(c))
             pipe = await c.add_pipe(await zmux.dial_tcp(*addr))
             async with asyncio.timeout(5):
                 await pipe.joined()
@@ -106,13 +92,16 @@ async def test_runtime_settings(sessions: tuple[zmux.Session, zmux.Session]) -> 
     assert c.liveness == off
 
     limits = zmux.shaping.ShapingLimits(
-        wire=zmux.shaping.ShapingAccount(initial=9), max_delay=0.5
+        wire=zmux.shaping.ShapingAccount(ceiling=9, initial=9),
+        profile=zmux.shaping.ShapingProfileLimits(max_added_delay=0.5),
     )
     assert c.shaping_limits == zmux.shaping.ShapingLimits()
     c.shaping_limits = limits
     assert c.shaping_limits == limits
 
-    c.raise_incoming_streams(bidi=1 << 20)
+    with pytest.raises(zmux.InvalidArgumentError, match="memory_budget"):
+        c.raise_incoming_streams(bidi=1 << 20)
+    c.raise_incoming_streams(bidi=zmux.Config().max_incoming_streams + 1)
     c.raise_incoming_streams()
     for bad in (-1, (1 << 60) + 1):
         with pytest.raises(ValueError):
@@ -144,14 +133,21 @@ async def test_flush_opens_at_once(sessions: tuple[zmux.Session, zmux.Session]) 
 async def test_python_exporter_on_both_sides() -> None:
     seen: list[zmux.adapter.PipeHint] = []
 
-    async def transform(pipe: zmux.PipeIo, hint: zmux.adapter.PipeHint) -> zmux.PipeIo:
+    async def transform(
+        accepted_pipe: zmux.PipeIo, hint: zmux.adapter.PipeHint
+    ) -> zmux.PipeIo:
         seen.append(hint)
-        reader, writer = await zmux.adapter.open_carrier(pipe)
-        out = zmux.pipe_from_streams(reader, writer, exporter=exporter)
+        incoming, outgoing = await zmux.adapter.open_carrier(accepted_pipe)
+        out = zmux.pipe_from_streams(incoming, outgoing, exporter=exporter)
         out.terminated_tls = zmux.TlsState(b"zmux", "a.test")
         return out
 
-    cfg = zmux.Config(max_pipes=2, pipe_auth=zmux.PipeAuth.exporter().with_end_to_end())
+    cfg = zmux.Config(
+        session_policy=zmux.SessionPolicy(
+            limits=zmux.CapacityLimits(steady_attachments=2)
+        ),
+        pipe_auth=zmux.PipeAuth.exporter().with_end_to_end(),
+    )
     async with zmux.Listener(
         config=cfg, listener_config=zmux.ListenerConfig(inbound_transform=transform)
     ) as listener:
@@ -171,8 +167,8 @@ async def test_python_exporter_on_both_sides() -> None:
             with pytest.raises(zmux.ExportError) as e:
                 c.export_keying_material(zmux.adapter.RESERVED_EXPORTER_PREFIX + "x")
             assert e.value.kind == zmux.ErrorKind.RESERVED_LABEL
-            await until(lambda: c.session_binding is not None)
-            await until(lambda: zmux.adapter.join_ready(c))
+            await until(c, lambda: c.session_binding is not None)
+            await until(c, lambda: zmux.adapter.join_ready(c))
             assert c.stats().pipes_active == 1
     assert seen
 
@@ -252,7 +248,7 @@ async def test_session_config_failure_rejects() -> None:
                 await zmux.Session.connect(
                     pipe, config=zmux.Config(handshake_timeout=2)
                 )
-        await until(lambda: li.stats().rejected == 1)
+        await until(li, lambda: li.stats().rejected == 1)
 
 
 def test_verdict_forms() -> None:
@@ -283,54 +279,6 @@ def test_verdict_forms() -> None:
     assert (d.verdict, d.variant) == (zmux.AdmissionVerdict.CLOSE, "x")
 
 
-def test_cache_report_and_snapshot() -> None:
-    cache = zmux.CarrierCache()
-    cache.report("k", "websocket", zmux.CacheOutcome.USABLE)
-    cache.report("k", "quic", "rejected", variant="sealed")
-    assert cache.is_usable("k", "websocket")
-    entries = json.loads(cache.snapshot())["entries"]
-    assert {e.get("variant") for e in entries} == {None, "sealed"}
-    other = zmux.CarrierCache()
-    other.restore(cache.snapshot())
-    restored = json.loads(other.snapshot())["entries"]
-    assert {e.get("variant") for e in restored} == {None, "sealed"}
-    with pytest.raises(ValueError):
-        cache.report("k", "quic", "maybe")
-
-
-def _free_port() -> tuple[str, int]:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return "127.0.0.1", s.getsockname()[1]
-
-
-async def test_candidate_variant_reported() -> None:
-    async with zmux.Listener() as li:
-        addr = await li.serve_http("127.0.0.1", 0)
-        good = zmux.Candidate.streaming(*addr).with_variant("plain")
-        dead = zmux.Candidate.split(*_free_port()).with_variant("sealed")
-        assert (good.variant, zmux.Candidate.streaming(*addr).variant) == (
-            "plain",
-            None,
-        )
-        cache = zmux.CarrierCache()
-        choice = zmux.CarrierChoice.auto([dead, good])
-        policy = zmux.CarrierChoicePolicy(cache=cache, key="k")
-        async with (
-            await zmux.connect_choice(choice, choice_policy=policy) as c,
-            await li.accept(),
-        ):
-            results = c.stats().carrier_candidates
-            assert ("streaming", "plain") in {(r.carrier, r.variant) for r in results}
-            async with asyncio.timeout(5):
-                while True:
-                    ev = await c.next_event()
-                    if isinstance(ev, zmux.CarrierChosen):
-                        break
-            assert ev.variant == "plain"
-        assert any(e.get("variant") for e in json.loads(cache.snapshot())["entries"])
-
-
 def test_replay_filter() -> None:
     f = zmux.adapter.ReplayFilter(1.0, 2)
     assert f.check_at(b"a", 1000, 1000) == zmux.adapter.ReplayVerdict.FRESH
@@ -339,26 +287,25 @@ def test_replay_filter() -> None:
     assert f.check_at(b"c", 1000, 1000) == zmux.adapter.ReplayVerdict.FRESH
     assert f.check_at(b"d", 1000, 1000) == zmux.adapter.ReplayVerdict.FULL
     assert len(f) == 2
-    now = int(time.time() * 1000)
-    assert (
-        zmux.adapter.ReplayFilter(1.0, 1).check(b"a", now)
-        == zmux.adapter.ReplayVerdict.FRESH
-    )
-    late = zmux.adapter.ReplayFilter(1.0, 1, not_before=time.time() + 100)
-    assert late.check(b"a", now) == zmux.adapter.ReplayVerdict.OUTSIDE
+    late = zmux.adapter.ReplayFilter(1.0, 1, not_before=2.0)
+    assert late.check_at(b"a", 1000, 1000) == zmux.adapter.ReplayVerdict.OUTSIDE
+    assert late.check(b"a", 1000) == zmux.adapter.ReplayVerdict.OUTSIDE
     for bad in ((0.0, 1), (1.0, 0), (-1.0, 1)):
         with pytest.raises(ValueError):
             zmux.adapter.ReplayFilter(*bad)
 
 
 def test_classify_first_bytes() -> None:
-    F = zmux.adapter.FirstBytes
-    assert zmux.adapter.classify_first_bytes(b"") == (F.NEED_MORE, 1)
-    assert zmux.adapter.classify_first_bytes(b"\x16\x03") == (F.OTHER, 0)
-    assert zmux.adapter.classify_first_bytes(b"\x20") == (F.NEED_MORE, 2)
+    first_bytes = zmux.adapter.FirstBytes
+    assert zmux.adapter.classify_first_bytes(b"") == (first_bytes.NEED_MORE, 1)
+    assert zmux.adapter.classify_first_bytes(b"\x16\x03") == (first_bytes.OTHER, 0)
+    assert zmux.adapter.classify_first_bytes(b"\x20") == (first_bytes.NEED_MORE, 2)
     assert zmux.adapter.MAX_FIRST_BYTES == 5
     framing = zmux.adapter.Framing.RECORDS
-    assert zmux.adapter.classify_first_bytes(b"\x16", framing=framing) == (F.OTHER, 0)
+    assert zmux.adapter.classify_first_bytes(b"\x16", framing=framing) == (
+        first_bytes.OTHER,
+        0,
+    )
     with pytest.raises(ValueError):
         zmux.adapter.classify_first_bytes(b"", framing="nope")
 
@@ -411,7 +358,9 @@ async def test_shaper_picks_the_variant() -> None:
                 await send.finish()
                 _, recv = await s.accept_bi()
                 assert await recv.read_to_end() == b"x" * 10
-                assert (c.shaping_stats()["wire_spent"] > 0) == padded
+                stats = c.shaping_stats()
+                assert (stats["ledger"]["measured_bytes"] > 0) == padded
+                assert stats["wire_spent"] == stats["faults"] == 0
 
 
 TESTDATA = pathlib.Path(__file__).parent / "testdata"
@@ -450,16 +399,6 @@ def test_replay_filter_follows_the_shared_vectors() -> None:
         for i, s in enumerate(c["steps"]):
             got = f.check_at(bytes.fromhex(s["key_hex"]), s["t_ms"], s["now_ms"])
             assert got == verdicts[s["verdict"]], (c["name"], i)
-
-
-def test_cache_queries_take_the_variant() -> None:
-    cache = zmux.CarrierCache()
-    cache.report("k", "streaming", "usable", variant="v")
-    assert cache.is_usable("k", "streaming", variant="v")
-    assert not cache.is_usable("k", "streaming")
-    cache.report("k", "split", "failed", variant="v")
-    assert cache.is_failed("k", "split", variant="v")
-    assert not cache.is_failed("k", "split")
 
 
 async def test_huge_read_sizes_on_a_stream(

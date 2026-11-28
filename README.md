@@ -63,7 +63,7 @@ The root namespace holds what an application uses: sessions, listeners, pipes
 and streams, their configuration, options, events, statistics and errors, and
 the dial and serve entries. The rest has a namespace of its own: `zmux.adapter`
 (what only the author of a carrier adapter or of an accept loop needs),
-`zmux.sched` (the scheduler and redundancy settings), `zmux.shaping` and
+`zmux.sched` (the scheduler and redundancy settings) and
 `zmux.helpers` (pipe pools, `splice`, limiters, duplicate sessions, packet streams).
 
 ## Terms
@@ -133,6 +133,14 @@ async with session:
         ...
 ```
 
+Use `await QuicServer.bind(host, port=port, tls=tls)` when the application
+needs to manage each incoming QUIC connection separately. Each
+`await server.accept(listener)` starts a `QuicService` and hands accepted
+sessions to the listener. Call `service.stop_admission()` to withdraw
+pending setups while established sessions continue using their pipes and
+lanes. Await `service.wait()` for teardown. Call `server.close()` to close
+the endpoint and its connections.
+
 HTTP: one endpoint serves every HTTP carrier on one path, each request told
 apart by its head. `serve_http(host, port, exchange=..., websocket=True)`
 takes bidirectional POSTs (`dial_streaming`), uplink POSTs and downlink GETs
@@ -149,6 +157,37 @@ await listener.serve_http("0.0.0.0", 8080, exchange=opts)  # server
 session = await zmux.connect_exchange("example.net", 8080, options=opts)  # client
 ```
 
+The session can detect a stalled path earlier when another settled path
+shows recent delivery progress. `pipe.health().eligible_for_new_data` describes
+scheduling eligibility, while `send.can_carry` describes service. The
+before and after values on `PipeHealthChanged` carry the directional
+evidence generation and its start when available.
+
+The session controller can replace a binding atomically with
+`new_controller.take_over(previous, target=target)`. The `TargetChanged`
+event identifies the installed binding, its predecessor and the target
+revision. The controller snapshot captures path health and directional
+coverage with the member table. A scheduling penalty on a path can leave
+coverage intact.
+Use `path.evidence(...)` to retain a snapshot observation and its original
+expiration in a `ReplaceIntent`. The controller checks that the evidence still
+applies when it uses it. Capacity events identify the originating binding
+and batch. The controller snapshot reports opener and cleanup usage for
+the binding and the domain.
+`controller.open(target)` returns a session and its control handle. An
+empty target can also open a session with `None` as its handle when the
+client and peer did not negotiate multipath.
+`CarrierCache.retry_metrics(...)` gives the candidate's ordinary and
+missing-direction retry timing. `control.release()` releases a binding
+and preserves confirmed coverage.
+
+A `ShapingProfileLimits` describes a sliding outbound overhead window
+with a minimum byte allowance, a parts-per-million allowance on proved
+baseline bytes, and a per-unit delay limit. Its defaults are Lightweight.
+Load shaping definitions such as L15 using `ShapingBundle.from_json()`.
+`session.shaping_stats()` reports committed and handed-off cover separately,
+with measured and baseline bytes and per-window allowance in `ledger`.
+
 ## Carrier choice
 
 A carrier choice picks among kinds for paths through reverse proxies and
@@ -161,16 +200,13 @@ and timers. The choice and every try are session events (`CarrierChosen`,
 `CarrierCandidate`) and in `session.stats()`. Fragment:
 
 ```python
-auth = zmux.PrefixAuth(b"shared secret", slot=30)
 choice = zmux.CarrierChoice.auto(
     [
-        zmux.Candidate.websocket("wss://example.net/zmux", carrier_credential=auth),
-        zmux.Candidate.streaming("example.net", 80, carrier_credential=auth),
-        zmux.Candidate.split("example.net", 80, carrier_credential=auth),
-        zmux.Candidate.exchange("example.net", 80, options=opts),
+        zmux.Candidate.websocket(secure_websocket_url, carrier_credential=auth),
+        zmux.Candidate.quic(host, port, carrier_credential=auth),
     ]
 )
-policy = zmux.CarrierChoicePolicy(cache=cache, key="example.net|office")
+policy = zmux.CarrierChoicePolicy(cache=cache, key="office")
 session = await zmux.connect_choice(choice, choice_policy=policy)
 print(session.stats().carrier)
 ```
@@ -210,8 +246,7 @@ The other runtime settings of a session are writable properties too. Each
 reads back what the session holds (the last assignment, or the configuration
 that set it), never fails and still answers after the session ended:
 `scheduler` (its name), `quality_band` and `capacity_floor` (`None` while
-unset), `shaper` (an opaque `zmux.shaping.InstalledShaper`) and
-`shaping_limits`; an invalid value raises `ValueError` and changes nothing. `zmux.QualityBand(rtt=None, rate_ratio=None, min_interval=1.0)`
+unset). An invalid value raises `ValueError`. `zmux.QualityBand(rtt=None, rate_ratio=None, min_interval=1.0)`
 reports a pipe's quality once its RTT moved by more than `rtt` seconds
 (positive) or its rate by more than the factor `rate_ratio` (at least 1; 1
 reports every change), at most once per `min_interval` seconds (positive;
@@ -238,7 +273,8 @@ datagrams) and `datagram_stream_bytes` (512 KiB; `None`: the count alone),
 and the session queue by `datagram_receive_queue` and
 `datagram_receive_bytes` (1 MiB), which does not count the stream queues.
 `session.send_datagram(data)` never waits and drops the oldest queued
-datagram when the send queue is full; `await session.send_datagram_wait(data)`
+queued datagram when the send queue is full. If every slot is waiting for
+a native carrier outcome, the sender raises `DatagramDroppedError`; `await session.send_datagram_wait(data)`
 waits for room instead and is cancellation-safe.
 Every queue, the send queue included, also bounds how long datagrams wait
 (`datagram_queue_delay`, 0.02 s; `None`: off): once the datagrams leaving
@@ -251,9 +287,9 @@ reports changes. A packet forwarder uses it as its MTU.
 
 ## Streams
 
-`open_bi(info=, tlvs=, pipe_carrier=, priority=, peer_priority=)` fixes the
-preamble before the first frame; `try_open_bi()` and `try_open_uni()` open
-without waiting.
+`open_bi()` and `open_uni()` wait for stream credit and fix the supplied
+`info` and `tlvs` before the first frame. Cancelling an opener withdraws
+it from the queue. `try_open_bi()` and `try_open_uni()` open without waiting.
 `finish()` ends the sending part, `reset(code)` abandons it and
 `recv.stop(code)` asks the peer to stop sending; `reset` and `stop` return at
 once, like `asyncio.Transport.abort`; both always take the code. Every
@@ -287,12 +323,18 @@ answers while a write, `flush` or `wait_send_capacity` holds the part, and so do
 `send.send_datagram` and `send.max_datagram_size`. An
 assignment does not take the part either: it works meanwhile too, and a
 raised `send.send_buffer` wakes a write that waits for room;
-`await recv.read_chunk(n)` returns a `memoryview` of the received buffer, and
-`recv.preamble_priority` is the priority the peer put in the stream's opening
+`await recv.read_chunk(n)` returns a read-only `memoryview` that keeps the
+received buffer alive. Release views when finished with them. If the session
+cannot lend another chunk, `BorrowLimitError` leaves the bytes available to
+`read()`. `recv.preamble_priority` is the priority the peer put in the stream's opening
 preamble (`None` when it sent none), for a relay that copies it to the next
-hop; every write takes any buffer-protocol object: `bytes` (or a contiguous
-`memoryview` of `bytes`) goes without a copy, any other buffer is copied when
-the call is made, so it may be reused at once.
+hop. Stream writes accept byte-oriented buffers. `write()` samples the buffer
+at the call, and cancellation may have sent a prefix. `write_some()` and
+`writev()` return the number of bytes taken from the input. A stream write
+that cannot reserve its backing raises `MemoryBudgetError`.
+`recv.try_read_chunk(n)` uses the same receive lease as `read_chunk(n)`.
+It returns `None` if it would wait, and an empty view at EOF. The lease stays
+alive until the last derived view releases it.
 
 `open_bi` and `accept_bi` give a `BiStream`, which unpacks as `send, recv`.
 `await session.open_stream_pair(limit=...)` returns a `(StreamPairReader,
@@ -323,26 +365,73 @@ async for event in session.events():
             log.warning("suspended, and nothing redials")
 ```
 
-Relays and nested sessions: `await zmux.helpers.splice((send_a, recv_a), (send_b,
-recv_b), a_to_b=limiter)` forwards two streams into each other; a limiter
-(`zmux.helpers.Limiter`) reserves bytes with `acquire(min, max)` and
-`try_acquire(min, max)` and takes back what was not forwarded with
-`refund(n)`, all on the event loop. A stream direction asks `acquire(1, k)`
-per chunk; `splice_packets` asks `acquire(n, n)` per whole capsule; a
-forwarded stream datagram needs `try_acquire(n, n)` and is dropped without a
-grant. An `acquire` that raises ends the direction with
-`SpliceEnd.LIMITER_FAILED`.
-The result is a `zmux.helpers.SpliceResult` of two `SpliceDirection`s
-(`a_to_b`, `b_to_a`) with `bytes`, `datagram_bytes`, `datagrams_dropped`
-(every datagram received and not forwarded), `datagrams_too_large` (of those,
-the ones dropped for their size: larger than a datagram of the downstream
-stream, or, in `splice_packets`, larger than `DEFAULT_MAX_PACKET`),
-`datagrams_limited`, `datagrams_as_capsules`, `end` (a `SpliceEnd`) and `code`.
-`zmux.helpers.SpliceAbort()` given as `abort=` ends the splices sharing it
-with a chosen code: `abort.abort(0x77)` resets the downstream parts and stops
-the upstream parts with it, and the directions still running report
-`SpliceEnd.CANCELLED` with `code` (an aborted handle at the start ends the
-splice at once); cancelling the task keeps resetting with `ZMUX_CANCELLED`.
+Use `zmux.helpers.splice(a, b)` to relay two bidirectional streams. Each
+direction forwards independently until it ends. The call takes ownership of
+both sets of halves and returns a coroutine for the relay. A
+`SpliceAbort` passed as `abort=` ends the splices sharing it with the first
+application code supplied to `abort.abort(code)`.
+
+Use `controlled_splice` or `controlled_splice_packets` and pass `SpliceHooks` as `a_to_b_hooks=` or `b_to_a_hooks=` to transform
+forwarded data. A byte splice calls `stream` hooks for bounded byte blocks.
+A packet splice calls `capsule` hooks for complete reliable capsules. Both
+modes support `datagram` hooks. The hooks run synchronously on the event
+loop that created the splice.
+
+```python
+from zmux.helpers import SpliceDecision, SpliceHooks, controlled_splice
+
+
+def drop_prefix(unit):
+    unit.append_slice(1)
+    return SpliceDecision.replace()
+
+
+control, run = controlled_splice(a, b, a_to_b_hooks=SpliceHooks(stream=(drop_prefix,)))
+result = await run
+```
+
+A hook may pass the current group, build ordered replacements, drop the
+group, or reset the direction with an application code. `unit.meta` can be
+retained. Payload access and replacement building end when the callback
+returns. `append_slice` shares the original data, and `append` transfers
+a copy of Python `bytes` into a bounded output group. `read()` copies one item.
+Passing or replacing can defer submission with `delay=` or `resume=`,
+and set an expiry with `timeout=`. Use `SpliceSignal` to release a wait
+and `SpliceMirror` to collect bounded diagnostic samples. A copy mirror
+returns independent bytes. Lease mode takes a backing bound and can return
+a read-only view of a shareable prefix. `SpliceLimits.wait_cap` caps the whole
+wait from admission. Enable `datagram_delay` to queue deferred datagrams.
+
+`controlled_splice` and `controlled_splice_packets` return a controller
+and the coroutine that drives it. Start the coroutine in an asyncio task
+to replace chains at admission boundaries, pause a direction, or inject
+typed inputs. Retain a pause token until resuming, and await
+`pause.acknowledged()` to observe the safe output boundary. An injection's
+receipt reports the sequence, hook generation, status and accepted bytes
+and items. Use `on_event` for committed hook replacements, pause acknowledgements
+and direction ends. Cancellation can
+leave already admitted inputs and forwarded prefixes in place.
+
+The direction's `Limiter` declares its maximum atomic grant as
+`max_burst_bytes` and reserves bytes for outgoing data. It uses
+`acquire(1, k)` for stream chunks, `acquire(n, n)` for complete capsules,
+and `try_acquire(n, n)` for the current datagram. A datagram with no grant
+is dropped. A transformed datagram group requests one exact grant for the group.
+An `acquire` error ends that direction. Each direction of the
+result reports forwarded bytes, transformed inputs and outputs, drops,
+and its end reason and application code.
+
+When the target accepts bytes, it keeps their limiter grant as a prepayment.
+The charge settles on the first complete local carrier handoff. The limiter
+gets the grant back if the final handoff opportunity is lost. Use `control.a_to_b.handoffs.snapshot()`
+for accepted, pending, handed-off and unsent bytes, refunds after acceptance,
+and counts of datagrams first handed off natively or in a record.
+`result.a_to_b.handoffs` provides the same live observation after a controlled
+or limited direction ends. An untracked direction has `handoffs=None`.
+`control.a_to_b.pre_admission_refunded_bytes` also includes grants returned
+before acceptance after the direction has ended. The same field on the
+result is a snapshot taken at completion.
+
 `await session.open_pipe_stream(info=..., tlvs=...)` opens a carrier stream
 and `zmux.adapter.stream_pipe(send, recv)` wraps an accepted one, either a `PipeIo`.
 
@@ -354,7 +443,9 @@ DATAGRAM capsule in its bytes, by `zmux.helpers.SendPolicy`
 context=0)` returns how it left (`zmux.helpers.Sent`), `recv()` a `Packet`
 or `None` once the peer called `close()`, and `async for` iterates the
 packets; `split()` gives a sender and a receiver for two tasks, `stats()` the
-counters. Its send and receive are cancellation-safe. Errors sit under
+counters. A cancelled send may already have submitted the packet. A locally
+dropped original raises `DatagramDroppedError`, whose `reason` is a
+`DatagramDrop`. Packet framing errors sit under
 `zmux.PacketError`: `PacketTooLargeError` above `max_packet` (65535 by
 default), and `MalformedPacketError` when the peer's bytes were malformed
 (the stream is then reset and stopped with `ZMUX_PACKET_ERROR`).
@@ -529,10 +620,8 @@ follows `closed`), and `logger` is told a session's log lines through a backlog
 of 256 per session (a lost line is counted in `SessionStats.log_lines_dropped`). A `Tracer` is told the session's `Session.id`, a
 `zmux.SessionId`. Deciding hooks (`authorize_join`,
 `allow_record_mode`, `on_reject`, `session_config`, an admission decider)
-may be `async` and are cancelled at the library's deadline. Choices the
-library makes in its own calls are data: `record_policy=zmux.RecordPolicy(...)`,
-`shaping_budget=ShapingBudget(...)` and handshake plans from a
-`ShapingBundle`. A custom `carrier_credential` is the one hook called on the
+may be `async` and are cancelled at the library's deadline. A custom
+`carrier_credential` is called on the
 library's thread that dials; it must be quick.
 
 A suspected leak of a session-level secret is answered by
@@ -560,20 +649,33 @@ exchange acknowledgement. Other carriers on the connection remain independent.
 
 `ListenerConfig(admission=...)` decides on each new carrier at every entry
 before anything is answered, and `dial_x(..., carrier_credential=...)` presents
-what it checks. `PrefixAuth` tokens are the shared mechanism: a token is the
-carrier's first bytes, or the `Zmux-Prefix-Auth` request header on WebSocket
-and WebTransport. Fragment:
+what it checks. A `PrefixAuth` presenter uses a provisioned `PrefixTicket`
+and outer `PrefixSchedule`. Tickets are presented as 64 binary bytes or as
+unpadded base64url in `Zmux-Prefix-Auth` on head-admitted requests. Both ends
+use the same slot length, binding policy and header field. The default
+`PrefixBinding.BOUND` binds each presentation to the completed TLS 1.3 or
+QUIC handshake. `ENCRYPTED` allows a bearer ticket on encrypted carriers.
+`ALLOW_CLEARTEXT` also permits a binary bearer presentation on a cleartext
+carrier. An authority redeems each presentation and tracks replay and
+single-use state.
 
 ```python
-auth = zmux.PrefixAuth(b"shared secret", slot=30, bind_tls=True)
+# generation and ticket are provisioned to the presenter and authority.
+schedule = zmux.PrefixSchedule([generation])
+window = zmux.PrefixWindow(30, skew=1)
+store = zmux.MemoryPrefixStore([generation], window=window)
+store.add_ticket(ticket)
+auth = zmux.PrefixAuth(ticket, schedule=schedule, slot_seconds=window.slot_seconds)
 listener = zmux.Listener(
-    listener_config=zmux.ListenerConfig(
-        admission=zmux.Admission.prefix_auth(auth, skew=1)
-    )
+    listener_config=zmux.ListenerConfig(admission=zmux.Admission.prefix_auth(store))
 )
-await listener.serve_websocket("0.0.0.0", 443, tls=server_tls)
-pipe = await zmux.dial_websocket("wss://example.net/", carrier_credential=auth)
 ```
+
+Share the authority across listeners in the admission domain. A custom
+`PrefixStore` supplies a cached schedule and async-capable operations for
+the floor, ticket lookup, atomic claim, and receipt resolution. The
+`PrefixDeadline` carries the monotonic deadline and cancellation state.
+Use `reject=` to select how the listener handles rejected presentations.
 
 `Admission(decide, *, peek=N)` takes a decision of your own:
 `decide(info, prefix)` gets the `CarrierInfo` and up to `N` first bytes, and
@@ -753,14 +855,7 @@ byte stream with a partial prefix is replayed to the fallback. Without a
 target it stalls. HTTP request bodies, message-framed carriers and late
 decision callbacks close on timeout.
 
-## Shaping and early data
-
-`session.shaper = zmux.shaping.Shaper(definition=...)` (or a
-`zmux.shaping.ShapingBundle`; `None` removes it), `Config(shaping=...,
-shaping_limits=..., shaping_budget=...)` and `ShapingBundle` take JSON
-definitions and values run natively; no Python code runs per record. Bounds left unset
-keep the library's defaults (`ShapingLimits.max_delay`,
-`ShapingSizeLimits.max_slots`); `None` lifts a bound.
+## Early data
 
 `Config(early_data=True)` toward a zmux peer sends the first streams before
 the peer's parameters arrive. QUIC 0-RTT: keep one

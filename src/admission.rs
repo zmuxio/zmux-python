@@ -5,12 +5,14 @@
 //! methods, as a client's credential for `dial_*`.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyTuple};
 
+use zmux::AdmissionVerdict as Verdict;
+
+use crate::prefix::PrefixAuth;
 use crate::ranged;
 use crate::rt::LoopRef;
 use crate::seconds;
@@ -21,7 +23,7 @@ use crate::seconds;
 pub(crate) struct CarrierInfo(pub(crate) zmux::CarrierInfo);
 
 fn addr(a: Option<std::net::SocketAddr>) -> Option<(String, u16)> {
-    a.map(|r| (r.ip().to_string(), r.port()))
+    a.map(crate::host_port)
 }
 
 #[pymethods]
@@ -116,64 +118,24 @@ pub(crate) fn framing_name(f: zmux::adapter::Framing) -> &'static str {
 
 /// An admission decision for `serve_*`.
 #[pyclass(frozen, module = "zmux")]
-pub(crate) struct AdmissionVerdict(V);
+pub(crate) struct AdmissionVerdict(Verdict);
 
-/// A verdict as Python holds it: an accept's value is a Python object.
-enum V {
-    Accept {
-        skip: usize,
-        value: Option<Arc<Py<PyAny>>>,
-    },
-    Fallback {
-        value: Option<Arc<Py<PyAny>>>,
-    },
-    Takeover {
-        value: Option<Arc<Py<PyAny>>>,
-    },
-    Stall,
-    Close,
-    More {
-        need: usize,
-    },
-    Defer,
+fn host_value(v: &zmux::AdmittedValue) -> Option<&Py<PyAny>> {
+    v.downcast_ref::<Py<PyAny>>()
 }
 
 /// The Python object of an admission's value (`AdmittedValue`): the one a
 /// decider gave `AdmissionVerdict.accept`, `None` without one.
 pub(crate) fn admitted_obj(py: Python<'_>, v: Option<&zmux::AdmittedValue>) -> Option<Py<PyAny>> {
-    v.and_then(|v| (**v).downcast_ref::<Py<PyAny>>())
-        .map(|o| o.clone_ref(py))
+    v.and_then(host_value).map(|o| o.clone_ref(py))
 }
 
 impl AdmissionVerdict {
-    fn native(&self) -> zmux::AdmissionVerdict {
-        match &self.0 {
-            V::Accept { skip, value } => {
-                let v = zmux::AdmissionVerdict::accept(*skip);
-                match value {
-                    Some(o) => v.with_value(o.clone() as zmux::AdmittedValue),
-                    None => v,
-                }
-            }
-            V::Fallback { value } => {
-                let v = zmux::AdmissionVerdict::fallback();
-                match value {
-                    Some(o) => v.with_value(o.clone() as zmux::AdmittedValue),
-                    None => v,
-                }
-            }
-            V::Takeover { value } => {
-                let verdict = zmux::AdmissionVerdict::takeover();
-                match value {
-                    Some(o) => verdict.with_value(o.clone() as zmux::AdmittedValue),
-                    None => verdict,
-                }
-            }
-            V::Stall => zmux::AdmissionVerdict::Stall,
-            V::Close => zmux::AdmissionVerdict::Close,
-            V::More { need } => zmux::AdmissionVerdict::More { need: *need },
-            V::Defer => zmux::AdmissionVerdict::Defer,
-        }
+    fn with_value(verdict: Verdict, value: Option<Py<PyAny>>) -> Self {
+        Self(match value {
+            Some(v) => verdict.with_value(Arc::new(v)),
+            None => verdict,
+        })
     }
 }
 
@@ -185,10 +147,7 @@ impl AdmissionVerdict {
     #[staticmethod]
     #[pyo3(signature = (skip=0, value=None))]
     fn accept(#[pyo3(from_py_with = ranged)] skip: usize, value: Option<Py<PyAny>>) -> Self {
-        AdmissionVerdict(V::Accept {
-            skip,
-            value: value.map(Arc::new),
-        })
+        Self::with_value(Verdict::accept(skip), value)
     }
     /// Hands the carrier to the listener's fallback, what was read
     /// replayed; `value`, any object, is the host's routing of it
@@ -196,41 +155,37 @@ impl AdmissionVerdict {
     #[staticmethod]
     #[pyo3(signature = (value=None))]
     fn fallback(value: Option<Py<PyAny>>) -> Self {
-        AdmissionVerdict(V::Fallback {
-            value: value.map(Arc::new),
-        })
+        Self::with_value(Verdict::fallback(), value)
     }
     #[classattr]
     #[allow(non_snake_case)]
     fn STALL() -> AdmissionVerdict {
-        AdmissionVerdict(V::Stall)
+        AdmissionVerdict(Verdict::Stall)
     }
     #[classattr]
     #[allow(non_snake_case)]
     fn CLOSE() -> AdmissionVerdict {
-        AdmissionVerdict(V::Close)
+        AdmissionVerdict(Verdict::Close)
     }
     /// On the head of an HTTP upgrade (`CarrierInfo.upgrade`): completes the
     /// upgrade and decides again on the carrier's first message or bytes.
     #[classattr]
     #[allow(non_snake_case)]
     fn DEFER() -> AdmissionVerdict {
-        AdmissionVerdict(V::Defer)
+        AdmissionVerdict(Verdict::Defer)
     }
     /// Hands the accepted carrier to the byte-stream target, or stalls without one.
     #[staticmethod]
     #[pyo3(signature = (value=None))]
     fn takeover(value: Option<Py<PyAny>>) -> Self {
-        Self(V::Takeover {
-            value: value.map(Arc::new),
-        })
+        Self::with_value(Verdict::takeover(), value)
     }
 
     /// Waits for a longer prefix before deciding again.
 
     #[staticmethod]
     fn more(#[pyo3(from_py_with = ranged)] need: usize) -> Self {
-        AdmissionVerdict(V::More { need })
+        AdmissionVerdict(Verdict::More { need })
     }
     /// A `Decision` of this verdict with the carrier's label `variant`.
     fn labelled(slf: Py<Self>, variant: String) -> Decision {
@@ -243,7 +198,7 @@ impl AdmissionVerdict {
     #[getter]
     fn need(&self) -> Option<usize> {
         match self.0 {
-            V::More { need } => Some(need),
+            Verdict::More { need } => Some(need),
             _ => None,
         }
     }
@@ -251,7 +206,7 @@ impl AdmissionVerdict {
     #[getter]
     fn skip(&self) -> Option<usize> {
         match self.0 {
-            V::Accept { skip, .. } => Some(skip),
+            Verdict::Accept { skip, .. } => Some(skip),
             _ => None,
         }
     }
@@ -259,9 +214,9 @@ impl AdmissionVerdict {
     #[getter]
     fn value(&self, py: Python<'_>) -> Option<Py<PyAny>> {
         match &self.0 {
-            V::Accept { value, .. } | V::Fallback { value } | V::Takeover { value } => {
-                value.as_ref().map(|o| o.clone_ref(py))
-            }
+            Verdict::Accept { value, .. }
+            | Verdict::Fallback { value }
+            | Verdict::Takeover { value } => admitted_obj(py, value.as_ref()),
             _ => None,
         }
     }
@@ -270,40 +225,65 @@ impl AdmissionVerdict {
             return Ok(false);
         };
         Ok(match (&self.0, &o.get().0) {
-            (V::Accept { skip: a, value: x }, V::Accept { skip: b, value: y }) => {
-                a == b && same(py, x.as_deref(), y.as_deref())?
+            (Verdict::Accept { skip: a, value: x }, Verdict::Accept { skip: b, value: y }) => {
+                a == b
+                    && same(
+                        py,
+                        x.as_ref().and_then(host_value),
+                        y.as_ref().and_then(host_value),
+                    )?
             }
-            (V::Fallback { value: x }, V::Fallback { value: y })
-            | (V::Takeover { value: x }, V::Takeover { value: y }) => {
-                same(py, x.as_deref(), y.as_deref())?
-            }
-            (V::Stall, V::Stall) | (V::Close, V::Close) | (V::Defer, V::Defer) => true,
-            (V::More { need: a }, V::More { need: b }) => a == b,
+            (Verdict::Fallback { value: x }, Verdict::Fallback { value: y })
+            | (Verdict::Takeover { value: x }, Verdict::Takeover { value: y }) => same(
+                py,
+                x.as_ref().and_then(host_value),
+                y.as_ref().and_then(host_value),
+            )?,
+            (Verdict::Stall, Verdict::Stall)
+            | (Verdict::Close, Verdict::Close)
+            | (Verdict::Defer, Verdict::Defer) => true,
+            (Verdict::More { need: a }, Verdict::More { need: b }) => a == b,
             _ => false,
         })
     }
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         Ok(match &self.0 {
-            V::Accept { skip, value: None } => format!("AdmissionVerdict.accept({skip})"),
-            V::Accept {
+            Verdict::Accept { skip, value: None } => format!("AdmissionVerdict.accept({skip})"),
+            Verdict::Accept {
                 skip,
                 value: Some(v),
             } => format!(
                 "AdmissionVerdict.accept({skip}, value={})",
-                v.bind(py).repr()?
+                host_value(v)
+                    .expect("Python admission value")
+                    .bind(py)
+                    .repr()?
             ),
-            V::Fallback { value: None } => "AdmissionVerdict.fallback()".into(),
-            V::Fallback { value: Some(v) } => {
-                format!("AdmissionVerdict.fallback(value={})", v.bind(py).repr()?)
+            Verdict::Fallback { value: None } => "AdmissionVerdict.fallback()".into(),
+            Verdict::Fallback { value: Some(v) } => {
+                format!(
+                    "AdmissionVerdict.fallback(value={})",
+                    host_value(v)
+                        .expect("Python admission value")
+                        .bind(py)
+                        .repr()?
+                )
             }
-            V::Takeover { value: None } => "AdmissionVerdict.takeover()".into(),
-            V::Takeover { value: Some(v) } => {
-                format!("AdmissionVerdict.takeover(value={})", v.bind(py).repr()?)
+            Verdict::Takeover { value: None } => "AdmissionVerdict.takeover()".into(),
+            Verdict::Takeover { value: Some(v) } => {
+                format!(
+                    "AdmissionVerdict.takeover(value={})",
+                    host_value(v)
+                        .expect("Python admission value")
+                        .bind(py)
+                        .repr()?
+                )
             }
-            V::Stall => "AdmissionVerdict.STALL".into(),
-            V::Close => "AdmissionVerdict.CLOSE".into(),
-            V::More { need } => format!("AdmissionVerdict.more({need})"),
-            V::Defer => "AdmissionVerdict.DEFER".into(),
+            Verdict::Stall => "AdmissionVerdict.STALL".into(),
+            Verdict::Close => "AdmissionVerdict.CLOSE".into(),
+            Verdict::More { need } => format!("AdmissionVerdict.more({need})"),
+            Verdict::Defer => "AdmissionVerdict.DEFER".into(),
+            _ => format!("AdmissionVerdict({:?})", self.0),
         })
     }
 }
@@ -364,27 +344,27 @@ impl Decision {
 fn decision(v: &Bound<'_, PyAny>) -> PyResult<zmux::AdmissionDecision> {
     if let Ok(d) = v.cast::<Decision>() {
         let d = d.get();
-        let verdict = d.verdict.get().native();
+        let verdict = d.verdict.get().0.clone();
         return Ok(match &d.variant {
             Some(l) => verdict.labelled(l.as_str()),
             None => verdict.into(),
         });
     }
-    Ok(v.cast::<AdmissionVerdict>()?.get().native().into())
+    Ok(v.cast::<AdmissionVerdict>()?.get().0.clone().into())
 }
 
 /// A server's admission of new carriers, given to a `Listener`.
 #[pyclass(frozen, module = "zmux")]
 pub(crate) struct Admission {
     pub(crate) inner: zmux::Admission,
-    /// The decider written in Python, whose coroutines run on an event loop.
-    decider: Option<PyDecide>,
+    /// The event loop for Python admission or ticket authority callbacks.
+    lp: Option<LoopRef>,
 }
 
 impl Admission {
     fn with_times(
         mut a: zmux::Admission,
-        decider: Option<PyDecide>,
+        lp: Option<LoopRef>,
         peek_timeout: Option<Bound<'_, PyAny>>,
         stall: Option<Bound<'_, PyAny>>,
         fallback_on_peek_timeout: bool,
@@ -407,16 +387,13 @@ impl Admission {
             }
             a = a.with_stall_interval(min, max);
         }
-        Ok(Admission { inner: a, decider })
+        Ok(Admission { inner: a, lp })
     }
 
     /// The admission for a listener, and the loop of its Python decider,
     /// which the listener binds at its first use unless it is bound.
     pub(crate) fn for_listener(&self) -> (zmux::Admission, Option<LoopRef>) {
-        (
-            self.inner.clone(),
-            self.decider.as_ref().map(|d| d.lp.clone()),
-        )
+        (self.inner.clone(), self.lp.clone())
     }
 }
 
@@ -519,24 +496,34 @@ impl Admission {
         let a = zmux::Admission::with_decider(peek, d.clone())
             .with_max_peek(max_peek)
             .with_max_message(max_message);
-        Self::with_times(a, Some(d), peek_timeout, stall, fallback_on_peek_timeout)
+        Self::with_times(a, Some(d.lp), peek_timeout, stall, fallback_on_peek_timeout)
     }
 
+    /// Redeems a carrier's ticket through the given admission authority.
     #[staticmethod]
-    #[pyo3(signature = (auth, *, skew, max_nonces=65536, peek_timeout=None, stall=None,
-        fallback_on_peek_timeout=false))]
+    #[pyo3(signature = (store, *, binding="bound", header=None, reject="close", max_skew=None,
+        peek_timeout=None, stall=None, fallback_on_peek_timeout=false))]
     fn prefix_auth(
-        auth: PyRef<'_, PrefixAuth>,
-        #[pyo3(from_py_with = ranged)] skew: u32,
-        #[pyo3(from_py_with = ranged)] max_nonces: usize,
+        store: Bound<'_, PyAny>,
+        binding: &str,
+        header: Option<String>,
+        reject: &str,
+        max_skew: Option<u32>,
         peek_timeout: Option<Bound<'_, PyAny>>,
         stall: Option<Bound<'_, PyAny>>,
         fallback_on_peek_timeout: bool,
     ) -> PyResult<Self> {
-        let verifier = zmux::PrefixAuthVerifier::new(auth.0.clone(), skew, max_nonces)
-            .map_err(crate::value_err)?;
-        let a = zmux::Admission::prefix_auth(Arc::new(verifier));
-        Self::with_times(a, None, peek_timeout, stall, fallback_on_peek_timeout)
+        let (a, lp) = crate::prefix::admission(store, binding, header, reject, max_skew)?;
+        Self::with_times(a, lp, peek_timeout, stall, fallback_on_peek_timeout)
+    }
+
+    /// Verifies cleartext first-message fixture tickets at a fixed Unix time.
+    #[cfg(feature = "test-hooks")]
+    #[staticmethod]
+    #[pyo3(name = "_fixture_first_message_ticket", signature = (store, *, unix_seconds))]
+    fn fixture_first_message_ticket(store: &Bound<'_, PyAny>, unix_seconds: u64) -> PyResult<Self> {
+        let admission = crate::prefix::fixture_admission(store, unix_seconds)?;
+        Self::with_times(admission, None, None, None, false)
     }
 
     #[getter]
@@ -570,53 +557,6 @@ impl Admission {
     fn stall(&self) -> (f64, f64) {
         let (min, max) = self.inner.stall_interval();
         (min.as_secs_f64(), max.as_secs_f64())
-    }
-}
-
-/// Prefix authentication parameters both ends share; a client's
-/// credential.
-#[pyclass(frozen, module = "zmux")]
-pub(crate) struct PrefixAuth(zmux::PrefixAuth);
-
-#[pymethods]
-impl PrefixAuth {
-    #[new]
-    #[pyo3(signature = (psk, *, slot, bind_tls=false, header=None))]
-    fn new(
-        psk: Vec<u8>,
-        #[pyo3(from_py_with = ranged)] slot: u64,
-        bind_tls: bool,
-        header: Option<String>,
-    ) -> PyResult<Self> {
-        let auth =
-            zmux::PrefixAuth::new(&psk, Duration::from_secs(slot), bind_tls).map_err(|_| {
-                PyValueError::new_err("prefix authentication needs a non-empty psk and slot > 0")
-            })?;
-        Ok(PrefixAuth(match header {
-            Some(h) => auth.with_header(h),
-            None => auth,
-        }))
-    }
-    #[getter]
-    fn bind_tls(&self) -> bool {
-        self.0.binds_tls()
-    }
-    #[getter]
-    fn header(&self) -> &str {
-        self.0.header_name()
-    }
-    fn __repr__(&self) -> String {
-        let b = if self.0.binds_tls() { "True" } else { "False" };
-        format!(
-            "PrefixAuth(bind_tls={b}, header={:?})",
-            self.0.header_name()
-        )
-    }
-}
-
-impl PrefixAuth {
-    pub(crate) fn binds_tls(&self) -> bool {
-        self.0.binds_tls()
     }
 }
 
@@ -667,7 +607,7 @@ pub(crate) fn carrier_credential(
         return Ok(None);
     };
     if let Ok(p) = obj.cast::<PrefixAuth>() {
-        return Ok(Some(Arc::new(p.get().0.clone())));
+        return Ok(Some(Arc::new(p.get().inner.clone())));
     }
     if obj.hasattr("prefix")? && obj.hasattr("header")? {
         return Ok(Some(Arc::new(PyCarrierCredential(obj.unbind()))));
@@ -682,6 +622,5 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AdmissionVerdict>()?;
     m.add_class::<Decision>()?;
     m.add_class::<Admission>()?;
-    m.add_class::<PrefixAuth>()?;
     Ok(())
 }

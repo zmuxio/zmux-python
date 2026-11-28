@@ -11,21 +11,16 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use pyo3::prelude::*;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::helpers::lock;
 use crate::ranged;
 use crate::rt::{self, LoopRef, future_into_py};
-use crate::{PipeIo, Returned, admission, io_err, unread_take};
+use crate::{PipeIo, Returned, admission, bridge_read, io_err, read_bridge_bytes};
 
 /// How many writes each way a layer's channel holds.
 const DEPTH: usize = 8;
-
-/// A Python error as the I/O error the Rust crate takes.
-pub(crate) fn py_io(e: PyErr) -> io::Error {
-    io::Error::other(e.to_string())
-}
 
 /// A carrier's halves as one byte stream (`PipeIo.into_stream()`): on a
 /// carrier with message framing each write is one message and reads return
@@ -86,22 +81,17 @@ impl CarrierStream {
         py: Python<'p>,
         #[pyo3(from_py_with = ranged)] n: usize,
     ) -> PyResult<Bound<'p, PyAny>> {
-        let (r, unread) = (self.r.clone(), self.unread.queue());
-        let undo = self.unread.undo(py)?;
-        rt::undoable_future_into_py(
+        let n = n.max(1);
+        bridge_read(
             py,
-            async move {
-                // Held until the result is settled: bytes taken back come first.
-                let mut held = r.lock_owned().await;
-                if let Some(b) = unread_take(&unread, n.max(1)) {
-                    return Ok((rt::Bin(b), held));
-                }
-                let mut buf = bytes::BytesMut::with_capacity(crate::read_alloc(n).max(1));
-                let r = held.as_mut().ok_or_else(released)?;
-                r.read_buf(&mut buf).await.map_err(io_err)?;
-                Ok((rt::Bin(buf.freeze()), held))
+            self.r.clone(),
+            &self.unread,
+            n,
+            move |mut held| async move {
+                let reader = held.as_mut().ok_or_else(released)?;
+                let bytes = read_bridge_bytes(reader, n).await?;
+                Ok((bytes, held))
             },
-            undo,
         )
     }
     /// Writes `data` as one write on the carrier (one message on a carrier
@@ -247,20 +237,15 @@ impl LayerEnd {
     }
     /// The next write of the carrier; `b""` once it ended.
     fn read<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
-        let (rx, unread) = (self.rx.clone(), self.unread.queue());
-        let undo = self.unread.undo(py)?;
-        rt::undoable_future_into_py(
+        bridge_read(
             py,
-            async move {
-                // Held until the result is settled: a write taken back comes first, whole.
-                let mut rx = rx.lock_owned().await;
-                if let Some(b) = unread_take(&unread, usize::MAX) {
-                    return Ok((rt::Bin(b), rx));
-                }
+            self.rx.clone(),
+            &self.unread,
+            usize::MAX,
+            |mut rx| async move {
                 let b = rx.recv().await.unwrap_or_default();
                 Ok((rt::Bin(b), rx))
             },
-            undo,
         )
     }
     /// Bytes the layer read, for the carrier's reads.
@@ -305,7 +290,7 @@ pub(crate) async fn wrap(
         if let Err(e) = r {
             // Closed now, though Python may still hold the stream.
             ours.release().await;
-            return Err(py_io(e));
+            return Err(crate::py_io(e));
         }
         Ok(chan)
     })
@@ -323,7 +308,7 @@ pub(crate) struct PipeHint {
 
 impl PipeHint {
     fn of(h: &zmux::PipeHint) -> Self {
-        let addr = |a: Option<std::net::SocketAddr>| a.map(|a| (a.ip().to_string(), a.port()));
+        let addr = |a: Option<std::net::SocketAddr>| a.map(crate::host_port);
         Self {
             source: addr(h.source.or(h.peer)),
             peer: addr(h.peer),
@@ -375,11 +360,7 @@ pub(crate) fn transform(f: Py<PyAny>, lp: LoopRef) -> zmux::InboundTransform {
         async move {
             let r = call(&f, &lp, io, hint).await;
             r.map_err(|e| {
-                lp.post(move |py| {
-                    if !e.is_instance_of::<pyo3::exceptions::asyncio::CancelledError>(py) {
-                        e.write_unraisable(py, Some(f.bind(py)));
-                    }
-                });
+                lp.report_callback_error(f, e);
                 io::Error::other("inbound transform failed")
             })
         }

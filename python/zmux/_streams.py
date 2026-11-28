@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from ._errors import (
     IncompleteReadError,
@@ -17,6 +17,10 @@ from ._errors import (
 )
 from ._types import ErrorKind
 from ._zmux import PipeIo, RecvStream, SendStream, UnsentCount, pipe_pair
+
+if TYPE_CHECKING:
+    from ._layer import LayerWriter
+
 
 _DEFAULT_LIMIT = 1 << 16
 
@@ -163,8 +167,9 @@ class StreamPairWriter:
         self._buf += data
         self._queued += len(data)
         if self._task is None or self._task.done():
-            self._task = asyncio.ensure_future(self._flush())
-            self._task.add_done_callback(_retrieve)
+            task = asyncio.ensure_future(self._flush())
+            task.add_done_callback(_retrieve)
+            self._task = task
 
     def writelines(self, data: Iterable[bytes | bytearray | memoryview]) -> None:
         """Queues each item of `data`."""
@@ -216,10 +221,12 @@ class StreamPairWriter:
         self._finishing()
 
     def _finishing(self) -> asyncio.Future[None]:
-        if self._closing is None:
-            self._closing = asyncio.ensure_future(self._finish())
-            self._closing.add_done_callback(_retrieve)
-        return self._closing
+        closing = self._closing
+        if closing is None:
+            closing = asyncio.ensure_future(self._finish())
+            closing.add_done_callback(_retrieve)
+            self._closing = closing
+        return closing
 
     async def _finish(self) -> None:
         await self._settled()
@@ -328,29 +335,28 @@ async def _anext(recv: RecvStream) -> bytes:
     return bytes(b)
 
 
-async def _write_some(send: SendStream, data: Any) -> int:
-    """`SendStream.write_some`: the only await waits for write readiness and
-    takes nothing, and the write itself is synchronous, so a cancellation never
-    lands after bytes were taken."""
-    if not memoryview(data).nbytes:
-        return 0
-    while True:
-        try:
-            n = send.try_write(data)
-        except StreamBusyError:
-            n = 0
-        if n:
-            return n
-        await send.writable()
+def _write_some(send: SendStream, data: Any) -> Awaitable[int]:
+    return _write_with_credit(send, data, vectored=False)
 
 
-async def _writev(send: SendStream, buffers: list[Any]) -> int:
-    """`SendStream.writev`, as `_write_some`."""
-    if not any(memoryview(b).nbytes for b in buffers):
-        return 0
+def _writev(send: SendStream, buffers: list[Any]) -> Awaitable[int]:
+    return _write_with_credit(send, buffers, vectored=True)
+
+
+async def _write_with_credit(send: SendStream, data: Any, *, vectored: bool) -> int:
+    """Await readiness without taking bytes, then write synchronously."""
+    write: Callable[[Any], int]
+    if vectored:
+        if not any(memoryview(b).nbytes for b in data):
+            return 0
+        write = send.try_writev
+    else:
+        if not memoryview(data).nbytes:
+            return 0
+        write = send.try_write
     while True:
         try:
-            n = send.try_writev(buffers)
+            n = write(data)
         except StreamBusyError:
             n = 0
         if n:
@@ -407,24 +413,16 @@ def pipe_from_streams(
             # noinspection PyCallingNonCallable
             count.set(size())
 
-    async def inbound() -> None:
-        while data := await reader.read(65536):
-            await end.write(data)
-        await end.write(b"")
-
-    async def outbound() -> None:
-        while data := await end.read():
-            writer.write(data)
-            note()
-            await writer.drain()
-            note()
-
-        if writer.can_write_eof():
-            writer.write_eof()
+    async def inbound(revoked: asyncio.Event) -> None:
+        await _pump_inbound(reader.read, end.write, revoked)
+        if not revoked.is_set():
+            await end.write(b"")
 
     _start_bridge(
         inbound,
-        outbound,
+        lambda revoked: _pump_outbound(
+            end.read, writer, revoked, note if count is not None else None
+        ),
         end._released,
         writer.close,
         writer.wait_closed,
@@ -434,9 +432,47 @@ def pipe_from_streams(
     return pipe
 
 
+async def _pump_inbound(
+    read: Callable[[int], Awaitable[bytes]],
+    write: Callable[[bytes], Awaitable[None]],
+    revoked: asyncio.Event,
+) -> None:
+    while not revoked.is_set():
+        data = await read(_DEFAULT_LIMIT)
+        if not data or revoked.is_set():
+            break
+        await write(data)
+
+
+async def _pump_outbound(
+    read: Callable[[], Awaitable[bytes]],
+    writer: LayerWriter,
+    revoked: asyncio.Event,
+    note: Callable[[], None] | None = None,
+) -> None:
+    while data := await read():
+        if revoked.is_set():
+            return
+        writer.write(data)
+        if note is not None:
+            note()
+        await writer.drain()
+        if revoked.is_set():
+            return
+        if note is not None:
+            note()
+
+    if revoked.is_set():
+        return
+    can_write_eof = getattr(writer, "can_write_eof", None)
+    write_eof = getattr(writer, "write_eof", None)
+    if write_eof is not None and can_write_eof is not None and can_write_eof():
+        write_eof()
+
+
 def _start_bridge(
-    inbound: Callable[[], Awaitable[None]],
-    outbound: Callable[[], Awaitable[None]],
+    inbound: Callable[[asyncio.Event], Awaitable[None]],
+    outbound: Callable[[asyncio.Event], Awaitable[None]],
     release: Callable[[], Awaitable[None]],
     close: Callable[[], None],
     wait_closed: Callable[[], Awaitable[None]],
@@ -444,17 +480,31 @@ def _start_bridge(
     done: Callable[[], None],
     finish: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
+    def cancel(task: asyncio.Future[None]) -> None:
+        # The host can suppress cancellation. Observe its eventual result
+        # without tying carrier release to when that result arrives.
+        task.add_done_callback(_retrieve)
+        task.cancel()
+
     async def bridge() -> None:
-        reading = asyncio.ensure_future(inbound())
-        writing = asyncio.ensure_future(outbound())
+        read_revoked = asyncio.Event()
+        write_revoked = asyncio.Event()
+        reading = asyncio.ensure_future(inbound(read_revoked))
+        writing = asyncio.ensure_future(outbound(write_revoked))
         released = asyncio.ensure_future(release())
         pumps = {reading, writing}
         aborted = False
+
+        def revoke_writer() -> None:
+            if not write_revoked.is_set():
+                write_revoked.set()
+                cancel(writing)
 
         def abort_once() -> None:
             nonlocal aborted
             if not aborted:
                 aborted = True
+                revoke_writer()
                 abort()
 
         try:
@@ -465,9 +515,11 @@ def _start_bridge(
                 for task in completed & pumps:
                     task.result()
                     pumps.remove(task)
+            released.result()
         finally:
-            reading.cancel()
-            released.cancel()
+            read_revoked.set()
+            cancel(reading)
+            cancel(released)
             loop = asyncio.get_running_loop()
             deadline = loop.time() + _BRIDGE_FLUSH_TIMEOUT
             try:
@@ -476,7 +528,7 @@ def _start_bridge(
             except (TimeoutError, asyncio.CancelledError):
                 abort_once()
             finally:
-                writing.cancel()
+                revoke_writer()
                 try:
                     close()
                     closing = asyncio.ensure_future(wait_closed())
@@ -484,26 +536,19 @@ def _start_bridge(
                         async with asyncio.timeout_at(deadline):
                             await asyncio.shield(closing)
                     except (TimeoutError, asyncio.CancelledError):
-                        # Observe a late exception without delaying carrier release.
-                        closing.add_done_callback(_retrieve)
-                        closing.cancel()
+                        cancel(closing)
                         abort_once()
                 finally:
-                    try:
-                        await asyncio.gather(
-                            reading, writing, released, return_exceptions=True
-                        )
-                    finally:
-                        if finish is not None:
-                            await finish()
+                    if finish is not None:
+                        await finish()
 
     def settled(task: asyncio.Future[None]) -> None:
         _settle(task)
         done()
 
-    task = asyncio.ensure_future(bridge())
-    _bridges.add(task)
-    task.add_done_callback(settled)
+    bridge_task = asyncio.ensure_future(bridge())
+    _bridges.add(bridge_task)
+    bridge_task.add_done_callback(settled)
 
 
 def _settle(task: asyncio.Future[None]) -> None:

@@ -10,36 +10,16 @@ import dataclasses
 import logging
 import math
 import threading
-import time
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import pytest
 import zmux
+from support import LOOPBACK, CallbackSignal
+from support import start_pending, until
+from support import session_pair as pair
 
 CANCELLED = zmux.ApplicationErrorCode.ZMUX_CANCELLED
-
-
-@contextlib.asynccontextmanager
-async def pair(
-    config: zmux.Config | None = None,
-) -> AsyncIterator[tuple[zmux.Session, zmux.Session]]:
-    async with zmux.Listener(config=config) as listener:
-        host, port = await listener.serve_tcp("127.0.0.1", 0)
-        c = await zmux.connect_tcp(host, port, config=config)
-        s = await listener.accept()
-        try:
-            yield c, s
-        finally:
-            c.abort(0)
-            s.abort(0)
-            await asyncio.gather(c.wait_closed(), s.wait_closed())
-
-
-async def until(cond: Callable[[], object], limit: float = 5.0) -> None:
-    async with asyncio.timeout(limit):
-        while not cond():
-            await asyncio.sleep(0.005)
 
 
 # ---- read readiness and the non-blocking read ----------------------------------
@@ -61,13 +41,11 @@ async def test_wait_readable_waits_only_for_its_own_bound() -> None:
         await send.write(b"x")
         _, recv = await s.accept_bi()
         assert await recv.read() == b"x"
-        with pytest.raises(TimeoutError):
-            async with asyncio.timeout(0.1):
-                await recv.wait_readable()
-        # Any number of waiters, each cancellable; the stream stays usable.
-        waiters = [asyncio.ensure_future(recv.wait_readable()) for _ in range(3)]
-        await asyncio.sleep(0.05)
+        # Each registered waiter can be cancelled independently.
+        waiters = [await start_pending(recv.wait_readable) for _ in range(3)]
         waiters[0].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiters[0]
         assert not any(w.done() for w in waiters[1:])
         await send.write(b"y")
         await asyncio.gather(*waiters[1:])
@@ -137,11 +115,11 @@ async def test_try_read_reports_a_reset_as_a_read_does() -> None:
         send, _ = await c.open_bi()
         await send.write(b"a")
         _, recv = await s.accept_bi()
+        assert await recv.read_exact(1) == b"a"
         send.reset(9)
         await recv.wait_readable()
         with pytest.raises(zmux.StreamResetError) as e:
-            while recv.try_read() is not None:
-                await asyncio.sleep(0)
+            recv.try_read()
         assert e.value.code == 9
 
 
@@ -167,9 +145,10 @@ async def test_wait_readable_then_try_read_is_a_read_that_loses_nothing() -> Non
         assert recv.try_read() == b"x"
         # Waits cancelled while nothing is readable take nothing ...
         for _ in range(3):
-            with pytest.raises(TimeoutError):
-                async with asyncio.timeout(0.01):
-                    await recv.wait_readable()
+            waiting = await start_pending(recv.wait_readable)
+            waiting.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiting
         # ... so the data that comes after them is all there for the read.
         await send.write(b"first")
         got = bytearray()
@@ -213,7 +192,7 @@ async def test_the_peer_adjusts_the_priority_a_getter_reads() -> None:
         _, recv = await s.accept_bi()
         assert send.priority == zmux.Priority.LOCAL_DEFAULT
         recv.peer_priority = (0, False)
-        await until(lambda: send.priority == zmux.Priority(0, False))
+        await until(c, lambda: send.priority == zmux.Priority(0, False))
         send.priority = (5, True)
         assert send.priority == zmux.Priority(5, True)
 
@@ -324,7 +303,8 @@ async def test_session_getters_read_unset_as_none() -> None:
 # ---- pipes ---------------------------------------------------------------------------------
 
 POOL_CONFIG = zmux.Config(
-    max_pipes=8, pipe_auth=zmux.PipeAuth.psk(b"k" * 32).with_end_to_end()
+    session_policy=zmux.SessionPolicy(limits=zmux.CapacityLimits(steady_attachments=8)),
+    pipe_auth=zmux.PipeAuth.psk(b"k" * 32).with_end_to_end(),
 )
 LISTENER = zmux.ListenerConfig(
     instance_id=b"instance", limits=zmux.ListenerLimits(max_suspended=16)
@@ -353,7 +333,6 @@ async def test_pipe_options_read_back_what_was_given_and_the_join_fixed() -> Non
             quality_band=band,
             label="b",
             fate_group=5,
-            return_on_reply=True,
         )
         pipe = await client.add_pipe(await zmux.dial_tcp(*addr), options=given)
         await pipe.wait_attached()
@@ -364,7 +343,7 @@ async def test_pipe_options_read_back_what_was_given_and_the_join_fixed() -> Non
         assert (o.weight, o.probation) == (2, None)
         assert o.liveness == zmux.PipeLiveness(dead_timeout=20.0)
         assert o.quality_band == band
-        assert (o.label, o.fate_group, o.return_on_reply) == ("b", 5, True)
+        assert (o.label, o.fate_group) == ("b", 5)
         # Fixed at creation: the values the join used, never inherit.
         assert o.direction is zmux.Direction.BIDI
         assert o.record_mode is not zmux.INHERIT
@@ -411,7 +390,7 @@ async def test_a_pipe_the_peer_added_reads_as_the_join_made_it() -> None:
             ),
         )
         await added.wait_attached()
-        await until(lambda: len(server.pipes()) == 2)
+        await until(server, lambda: len(server.pipes()) == 2)
         mine = added.options
         theirs = next(p for p in server.pipes() if p.id == added.id).options
         # The handshake decides these, and both ends read the same facts.
@@ -432,7 +411,6 @@ async def test_a_pipe_the_peer_added_reads_as_the_join_made_it() -> None:
             "liveness",
             "quality_band",
             "label",
-            "return_on_reply",
         ):
             assert getattr(theirs, name) == getattr(d, name), name
         assert theirs.send_priority is zmux.INHERIT and theirs.label is None
@@ -447,7 +425,7 @@ async def test_pipe_options_answer_after_the_pipe_ended() -> None:
         before = pipe.options
         pipe.close()
         await asyncio.wait_for(pipe.wait_closed(), 10)
-        await until(lambda: pipe.stats() is None)
+        await until(client, lambda: pipe.stats() is None)
         # Never fails: the options held last.
         assert pipe.options == before
 
@@ -458,15 +436,14 @@ async def test_a_pipe_this_endpoint_aborted_is_reported_as_aborted() -> None:
     async with multipath() as (client, _server, addr):
         pipe = await client.add_pipe(await zmux.dial_tcp(*addr))
         await pipe.wait_attached()
-        waiting = asyncio.ensure_future(pipe.wait_closed())
-        await asyncio.sleep(0)
+        waiting = await start_pending(pipe.wait_closed)
         pipe.abort()
         with pytest.raises(zmux.PipeAbortedError) as e:
             await asyncio.wait_for(waiting, 10)
         assert isinstance(e.value, zmux.PipeError)
         assert isinstance(e.value, zmux.PipeGoneError)
         assert e.value.kind == zmux.ErrorKind.FAILED
-        await until(lambda: pipe.stats() is None)
+        await until(client, lambda: pipe.stats() is None)
         for _ in range(2):
             with pytest.raises(zmux.PipeAbortedError):
                 await asyncio.wait_for(pipe.wait_closed(), 10)
@@ -478,7 +455,7 @@ async def test_a_pipe_closed_gracefully_reads_as_closed_to_a_late_wait() -> None
         await pipe.wait_attached()
         pipe.close()
         await asyncio.wait_for(pipe.wait_closed(), 10)
-        await until(lambda: pipe.stats() is None)
+        await until(client, lambda: pipe.stats() is None)
         await asyncio.wait_for(pipe.wait_closed(), 10)
 
 
@@ -489,9 +466,8 @@ async def test_stream_getters_answer_while_a_write_and_a_read_hold_the_parts() -
     async with pair() as (c, _s):
         send, recv = await c.open_bi(priority=(5, False))
         # The peer reads nothing: the write never ends and holds its part.
-        blocked = asyncio.ensure_future(send.write(b"x" * (16 << 20)))
-        reading = asyncio.ensure_future(recv.read())
-        await asyncio.sleep(0.05)
+        blocked = await start_pending(lambda: send.write(b"x" * (16 << 20)))
+        reading = await start_pending(recv.read)
         assert not blocked.done() and not reading.done()
         assert send.priority == zmux.Priority(5, False)
         assert send.send_buffer > 0
@@ -527,8 +503,7 @@ async def test_a_receive_window_set_during_a_read_reaches_the_peer() -> None:
         await send.write(b"x")
         peer_send, _peer_recv = await s.accept_bi()
         initial = recv.receive_window[0]
-        reading = asyncio.ensure_future(recv.read())
-        await asyncio.sleep(0.05)
+        reading = await start_pending(recv.read)
         assert not reading.done()
         # The read holds the part; the setter does not need it, and the
         # credit it advertises arrives at the peer's sending part.
@@ -555,108 +530,6 @@ async def test_stream_getters_keep_answering_once_the_part_was_taken() -> None:
 # ---- pool policy ------------------------------------------------------------------------------
 
 
-async def test_a_slow_decide_is_waited_for_and_not_rejected() -> None:
-    """The pool's maintainer waits for the loop's answer without a bound: a
-    `decide` that blocks the loop for a while is answered, not rejected."""
-    rejected: list[BaseException] = []
-    asked: list[int] = []
-
-    class Slow:
-        def decide(self, view: zmux.helpers.PoolView) -> zmux.helpers.PoolDecision:
-            if not asked:
-                time.sleep(0.4)
-            asked.append(threading.get_ident())
-            return zmux.helpers.PoolDecision(count=2, recheck=0.05)
-
-    async with zmux.Listener(config=POOL_CONFIG, listener_config=LISTENER) as listener:
-        addr = await listener.serve_tcp("127.0.0.1", 0)
-
-        async def dial() -> zmux.PipeIo:
-            return await zmux.dial_tcp(*addr)
-
-        async with await zmux.connect_tcp(*addr, config=POOL_CONFIG) as session:
-            first = session.pipes()[0].id
-            pool = zmux.helpers.PipePool(
-                1, dial, policy=Slow(), decision_rejected=rejected.append
-            )
-            handle = session.maintain_pipes(pool)
-            await until(
-                lambda: len([s for s in session.pipe_stats() if s.pipe != first]) >= 2,
-                10,
-            )
-            assert not rejected
-            assert set(asked) == {threading.get_ident()}
-            handle.stop()
-            await until(lambda: handle.finished)
-
-
-async def test_stuck_policies_hold_no_thread_and_stop_ends_the_wait() -> None:
-    """A `decide` that never returns waits on its own pool's task: pools
-    beyond the policy executor's threads, all stuck, leave another pool's
-    policy answered, and stopping a pool cancels the call it waits for."""
-    stuck = 6
-    asked: list[int] = []
-    cancelled: list[int] = []
-
-    class Stuck:
-        def __init__(self, n: int) -> None:
-            self.n = n
-
-        async def decide(
-            self, view: zmux.helpers.PoolView
-        ) -> zmux.helpers.PoolDecision:
-            asked.append(self.n)
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                cancelled.append(self.n)
-                raise
-            raise AssertionError("unreachable")
-
-    async with contextlib.AsyncExitStack() as stack:
-        listener = await stack.enter_async_context(
-            zmux.Listener(config=POOL_CONFIG, listener_config=LISTENER)
-        )
-        addr = await listener.serve_tcp("127.0.0.1", 0)
-
-        async def dial() -> zmux.PipeIo:
-            return await zmux.dial_tcp(*addr)
-
-        handles = []
-        for n in range(stuck):
-            session = await stack.enter_async_context(
-                await zmux.connect_tcp(*addr, config=POOL_CONFIG)
-            )
-            pool = zmux.helpers.PipePool(1, dial, policy=Stuck(n))
-            handles.append(session.maintain_pipes(pool))
-        await until(lambda: len(asked) == stuck, 10)
-
-        # Another pool, on the policy executor's side, is still answered.
-        other = await stack.enter_async_context(
-            await zmux.connect_tcp(*addr, config=POOL_CONFIG)
-        )
-        first = other.pipes()[0].id
-        pool = zmux.helpers.PipePool(
-            1, dial, policy=zmux.helpers.MachinePoolPolicy({"count": 2})
-        )
-        handle = other.maintain_pipes(pool)
-
-        def extra() -> bool:
-            return len([p for p in other.pipe_stats() if p.pipe != first]) >= 2
-
-        await until(extra, 10)
-        handle.stop()
-
-        # Stopping a pool ends its wait: the call on the loop is cancelled.
-        for h in handles:
-            h.stop()
-        await until(lambda: sorted(cancelled) == list(range(stuck)), 10)
-        for h in [handle, *handles]:
-            async with asyncio.timeout(10):
-                while not h.finished:
-                    await asyncio.sleep(0.005)
-
-
 # ---- the tracer backlog ------------------------------------------------------------------------
 
 
@@ -667,6 +540,7 @@ async def test_a_blocked_loop_costs_a_session_its_newest_events_and_never_the_en
     that arrive are counted in the session's own `dropped`, told before the
     next event delivered, and `established` and `closed` still come."""
     seen: list[tuple[str, int, int]] = []
+    notifications = CallbackSignal()
     logged: list[str] = []
     changes = 300
     entered = threading.Event()
@@ -679,10 +553,12 @@ async def test_a_blocked_loop_costs_a_session_its_newest_events_and_never_the_en
     class Trace(zmux.Tracer):
         def established(self, session: zmux.SessionId) -> None:
             seen.append(("established", session, 0))
+            notifications.notify()
 
         def event(self, session: zmux.SessionId, event: zmux.Event) -> None:
             if isinstance(event, zmux.PipePriorityChanged):
                 seen.append(("change", session, 0))
+                notifications.notify()
                 if not entered.is_set():
                     # Delivery stands in this call, on the loop, until the
                     # test opens the gate.
@@ -690,15 +566,20 @@ async def test_a_blocked_loop_costs_a_session_its_newest_events_and_never_the_en
                     assert gate.wait(30)
             else:
                 seen.append(("event", session, 0))
+                notifications.notify()
 
         def dropped(self, session: zmux.SessionId, count: int) -> None:
             seen.append(("dropped", session, count))
+            notifications.notify()
 
         def closed(self, session: zmux.SessionId, reason: BaseException) -> None:
             seen.append(("closed", session, 0))
+            notifications.notify()
 
     config = zmux.Config(
-        max_pipes=8,
+        session_policy=zmux.SessionPolicy(
+            limits=zmux.CapacityLimits(steady_attachments=8)
+        ),
         pipe_auth=zmux.PipeAuth.psk(b"k" * 32).with_end_to_end(),
         tracer=Trace(),
         logger=Log(__name__),
@@ -709,7 +590,7 @@ async def test_a_blocked_loop_costs_a_session_its_newest_events_and_never_the_en
         server = await listener.accept()
         pipe = await client.add_pipe(await zmux.dial_tcp(*addr))
         await pipe.wait_attached()
-        await until(lambda: ("established", client.id, 0) in seen)
+        await until(notifications, lambda: ("established", client.id, 0) in seen)
 
         def produce() -> None:
             # The first change reaches the tracer, which holds delivery in its
@@ -730,18 +611,20 @@ async def test_a_blocked_loop_costs_a_session_its_newest_events_and_never_the_en
         kept = 1 + 256
         # The next event accepted is told after the count of what was lost.
         pipe.update(send_priority=9)
-        await until(lambda: any(k == "dropped" for k, _, _ in seen))
+        await until(notifications, lambda: any(k == "dropped" for k, _, _ in seen))
         at = next(i for i, (k, _, _) in enumerate(seen) if k == "dropped")
         told = [k for k, _, _ in seen[:at]].count("change")
         assert seen[at][1] == client.id
         assert told <= kept
         assert seen[at][2] >= changes - told
-        await until(lambda: any(k == "change" for k, _, _ in seen[at + 1 :]))
+        await until(
+            notifications, lambda: any(k == "change" for k, _, _ in seen[at + 1 :])
+        )
         assert [k for k, _, _ in seen].count("dropped") == 1
         # The lost events are the tracer's: the logger is told nothing of them.
         assert not any("dropped" in m for m in logged)
         server.close()
-        await until(lambda: ("closed", client.id, 0) in seen)
+        await until(notifications, lambda: ("closed", client.id, 0) in seen)
         # `closed` is the last call.
         assert seen[-1] == ("closed", client.id, 0)
         assert [k for k, _, _ in seen].count("closed") == 1
@@ -766,16 +649,30 @@ async def test_an_out_of_range_integer_argument_is_value_error() -> None:
             send.priority = (-1, False)
 
 
-def test_a_quality_band_and_a_pool_decision_are_checked_by_the_core() -> None:
+@pytest.mark.parametrize("lanes", [-1, 2**32])
+@pytest.mark.parametrize(
+    "bind",
+    [
+        lambda lanes: zmux.Candidate.http3(f"https://{LOOPBACK}", lanes=lanes),
+        lambda lanes: zmux.dial_quic(LOOPBACK, 0, lanes=lanes),
+        lambda lanes: zmux.dial_http3(f"https://{LOOPBACK}", lanes=lanes),
+        lambda lanes: zmux.dial_webtransport(f"https://{LOOPBACK}", lanes=lanes),
+    ],
+    ids=["http3_candidate", "quic_dial", "http3_dial", "webtransport_dial"],
+)
+def test_out_of_range_lanes_is_value_error(
+    bind: Callable[[int], object], lanes: int
+) -> None:
+    with pytest.raises(ValueError):
+        bind(lanes)
+
+
+def test_a_quality_band_is_checked_by_the_core() -> None:
     for bad in (0.0, -1.0, 1e-10, math.nan):
         with pytest.raises(ValueError):
             zmux.QualityBand(rtt=bad)
     with pytest.raises(ValueError):
         zmux.QualityBand()
-    for bad_count in (True, False, 0, -1, 1.5, "2"):
-        with pytest.raises(ValueError):
-            zmux.helpers.PoolDecision(count=bad_count)  # type: ignore[arg-type]
-    assert zmux.helpers.PoolDecision(count=2).count == 2
 
 
 async def test_a_stream_datagram_takes_any_buffer() -> None:

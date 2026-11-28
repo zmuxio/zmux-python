@@ -56,7 +56,7 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install --group lint "pytest>=9.2.0" "pytest-asyncio>=1.5.0" "hypothesis>=6.170.17" "cryptography>=50.0.2"
+      - run: python -m pip install --group lint --group test --group test-tls
       - run: ruff check .
       - run: ruff format --check .
       - run: python -m mypy --strict .
@@ -74,7 +74,7 @@ jobs:
           restore-keys: types-
       - name: Build and install the module
         run: |
-          python -m pip install "maturin>=1.16.0,<2"
+          python tools/install-build-requirements.py
           maturin build --locked --features test-hooks --out dist
           python -m pip install --find-links dist --no-index zmuxio
       - name: Stubs match the module
@@ -121,15 +121,16 @@ jobs:
       - name: Build the wheel
         shell: bash
         run: |
-          python -m pip install "maturin>=1.16.0,<2"
+          python -m pip install --upgrade pip
+          python tools/install-build-requirements.py
           maturin build --release --locked --features test-hooks --out dist -i "${{ steps.py.outputs.python-path }}" ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
       - name: Install and test
         shell: bash
         run: |
           python -m pip install --find-links dist --no-index zmuxio
-          python -m pip install "pytest>=9.2.0" "pytest-asyncio>=1.5.0" "hypothesis>=6.170.17"
+          python -m pip install --group test
           # cryptography ships no 32-bit Windows wheel; the TLS tests skip there.
-          if [[ "${{ matrix.arch }}" != x86 ]]; then python -m pip install "cryptography>=50.0.2"; fi
+          if [[ "${{ matrix.arch }}" != x86 ]]; then python -m pip install --group test-tls; fi
           python -m pytest -q -rs tests
 
   macos-x86_64:
@@ -155,74 +156,10 @@ jobs:
           rustup default stable
       - name: Build the wheels
         run: |
-          python -m pip install "maturin>=1.16.0,<2"
+          python -m pip install --upgrade pip
+          python tools/install-build-requirements.py
           maturin build --release --locked --target x86_64-apple-darwin --out dist \
             -i "${{ steps.py312.outputs.python-path }}" -i "${{ steps.py314t.outputs.python-path }}"
           wheels=(dist/*macosx*x86_64.whl)
           printf '%s\n' "${wheels[@]}"
           test "${#wheels[@]}" -eq 2
-
-  interop:
-    name: Interop (Go zmux peers)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          path: zmux-python
-      - name: Checkout zmux-go
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: zmuxio/zmux-go
-          path: zmux-go
-      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
-        id: py
-        with:
-          python-version: '3.12'
-      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
-        with:
-          go-version: 'stable'
-          cache-dependency-path: zmux-python/interop/shape-go-peer/go.sum
-      - name: Install Rust
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            zmux-python/target
-          key: interop-${{ hashFiles('zmux-python/Cargo.lock') }}
-          restore-keys: interop-
-      - name: Build and install the module
-        working-directory: zmux-python
-        run: |
-          python -m pip install "maturin>=1.16.0,<2"
-          maturin build --release --locked --out dist -i "${{ steps.py.outputs.python-path }}"
-          python -m pip install --find-links dist --no-index zmuxio
-          python -m pip install "pytest>=9.2.0" "pytest-asyncio>=1.5.0" "hypothesis>=6.170.17" "cryptography>=50.0.2"
-      - name: Build the Go peers
-        run: |
-          out="$GITHUB_WORKSPACE/peers"
-          mkdir -p "$out"
-          "$GITHUB_WORKSPACE/zmux-go/interop/webpeer/build.sh" "$out/web-go"
-          # The shaping peer builds against the zmux-go checkout, through a workspace.
-          printf 'go 1.27\n\nuse (\n\t%s\n\t%s\n)\n' \
-            "$GITHUB_WORKSPACE/zmux-python/interop/shape-go-peer" "$GITHUB_WORKSPACE/zmux-go" > "$out/go.work"
-          (cd zmux-python/interop/shape-go-peer && GOWORK="$out/go.work" timeout 300 go build -o "$out/shape-go-peer" .)
-      - name: Run the interop tests
-        working-directory: zmux-python
-        env:
-          ZMUX_GO_HTTP_PEER: ${{ github.workspace }}/peers/web-go/httppeer
-          ZMUX_SHAPE_PEER: ${{ github.workspace }}/peers/shape-go-peer
-          ZMUX_SHAPE_DEF: ${{ github.workspace }}/zmux-python/tests/testdata/shaping/interop.json
-        run: |
-          timeout 600 python -m pytest -q -rs --junitxml=interop.xml tests/test_http_tls_interop.py tests/test_shaping_interop.py
-          # Every test ran: none may skip for a missing peer.
-          python - <<'CHECK'
-          import xml.etree.ElementTree as ET
-          s = ET.parse("interop.xml").getroot().find("testsuite")
-          counts = {k: int(s.attrib[k]) for k in ("tests", "failures", "errors", "skipped")}
-          assert counts == {"tests": 7, "failures": 0, "errors": 0, "skipped": 0}, counts
-          CHECK

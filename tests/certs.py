@@ -7,6 +7,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
+from support import LOOPBACK
 
 
 def self_signed() -> tuple[bytes, bytes]:
@@ -25,7 +26,10 @@ def self_signed() -> tuple[bytes, bytes]:
         .not_valid_before(now - datetime.timedelta(hours=1))
         .not_valid_after(now + datetime.timedelta(days=1))
         .add_extension(
-            x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False
+            x509.SubjectAlternativeName(
+                [x509.DNSName("localhost"), x509.IPAddress(LOOPBACK)]
+            ),
+            critical=False,
         )
         .sign(key, hashes.SHA256())
     )

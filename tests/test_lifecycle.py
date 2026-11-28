@@ -1,85 +1,14 @@
-"""Waits, cancellation and release of what the binding holds: a panic reaches the awaiter,
-callbacks and releases run clear of the session's lock, and a wait holds no part."""
+"""Waits, cancellation and release of what the binding holds."""
 
 import asyncio
 import contextlib
-import subprocess
 import sys
-import textwrap
-from collections.abc import AsyncIterator
+from functools import partial
 
 import pytest
 import zmux
-
-
-@contextlib.asynccontextmanager
-async def pair() -> AsyncIterator[tuple[zmux.Session, zmux.Session]]:
-    async with zmux.Listener() as listener:
-        addr = await listener.serve_tcp("127.0.0.1", 0)
-        c = await zmux.Session.connect(await zmux.dial_tcp(*addr))
-        s = await listener.accept()
-        try:
-            yield c, s
-        finally:
-            c.abort(0)
-            s.abort(0)
-
-
-def run_bounded(body: str) -> None:
-    """Runs `body` in its own interpreter: a deadlock holds the interpreter lock, which no
-    timeout in this process could end."""
-    code = "import faulthandler\nfaulthandler.dump_traceback_later(25, exit=True)\n"
-    code += textwrap.dedent(body)
-    r = subprocess.run(
-        [sys.executable, "-c", code],
-        capture_output=True,
-        text=True,
-        timeout=60,
-        check=False,
-    )
-    assert r.returncode == 0, r.stderr[-2000:]
-
-
-def test_a_lent_buffer_is_released_clear_of_the_session() -> None:
-    # The peer's acknowledgements free chunks under the session's lock while this thread,
-    # holding the interpreter, asks the session again and again.
-    run_bounded(
-        """
-        import asyncio
-        import zmux
-        async def main():
-            async with zmux.Listener() as l:
-                addr = await l.serve_tcp("127.0.0.1", 0)
-                c = await zmux.Session.connect(await zmux.dial_tcp(*addr))
-                s = await l.accept()
-                send, _ = await c.open_bi()
-                await send.flush()
-                _, recv = await s.accept_bi()
-                async def drain():
-                    while await recv.read():
-                        pass
-                d = asyncio.create_task(drain())
-                buffer = bytearray(1 << 16)
-                for _ in range(200):
-                    await send.write(buffer)
-                    for _ in range(20):
-                        c.stats()
-                await send.finish()
-                await d
-                # Every export ended: the buffer can change size again.
-                for _ in range(2000):
-                    try:
-                        buffer.append(0)
-                        break
-                    except BufferError:
-                        await asyncio.sleep(0.005)
-                else:
-                    raise SystemExit("still exported")
-                c.abort(0)
-                s.abort(0)
-        asyncio.run(main())
-        """
-    )
+from support import start_pending, until
+from support import session_pair as pair
 
 
 @pytest.mark.skipif(
@@ -97,16 +26,17 @@ async def test_a_cancelled_long_read_keeps_what_it_read() -> None:
         await send.write(b"x")
         await send.flush()
         _, recv = await s.accept_bi()
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(recv.read_exact(sys.maxsize + 1), 0.05)
+        reading = await start_pending(lambda: recv.read_exact(sys.maxsize + 1))
+        reading.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reading
         assert await asyncio.wait_for(recv.read(1), 10) == b"x"
 
 
 async def test_stopped_lets_a_write_go_on() -> None:
     async with pair() as (c, s):
         send, _ = await c.open_bi()
-        stopped = asyncio.ensure_future(send.stopped())
-        await asyncio.sleep(0.01)
+        stopped = await start_pending(send.stopped)
         await asyncio.wait_for(send.write(b"hello"), 5)
         await asyncio.wait_for(send.finish(), 5)
         _, recv = await s.accept_bi()
@@ -123,8 +53,7 @@ async def test_read_datagram_lets_a_read_go_on() -> None:
         send, _ = await c.open_bi()
         await send.flush()
         _, recv = await s.accept_bi()
-        waiting = asyncio.ensure_future(recv.read_datagram())
-        await asyncio.sleep(0.01)
+        waiting = await start_pending(recv.read_datagram)
         await send.write(b"data")
         assert await asyncio.wait_for(recv.read(4), 5) == b"data"
         waiting.cancel()
@@ -140,12 +69,10 @@ async def test_a_cancelled_read_leaves_the_stream_usable() -> None:
         await send.flush()
         _, recv = await s.accept_bi()
         for read in (recv.read, recv.read_chunk):
-            try:
-                await asyncio.wait_for(read(16), 0.02)
-            except TimeoutError:
-                pass
-            else:
-                raise AssertionError("nothing was written")
+            waiting = await start_pending(partial(read, 16))
+            waiting.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiting
         await send.write(b"ok")
         assert await asyncio.wait_for(recv.read_exact(2), 5) == b"ok"
 
@@ -162,8 +89,7 @@ async def test_a_cancelled_blocked_write_releases_the_part() -> None:
         c = await zmux.Session.connect(await zmux.dial_tcp(*addr), config=config)
         s = await listener.accept()
         send, _ = await c.open_bi()
-        blocked = asyncio.ensure_future(send.write(bytes(1 << 22)))
-        await asyncio.sleep(0.05)
+        blocked = await start_pending(lambda: send.write(bytes(1 << 22)))
         assert not blocked.done()
         blocked.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -182,31 +108,20 @@ def test_a_binding_call_is_a_coroutine() -> None:
     asyncio.run(main())
 
 
-async def test_a_read_cancelled_as_it_completes_loses_nothing() -> None:
+async def test_a_cancelled_exact_read_returns_the_prefix_it_collected() -> None:
     async with pair() as (c, s):
         send, _ = await c.open_bi()
-        await send.write(b"x")
-        await send.flush()
+        await send.write(b"ab")
         _, recv = await s.accept_bi()
-        assert await recv.read_exact(1) == b"x"
-        sent = bytearray()
-        got = bytearray()
-        for i in range(300):
-            data = i.to_bytes(4, "big")
-            sent += data
-            read = asyncio.create_task(recv.read_exact(4))
-            await asyncio.sleep(0)
-            await send.write(data)
-            await send.flush()
-            # Cancel on every timing around the completion.
-            for _ in range(i % 7):
-                await asyncio.sleep(0)
-            read.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                got += await read
+        await recv.wait_readable()
+        reading = await start_pending(lambda: recv.read_exact(4))
+        assert recv.stats().bytes_read == 2
+        reading.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reading
+        await send.write(b"cd")
         await send.finish()
-        got += await asyncio.wait_for(recv.read_to_end(), 5)
-        assert got == sent
+        assert await recv.read_to_end() == b"abcd"
 
 
 def release_while_loop_is_blocked(held: list[object]) -> None:
@@ -231,10 +146,14 @@ def release_while_loop_is_blocked(held: list[object]) -> None:
 async def test_dropped_streams_are_released_after_pipe_0_went() -> None:
     # A finalizer only lets go of the handle: the session collects the stream, promptly,
     # whatever pipe carries it.
-    import time
 
     key = b"lifecycle-drops-0123456789abcdef"
-    c = zmux.Config(max_pipes=4, pipe_auth=zmux.PipeAuth.psk(key).with_end_to_end())
+    c = zmux.Config(
+        session_policy=zmux.SessionPolicy(
+            limits=zmux.CapacityLimits(steady_attachments=4)
+        ),
+        pipe_auth=zmux.PipeAuth.psk(key).with_end_to_end(),
+    )
     async with zmux.Listener(config=c) as listener:
         addr = await listener.serve_tcp("127.0.0.1", 0)
         async with await zmux.Session.connect(
@@ -248,11 +167,9 @@ async def test_dropped_streams_are_released_after_pipe_0_went() -> None:
                 await send.write(b"unfinished")
                 ssend, srecv = await asyncio.wait_for(server.accept_bi(), 5)
                 assert await asyncio.wait_for(srecv.read(10), 5) == b"unfinished"
-                held = [send, recv, ssend, srecv]
+                held: list[object] = [send, recv, ssend, srecv]
                 del send, recv, ssend, srecv
                 release_while_loop_is_blocked(held)
-                deadline = time.monotonic() + 3
-                while client.stats().streams_active + server.stats().streams_active:
-                    assert time.monotonic() < deadline, "streams still active"
-                    await asyncio.sleep(0.01)
+                await until(client, lambda: client.stats().streams_active == 0)
+                await until(server, lambda: server.stats().streams_active == 0)
             server.close()

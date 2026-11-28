@@ -42,6 +42,3 @@ zmux\._types\.Inherit
 zmux\._types\.Staged
 zmux\._types\.PipeId
 zmux\._types\.SessionId
-
-# The default of a field of the NewType PipeId is a plain int at runtime.
-zmux\._types\.PoolMember\.__init__

@@ -6,19 +6,26 @@ from __future__ import annotations
 
 import asyncio
 import builtins
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
-    from ._types import CandidateResult, ErrorKind
+    from ._types import CandidateResult, DatagramDrop, ErrorKind
 
 __all__ = [
     "ApplicationClosedError",
-    "CarrierChoiceError",
+    "BootstrapError",
+    "CapacityChangeError",
+    "CarrierCacheError",
+    "CarrierCacheFormatError",
+    "CarrierCacheValueError",
+    "CarrierCacheVersionError",
     "ConnectError",
     "ConnectionRefusedError",
     "CredentialsFailedError",
     "DatagramBlockedError",
+    "DatagramDroppedError",
     "DatagramError",
+    "DatagramTooLargeError",
     "DeadlineExceededError",
     "DuplicateUndecidedError",
     "EarlyDataRejectedError",
@@ -35,6 +42,7 @@ __all__ = [
     "LimitExceededError",
     "ListenerClosedError",
     "MalformedPacketError",
+    "MemoryBudgetError",
     "NoExporterError",
     "NoReplyError",
     "NoRunningLoopError",
@@ -52,6 +60,9 @@ __all__ = [
     "ResumeTimeoutError",
     "SecureCarrierError",
     "SessionClosedError",
+    "SessionControllerError",
+    "SessionPolicyError",
+    "SpliceCommandError",
     "StreamBusyError",
     "StreamClosedError",
     "StreamError",
@@ -80,6 +91,35 @@ class ZmuxError(Exception):
 class InvalidArgumentError(ZmuxError, ValueError):
     """A value the caller passed cannot be used: an invalid configuration or
     option, an oversized or malformed preamble."""
+
+
+class SpliceCommandError(ZmuxError, ValueError):
+    """A splice direction refused a control command."""
+
+    reason: Literal[
+        "closed",
+        "invalid_parameter",
+        "splice_budget",
+        "paused",
+        "cancelled",
+        "stale_pause",
+    ]
+    """Why the direction refused the command."""
+
+    def __init__(
+        self,
+        reason: Literal[
+            "closed",
+            "invalid_parameter",
+            "splice_budget",
+            "paused",
+            "cancelled",
+            "stale_pause",
+        ],
+        message: str,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class DeadlineExceededError(ZmuxError, TimeoutError):
@@ -164,6 +204,10 @@ class ResumeFailedError(SessionClosedError):
 
 class StreamError(ZmuxError):
     """A stream operation failed."""
+
+
+class BorrowLimitError(StreamError):
+    """The session cannot lend another receive chunk. A copying read can still consume it."""
 
 
 class StreamResetError(StreamError, ConnectionError):
@@ -256,6 +300,24 @@ class DatagramError(ZmuxError):
     """Sending a datagram failed."""
 
 
+class DatagramDroppedError(DatagramError):
+    """The sender dropped an original datagram."""
+
+    reason: DatagramDrop | str
+    """Why the sender dropped the datagram."""
+
+
+class MemoryBudgetError(ZmuxError, MemoryError):
+    """The configured memory budget could not reserve the operation's backing."""
+
+
+class DatagramTooLargeError(DatagramError, ValueError):
+    """The payload exceeds the negotiated datagram bound."""
+
+    max: int
+    """Maximum application payload in bytes for this send."""
+
+
 class DatagramBlockedError(DatagramError):
     """The stream has no identifier yet and the peer's stream limit allows
     none now: its datagram was refused and the stream stays unopened. A
@@ -334,7 +396,35 @@ class VerifyUnavailableError(ZmuxError):
     """A verifier or gate could not decide now, no fault of the peer."""
 
 
-class CarrierChoiceError(ZmuxError):
+class SessionControllerError(ZmuxError):
+    """The session controller could not apply an operation."""
+
+
+class SessionPolicyError(ZmuxError):
+    """The session's capacity or Join authorization policy could not be updated."""
+
+
+class CapacityChangeError(PipeError):
+    """A capacity transaction could not advance."""
+
+
+class CarrierCacheError(ValueError):
+    """A history snapshot or carrier observation could not be applied."""
+
+
+class CarrierCacheVersionError(CarrierCacheError):
+    """The snapshot uses an unsupported schema version."""
+
+
+class CarrierCacheFormatError(CarrierCacheError):
+    """The snapshot has malformed JSON or mismatched field types."""
+
+
+class CarrierCacheValueError(CarrierCacheError):
+    """The snapshot or sequenced observation contains an invalid value."""
+
+
+class BootstrapError(SessionControllerError):
     """No candidate of a carrier choice was usable: `results` lists every
     try in order."""
 

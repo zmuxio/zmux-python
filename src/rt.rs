@@ -18,9 +18,10 @@
 use std::cell::RefCell;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock, mpsc};
-use std::task::Poll;
+use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock, Weak, mpsc};
+use std::task::{Context, Poll, Waker};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -753,12 +754,111 @@ async def drive(start, undo):
     finally:
         release()
 
+async def drive_on_loop(operation, loop, context):
+    try:
+        if asyncio.get_running_loop() is not loop:
+            raise RuntimeError('the operation must run on the event loop that created it')
+        while True:
+            waiter = loop.create_future()
+            result = context.run(operation, waiter)
+            if result is not None:
+                return result[0]
+            await waiter
+    finally:
+        operation.close()
+
 drive.setup_future = SetupFuture
+drive.on_loop = drive_on_loop
 ";
             let m = PyModule::from_code(py, code, c"zmux_drive", c"zmux_drive")?;
             Ok::<_, PyErr>(m.getattr("drive")?.unbind())
         })
         .map(|f| f.bind(py))
+}
+
+type LoopOperation = Pin<Box<dyn Future<Output = PyResult<Deferred>> + Send>>;
+
+/// Polls a Rust operation on asyncio when its synchronous callbacks must
+/// run there. Tokio still drives the underlying I/O and timers.
+#[pyclass(frozen)]
+struct PollOnLoop {
+    future: StdMutex<Option<LoopOperation>>,
+    queue: Arc<Queue>,
+    runtime: tokio::runtime::Handle,
+}
+
+struct LoopWake(Weak<Queue>, StdMutex<Option<Py<PyAny>>>);
+
+impl std::task::Wake for LoopWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let waiter = lock(&self.1).take();
+        if let (Some(queue), Some(waiter)) = (self.0.upgrade(), waiter) {
+            queue.push(Box::new(move |py| {
+                let waiter = waiter.bind(py);
+                let r = (|| {
+                    if !waiter.call_method0(intern!(py, "done"))?.is_truthy()? {
+                        waiter.call_method1(intern!(py, "set_result"), (py.None(),))?;
+                    }
+                    Ok::<_, PyErr>(())
+                })();
+                if let Err(e) = r {
+                    e.write_unraisable(py, Some(waiter));
+                }
+            }));
+        }
+    }
+}
+
+#[pymethods]
+impl PollOnLoop {
+    fn __call__(&self, py: Python<'_>, waiter: Py<PyAny>) -> PyResult<Option<(Py<PyAny>,)>> {
+        let mut future = lock(&self.future)
+            .take()
+            .ok_or_else(|| PyRuntimeError::new_err("the operation already ended"))?;
+        let awakened = Arc::new(LoopWake(
+            Arc::downgrade(&self.queue),
+            StdMutex::new(Some(waiter)),
+        ));
+        let waker = Waker::from(awakened.clone());
+        let _runtime = self.runtime.enter();
+        match future.as_mut().poll(&mut Context::from_waker(&waker)) {
+            Poll::Pending => {
+                *lock(&self.future) = Some(future);
+                Ok(None)
+            }
+            Poll::Ready(result) => {
+                lock(&awakened.1).take();
+                Ok(Some((result?.0(py)?,)))
+            }
+        }
+    }
+
+    fn close(&self) {
+        let future = lock(&self.future).take();
+        drop(future);
+    }
+}
+
+/// Runs `future` on the caller's current loop and context. The coroutine
+/// drops the Rust operation synchronously on cancellation.
+pub(crate) fn future_on_loop(
+    py: Python<'_>,
+    future: impl Future<Output = PyResult<Deferred>> + Send + 'static,
+) -> PyResult<Bound<'_, PyAny>> {
+    let lp = running_loop(py)?;
+    let context = py.import("contextvars")?.call_method0("copy_context")?;
+    let operation = PollOnLoop {
+        future: StdMutex::new(Some(Box::pin(caught(future)))),
+        queue: queue_of(&lp)?,
+        runtime: runtime()?.handle().clone(),
+    };
+    drive(py)?
+        .getattr("on_loop")?
+        .call1((operation, lp, context))
 }
 
 /// A coroutine that runs `fut` on the runtime once awaited. Cancelling it drops `fut`, and
@@ -769,6 +869,17 @@ where
     T: for<'py> IntoPyObject<'py> + Send + 'static,
 {
     undoable_future_into_py(py, async move { fut.await.map(|v| (v, ())) }, None)
+}
+
+/// Exposes an infallible native wait as a Python awaitable returning `None`.
+pub(crate) fn unit_future_into_py(
+    py: Python<'_>,
+    fut: impl Future<Output = ()> + Send + 'static,
+) -> PyResult<Bound<'_, PyAny>> {
+    future_into_py(py, async move {
+        fut.await;
+        Ok(())
+    })
 }
 
 /// [`future_into_py`], where `undo` takes back a result no awaiter will see. The future also
@@ -788,47 +899,19 @@ where
 
 #[pyclass(frozen)]
 struct Withdraw {
-    gate: Withdrawal,
+    gate: zmux::adapter::SetupCancellation,
     waiter: OnCancel,
 }
 
 #[pymethods]
 impl Withdraw {
-    fn __call__(&self, error: Bound<'_, PyBaseException>) -> bool {
-        let won = match &self.gate {
-            Withdrawal::Setup(gate) => gate.cancel(),
-            Withdrawal::Join(receipt) => receipt.cancel(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                PyErr::from_value(error.into_any()),
-            )),
-        };
+    fn __call__(&self, _error: Bound<'_, PyBaseException>) -> bool {
+        let won = self.gate.cancel();
         if won {
             self.waiter.signal();
         }
         won
     }
-}
-
-enum Withdrawal {
-    Setup(zmux::adapter::SetupCancellation),
-    Join(zmux::adapter::JoinCancellation),
-}
-
-pub(crate) fn join_future_into_py<F, T>(
-    py: Python<'_>,
-    fut: F,
-    receipt: zmux::adapter::JoinCancellation,
-) -> PyResult<Bound<'_, PyAny>>
-where
-    F: Future<Output = PyResult<T>> + Send + 'static,
-    T: for<'py> IntoPyObject<'py> + Send + 'static,
-{
-    operation(
-        py,
-        async move { fut.await.map(|v| (v, ())) },
-        None,
-        Some(Withdrawal::Join(receipt)),
-    )
 }
 
 pub(crate) fn setup_future_into_py<F>(
@@ -843,7 +926,7 @@ where
         py,
         async move { fut.await.map(|()| ((), ())) },
         None,
-        Some(Withdrawal::Setup(withdrawal)),
+        Some(withdrawal),
     )
 }
 
@@ -851,7 +934,7 @@ fn operation<F, T, G>(
     py: Python<'_>,
     fut: F,
     undo: Option<Py<PyAny>>,
-    withdrawal: Option<Withdrawal>,
+    withdrawal: Option<zmux::adapter::SetupCancellation>,
 ) -> PyResult<Bound<'_, PyAny>>
 where
     F: Future<Output = PyResult<(T, G)>> + Send + 'static,
@@ -863,13 +946,53 @@ where
     drive(py)?.call1((Begin(StdMutex::new(Some(start))), undo))
 }
 
+/// A test can hold the completion before asyncio sees it, even while
+/// another operation on the same loop starts or finishes.
+#[cfg(feature = "test-hooks")]
+#[pyclass(frozen)]
+struct TestCompletion(StdMutex<Option<Job>>);
+
+#[cfg(feature = "test-hooks")]
+#[pymethods]
+impl TestCompletion {
+    fn __call__(&self, py: Python<'_>) {
+        let job = lock(&self.0).take();
+        if let Some(job) = job {
+            job(py);
+        }
+    }
+}
+
+/// Report the first pending poll to a test, on its event loop.
+#[cfg(feature = "test-hooks")]
+async fn track_pending<F: Future>(
+    fut: F,
+    mut pending: Option<(Py<PyAny>, Arc<Queue>)>,
+) -> F::Output {
+    let mut fut = std::pin::pin!(fut);
+    std::future::poll_fn(move |cx| {
+        let polled = fut.as_mut().poll(cx);
+        if polled.is_pending()
+            && let Some((notify, queue)) = pending.take()
+        {
+            queue.push(Box::new(move |py| {
+                if let Err(e) = notify.call0(py) {
+                    e.write_unraisable(py, Some(notify.bind(py)));
+                }
+            }));
+        }
+        polled
+    })
+    .await
+}
+
 /// The asyncio future of `fut`, run on the runtime, on the running event loop.
 /// With the callable that lets go of what the operation held.
 fn start_future<F, T, G>(
     py: Python<'_>,
     fut: F,
     undo: Option<Py<PyAny>>,
-    withdrawal: Option<Withdrawal>,
+    withdrawal: Option<zmux::adapter::SetupCancellation>,
 ) -> PyResult<Py<PyAny>>
 where
     F: Future<Output = PyResult<(T, G)>> + Send + 'static,
@@ -889,6 +1012,19 @@ where
         target.call_method1(intern!(py, "add_done_callback"), (waiter,))?;
         target
     };
+    #[cfg(feature = "test-hooks")]
+    let fut = track_pending(
+        fut,
+        target
+            .getattr("_zmux_test_pending")
+            .ok()
+            .map(|notify| (notify.unbind(), queue.clone())),
+    );
+    #[cfg(feature = "test-hooks")]
+    let hold_completion = target
+        .getattr("_zmux_test_complete")
+        .ok()
+        .map(Bound::unbind);
     let fut_py = target.clone().unbind();
     let held = Held::default();
     let release = Release(held.clone());
@@ -915,12 +1051,23 @@ where
             CANCELLED.notify_all();
         }
         let Ok(r) = r else { return };
-        queue.push(Box::new(move |py| {
+        let finish = move |py: Python<'_>| {
             let fut = fut_py.bind(py);
             if let Err(e) = complete(py, fut, r, undo, &held) {
                 e.write_unraisable(py, Some(fut));
             }
-        }));
+        };
+        #[cfg(feature = "test-hooks")]
+        if let Some(hold) = hold_completion {
+            queue.push(Box::new(move |py| {
+                let completion = TestCompletion(StdMutex::new(Some(Box::new(finish))));
+                if let Err(e) = hold.call1(py, (completion,)) {
+                    e.write_unraisable(py, Some(hold.bind(py)));
+                }
+            }));
+            return;
+        }
+        queue.push(Box::new(finish));
     });
     Ok((target, release).into_pyobject(py)?.into_any().unbind())
 }
@@ -959,6 +1106,16 @@ impl At {
             queue: queue_of(&lp)?,
             context: Arc::new(context.unbind()),
         })
+    }
+
+    fn post(&self, job: Job) {
+        let context = self.context.clone();
+        self.queue.push(Box::new(move |py| {
+            let invoke = Invoke(StdMutex::new(Some(job)));
+            if let Err(e) = context.call_method1(py, intern!(py, "run"), (invoke,)) {
+                e.write_unraisable(py, None);
+            }
+        }));
     }
 }
 
@@ -1106,6 +1263,22 @@ impl LoopRef {
         }
     }
 
+    /// Reports a carrier callback failure on its loop, ignoring cancellation.
+    pub(crate) fn report_callback_error(&self, callback: Arc<Py<PyAny>>, error: PyErr) {
+        self.post(move |py| {
+            if !error.is_instance_of::<pyo3::exceptions::asyncio::CancelledError>(py) {
+                error.write_unraisable(py, Some(callback.bind(py)));
+            }
+        });
+    }
+
+    /// Runs a one-way call in the captured context.
+    pub(crate) fn post_in_context(&self, job: impl for<'py> FnOnce(Python<'py>) + Send + 'static) {
+        if let Some(at) = lock(&self.0.at).clone() {
+            at.post(Box::new(job));
+        }
+    }
+
     /// Calls `f` on the loop, in the context: its result, awaited as a task
     /// when it is awaitable, taken by `out` there. Dropping the future
     /// cancels the task.
@@ -1143,24 +1316,38 @@ impl LoopRef {
         F: for<'py> FnOnce(Python<'py>) -> PyResult<Bound<'py, PyAny>> + Send + 'static,
         S: for<'py> FnOnce(Python<'py>, PyResult<Bound<'py, PyAny>>) -> R + Send + 'static,
     {
+        self.settled_with(f, settle, gone, false)
+    }
+
+    /// Like `settled`, but a result from an already started call still
+    /// reaches `settle` after cancellation. An owned result can refund
+    /// itself when no awaiter takes it.
+    pub(crate) fn settled_with<R, F, S>(
+        &self,
+        f: F,
+        settle: S,
+        gone: fn() -> R,
+        settle_cancelled: bool,
+    ) -> impl Future<Output = R> + Send + 'static + use<R, F, S>
+    where
+        R: Send + 'static,
+        F: for<'py> FnOnce(Python<'py>) -> PyResult<Bound<'py, PyAny>> + Send + 'static,
+        S: for<'py> FnOnce(Python<'py>, PyResult<Bound<'py, PyAny>>) -> R + Send + 'static,
+    {
         let at = self.at();
         let settle: Settle<R> = Box::new(settle);
         async move {
             // Waits for a loop bound later; dropped meanwhile, nothing ran.
-            let At { queue, context } = at.await;
+            let at = at.await;
             let (tx, rx) = oneshot::channel::<R>();
             let state = Arc::new(StdMutex::new(CallState::default()));
             let st = state.clone();
-            queue.push(Box::new(move |py| {
-                let run: Job = Box::new(move |py| start_call(py, f, settle, tx, &st));
-                let invoke = Invoke(StdMutex::new(Some(run)));
-                if let Err(e) = context.call_method1(py, intern!(py, "run"), (invoke,)) {
-                    e.write_unraisable(py, None);
-                }
+            at.post(Box::new(move |py| {
+                start_call(py, f, settle, tx, &st, settle_cancelled);
             }));
             let mut guard = CancelOnDrop {
                 state,
-                queue,
+                queue: at.queue,
                 armed: true,
             };
             let r = rx.await.unwrap_or_else(|_| gone());
@@ -1264,6 +1451,7 @@ fn start_call<R: Send + 'static>(
     settle: Settle<R>,
     tx: oneshot::Sender<R>,
     state: &Arc<StdMutex<CallState>>,
+    settle_cancelled: bool,
 ) {
     if lock(state).dropped {
         return;
@@ -1286,7 +1474,7 @@ fn start_call<R: Send + 'static>(
         move |t: &Bound<'_, PyAny>| {
             // A call the Rust side gave up (and so cancelled) has no
             // outcome to settle.
-            if lock(&st).dropped {
+            if !settle_cancelled && lock(&st).dropped {
                 return;
             }
             let r = t.call_method0(intern!(t.py(), "result"));

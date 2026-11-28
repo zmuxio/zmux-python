@@ -32,7 +32,10 @@ async def test_bound_join_with_go_over_http2_tls() -> None:
             assert ready[0] == b"READY"
             port = int(ready[1].rsplit(b":", 1)[1])
             cfg = zmux.Config(
-                max_pipes=4, pipe_auth=zmux.PipeAuth.psk(b"\x07" * 32).with_end_to_end()
+                session_policy=zmux.SessionPolicy(
+                    limits=zmux.CapacityLimits(steady_attachments=4)
+                ),
+                pipe_auth=zmux.PipeAuth.psk(b"\x07" * 32).with_end_to_end(),
             )
             conn = await zmux.Http2Connection.dial(
                 "127.0.0.1",

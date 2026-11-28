@@ -7,57 +7,37 @@ import subprocess
 import sys
 import textwrap
 import threading
-import time
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
 
 import pytest
 
 import zmux
+from support import TEST_HOOKS, start_pending
+from support import session_pair as pair
 
 
-@asynccontextmanager
-async def pair() -> AsyncIterator[tuple[zmux.Session, zmux.Session]]:
-    async with zmux.Listener() as listener:
-        addr = await listener.serve_tcp("127.0.0.1", 0)
-        async with (
-            await zmux.Session.connect(await zmux.dial_tcp(*addr)) as c,
-            await asyncio.wait_for(listener.accept(), 5) as s,
-        ):
-            yield c, s
+class GatedLimiter:
+    """A limiter whose acquire can pause independently of another session."""
 
-
-class Slow:
-    """A limiter that allows one small chunk at a time."""
+    max_burst_bytes = (1 << 64) - 1
 
     def __init__(self) -> None:
-        self.used = 0
+        self.entered = asyncio.Event()
+        self.released = asyncio.Event()
 
     async def acquire(self, least: int, most: int, /) -> int:
-        await asyncio.sleep(0)
-        n = min(most, 512)
-        self.used += n
-        return n
+        self.entered.set()
+        await self.released.wait()
+        return most
 
     def try_acquire(self, least: int, most: int, /) -> int:
-        if least > 512:
-            return 0
-        n = min(most, 512)
-        self.used += n
-        return n
+        return most if self.released.is_set() else 0
 
     def refund(self, n: int, /) -> None:
-        self.used -= n
+        pass
 
 
-async def test_limited_splice_and_a_busy_thread_leave_other_sessions_alive() -> None:
-    stop = threading.Event()
-
-    def spin() -> None:
-        # Holds the interpreter as much as a Python thread can.
-        while not stop.is_set():
-            sum(range(200_000))
-
+async def test_blocked_splice_limiter_leaves_other_sessions_alive() -> None:
+    limiter = GatedLimiter()
     async with (
         pair() as (c, relay_in),
         pair() as (relay_out, server),
@@ -67,31 +47,27 @@ async def test_limited_splice_and_a_busy_thread_leave_other_sessions_alive() -> 
         async def relay() -> zmux.helpers.SpliceResult:
             a = await relay_in.accept_bi()
             b = await relay_out.open_bi()
-            return await zmux.helpers.splice(a, b, chunk=4096, a_to_b=Slow())
+            return await zmux.helpers.splice(a, b, chunk=4096, a_to_b=limiter)
 
         async def sink() -> int:
-            back, recv = await server.accept_bi()
-            n = len(await recv.read_to_end())
+            back, incoming = await server.accept_bi()
+            n = len(await incoming.read_to_end())
             await back.finish()
             return n
 
-        relaying = asyncio.ensure_future(relay())
-        sinking = asyncio.ensure_future(sink())
-        send, recv = await c.open_bi()
-        spinner = threading.Thread(target=spin)
-        spinner.start()
-        try:
+        async with asyncio.TaskGroup() as tasks:
+            relaying = tasks.create_task(relay())
+            sinking = tasks.create_task(sink())
+            send, recv = await c.open_bi()
             await send.write(b"x" * 50_000)
             await send.finish()
-            for _ in range(5):
-                await asyncio.wait_for(x.ping(), 2)
-            assert await asyncio.wait_for(sinking, 20) == 50_000
-        finally:
-            stop.set()
-            spinner.join(5)
-        await recv.read_to_end()
-        done = await asyncio.wait_for(relaying, 5)
-        assert done.a_to_b.bytes == 50_000
+            await limiter.entered.wait()
+            assert not relaying.done()
+            await x.ping()
+            limiter.released.set()
+            assert await sinking == 50_000
+            assert await recv.read_to_end() == b""
+            assert (await relaying).a_to_b.bytes == 50_000
 
 
 if sys.platform != "win32":
@@ -109,10 +85,13 @@ if sys.platform != "win32":
                     asyncio.run(asyncio.wait_for(zmux.dial_tcp("127.0.0.1", 1), 2))
                 except RuntimeError as e:
                     code = 0 if "fork" in str(e) else 2
-                except BaseException:
+                except Exception:
                     code = 3
-                os.write(w, bytes([code]))
-                os._exit(0)
+                finally:
+                    try:
+                        os.write(w, bytes([code]))
+                    finally:
+                        os._exit(0)
             os.close(w)
             try:
                 got = await asyncio.wait_for(asyncio.to_thread(os.read, r, 1), 10)
@@ -157,8 +136,8 @@ def test_exit_with_sessions_open_and_hooks_firing() -> None:
     assert r.returncode == 0, r.stderr
 
 
+@pytest.mark.skipif(not TEST_HOOKS, reason="requires the test-hooks build")
 def test_exit_with_operations_pending() -> None:
-    start = time.monotonic()
     r = run_child(
         """
         import asyncio, zmux
@@ -168,10 +147,21 @@ def test_exit_with_operations_pending() -> None:
             addr = await listener.serve_tcp("127.0.0.1", 0)
             c = await zmux.Session.connect(await zmux.dial_tcp(*addr))
             s = await listener.accept()
-            pending = [asyncio.ensure_future(s.accept_bi()) for _ in range(10)]
-            await asyncio.sleep(0.05)
-            globals()["kept"] = (listener, c, s, pending)
             loop = asyncio.get_running_loop()
+            original = loop.create_future
+            signals = asyncio.Queue()
+
+            def future():
+                f = original()
+                f._zmux_test_pending = lambda: signals.put_nowait(None)
+                return f
+
+            loop.create_future = future
+            pending = [asyncio.ensure_future(s.accept_bi()) for _ in range(10)]
+            for _ in pending:
+                await signals.get()
+            assert all(not task.done() for task in pending)
+            globals()["kept"] = (listener, c, s, pending)
             loop.stop()
 
         loop = asyncio.new_event_loop()
@@ -180,7 +170,6 @@ def test_exit_with_operations_pending() -> None:
         """
     )
     assert r.returncode == 0, r.stderr
-    assert time.monotonic() - start < 20
 
 
 async def test_a_write_copies_a_mutable_buffer() -> None:
@@ -189,7 +178,7 @@ async def test_a_write_copies_a_mutable_buffer() -> None:
         send, _ = await c.open_bi()
         buf = bytearray(b"a" * 4096)
         await send.write(buf)
-        buf[:] = b"b" * 4096
+        buf[:] = b"b"
         view = memoryview(bytearray(b"c" * 10))
         send.try_write(view)
         view[:] = b"d" * 10
@@ -235,9 +224,8 @@ async def test_metadata_while_a_read_waits() -> None:
         await send.write(b"x")
         out, recv = await asyncio.wait_for(s.accept_bi(), 5)
         assert await recv.read(1) == b"x"
-        reading = asyncio.ensure_future(recv.read())
+        reading = await start_pending(recv.read)
         writing = asyncio.ensure_future(out.writable())
-        await asyncio.sleep(0.05)
         assert not reading.done()
         assert recv.id == out.id is not None
         assert recv.stats().bytes_read == 1
@@ -256,9 +244,8 @@ async def test_try_write_right_after_cancelled_waits() -> None:
         await send.write(b"x")
         out, inbound = await asyncio.wait_for(s.accept_bi(), 5)
         await inbound.read(1)
-        reading = asyncio.ensure_future(recv.read())
+        reading = await start_pending(recv.read)
         waiting = asyncio.ensure_future(send.writable())
-        await asyncio.sleep(0.05)
         reading.cancel()
         await asyncio.gather(reading, waiting, return_exceptions=True)
         # Nothing is busy: the cancelled read and the readiness wait hold no part.

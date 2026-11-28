@@ -5,5 +5,5 @@ __pycache__/
 *.egg-info/
 dist/
 .idea/
-uv.lock
 .hypothesis/
+uv.lock

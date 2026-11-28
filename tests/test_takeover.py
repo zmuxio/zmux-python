@@ -8,19 +8,11 @@ from contextlib import suppress
 
 import pytest
 import zmux
+from support import TEST_HOOKS, WATCHDOG, Tls, manual_clock, start_pending, until
 import zmux._zmux
-from test_smoke import Tls, dial_with, serve_admitted, serve_test_http
+from test_smoke import dial_with, serve_admitted, serve_test_http
 
 HELLO = b"HELO"
-
-
-@pytest.fixture(scope="module")
-def tls() -> Tls:
-    pytest.importorskip("cryptography")  # no 32-bit Windows wheels
-    from certs import self_signed
-
-    cert_pem, key_pem = self_signed()
-    return zmux.TlsConfig(cert=cert_pem, key=key_pem), zmux.TlsConfig(ca=cert_pem)
 
 
 def decide(
@@ -96,10 +88,10 @@ async def test_every_carrier_reaches_the_fallback(carrier: str, tls: Tls) -> Non
         with pytest.raises(TypeError):
             t.into_messages()
         s = t.into_pipe().into_stream()
-        head = await read_exactly(s, 8)
+        request_head = await read_exactly(s, 8)
         await s.write(b"pong")
         await s.shutdown()
-        await served.put((t.value, head, await read_to_end(s)))
+        await served.put((t.value, request_head, await read_to_end(s)))
 
     async def fallback(t: zmux.Takeover) -> None:
         assert listener.stats().admission.takeover == 1
@@ -146,8 +138,8 @@ async def test_a_returned_takeover_is_closed() -> None:
     or detached."""
     kept: asyncio.Future[zmux.Takeover] = asyncio.get_running_loop().create_future()
 
-    def fallback(t: zmux.Takeover) -> None:
-        kept.set_result(t)
+    def fallback(takeover: zmux.Takeover) -> None:
+        kept.set_result(takeover)
 
     async with zmux.Listener(listener_config=config(fallback)) as listener:
         _, port = await listener.serve_tcp("127.0.0.1", 0)
@@ -181,7 +173,6 @@ async def test_a_taken_carrier_is_the_hosts() -> None:
         assert not t.detached and "taken" in repr(t)
 
         async def later() -> None:
-            await asyncio.sleep(0.05)
             await s.write(await read_exactly(s, 4))
             await s.shutdown()
             await done.put(b"")
@@ -269,14 +260,16 @@ async def socket_pair() -> tuple[
 async def test_messages_are_full_duplex(tls: Tls) -> None:
     """A read waiting for a message does not hold back writes from another
     task."""
+    # Check before starting the fallback task so a production build skips cleanly.
+    if not TEST_HOOKS:
+        pytest.skip("requires the test-hooks build")
     server_tls, client_tls = tls
     result: asyncio.Future[bytes | None] = asyncio.get_running_loop().create_future()
     tasks: list[asyncio.Task[None]] = []
 
     async def serve(m: zmux.TakeoverMessages) -> None:
         assert await m.read_message() == HELLO
-        pending = asyncio.create_task(m.read_message())
-        await asyncio.sleep(0.05)
+        pending = await start_pending(m.read_message)
         assert not pending.done()
         # Written while the read waits.
         await asyncio.wait_for(m.write_message(b"one"), 5)
@@ -445,7 +438,7 @@ async def test_takeover_or_deferred_fallback_stalls_without_target(
     server_tls, client_tls = tls
     upgrade = carrier in ("websocket", "webtransport")
 
-    def decide(
+    def classify_stage(
         info: zmux.CarrierInfo, _prefix: bytes
     ) -> zmux.AdmissionVerdict | zmux.Decision:
         if info.stage is zmux.AdmissionStage.HEAD:
@@ -455,25 +448,35 @@ async def test_takeover_or_deferred_fallback_stalls_without_target(
         return verdict().labelled("relay")
 
     cfg = zmux.ListenerConfig(
-        admission=zmux.Admission(decide, peek=0, stall=(0.1, 0.1))
+        admission=zmux.Admission(
+            classify_stage, peek=0, stall=(2 * WATCHDOG, 2 * WATCHDOG)
+        )
     )
-    async with asyncio.timeout(5), zmux.Listener(listener_config=cfg) as listener:
+    async with (
+        asyncio.timeout(WATCHDOG),
+        zmux.Listener(listener_config=cfg) as listener,
+    ):
         addr = await serve_admitted(listener, carrier, server_tls)
         stream = (await dial_with(carrier, addr, client_tls, None)).into_stream()
         if upgrade:
             await stream.write(HELLO)
+        await until(listener, lambda: listener.stats().admission.stalled > 0)
+        if carrier == "webtransport":
+            # The stall owns the whole session, including its other streams.
+            listener.close()
+        else:
+            # The stalled peer drains until EOF. End the request explicitly.
+            with suppress(zmux.ConnectError):
+                await stream.shutdown()
+        if upgrade:
             try:
                 assert await stream.read() == b""
             except zmux.ConnectError:
                 # WebTransport can end by closing the whole session.
                 assert carrier == "webtransport"
         else:
-            try:
-                with pytest.raises(zmux.ConnectError):
-                    await stream.read()
-            finally:
-                with suppress(zmux.ConnectError):
-                    await stream.shutdown()
+            with pytest.raises(zmux.ConnectError):
+                await stream.read()
         counts = listener.stats().admission
         assert (counts.accepted, counts.takeover, counts.fallback, counts.stalled) == (
             0,
@@ -487,39 +490,61 @@ async def test_takeover_or_deferred_fallback_stalls_without_target(
 
 
 @pytest.mark.parametrize("has_target", [False, True])
+@pytest.mark.skipif(not TEST_HOOKS, reason="requires the test-hooks build")
 async def test_longer_prefix_timeout_replays_or_stalls(has_target: bool) -> None:
+    clock = manual_clock()
+    peek_timeout = 7
     seen: asyncio.Queue[bytes] = asyncio.Queue()
     served: asyncio.Queue[bytes] = asyncio.Queue()
+    decide_more = asyncio.Event()
 
-    def decide(info: zmux.CarrierInfo, prefix: bytes) -> zmux.Decision:
+    async def request_more(info: zmux.CarrierInfo, prefix: bytes) -> zmux.Decision:
         seen.put_nowait(prefix)
+        await decide_more.wait()
         return zmux.AdmissionVerdict.more(4).labelled("longer")
 
     def fallback(taken: zmux.Takeover) -> None:
         served.put_nowait(taken.replayed)
 
+    async def handle(owner: zmux.Listener, input_pipe: zmux.PipeIo) -> None:
+        if has_target:
+            await owner.handle_pipe(input_pipe)
+        else:
+            with pytest.raises(zmux.ZmuxError):
+                await owner.handle_pipe(input_pipe)
+
     cfg = zmux.ListenerConfig(
         admission=zmux.Admission(
-            decide,
+            request_more,
             peek=1,
             max_peek=4,
-            peek_timeout=0.3,
+            peek_timeout=peek_timeout,
             stall=(60, 60),
             fallback_on_peek_timeout=True,
         ),
         fallback=fallback if has_target else None,
     )
-    async with asyncio.timeout(5), zmux.Listener(listener_config=cfg) as listener:
+    async with (
+        asyncio.timeout(WATCHDOG),
+        zmux.Listener(
+            config=zmux.Config(clock_domain=clock.domain), listener_config=cfg
+        ) as listener,
+        asyncio.TaskGroup() as tasks,
+    ):
         carrier, peer = zmux.adapter.pipe_pair()
-        handling = asyncio.ensure_future(listener.handle_pipe(carrier))
+        # Buffer both bytes before the initial one-byte peek.
         await peer.write(b"ab")
+        handling = tasks.create_task(handle(listener, carrier))
         assert await seen.get() == b"a"
+        await clock.wait_for_timer(peek_timeout)
+        decide_more.set()
+        # The same deadline bounds both the decision and the longer read.
+        await clock.wait_for_timer(peek_timeout, count=2)
+        clock.advance(peek_timeout)
+        await handling
         if has_target:
-            await handling
             assert await served.get() == b"ab"
         else:
-            with pytest.raises(zmux.ZmuxError):
-                await handling
             # The listener's stall still owns the carrier after setup ended.
             await peer.write(b"x")
             assert served.empty()

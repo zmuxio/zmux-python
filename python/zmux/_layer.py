@@ -9,7 +9,7 @@ from collections.abc import Awaitable, Callable
 from typing import Protocol, cast
 
 from ._errors import ZmuxError
-from ._streams import _start_bridge
+from ._streams import _pump_inbound, _pump_outbound, _start_bridge
 from ._zmux import CarrierStream, PipeIo, _LayerEnd
 
 
@@ -149,6 +149,11 @@ class _CarrierTransport(asyncio.Transport):
     def abort(self) -> None:
         self._lose(None)
 
+    async def release(self) -> None:
+        self.abort()
+        await asyncio.gather(self._reader, self._writer, return_exceptions=True)
+        await self._stream._release()
+
     def _force_close(self, exc: Exception | None) -> None:
         # Called by asyncio's TLS protocol on a fatal error, as on its own
         # transports: the queue is dropped and the protocol told of `exc`.
@@ -233,36 +238,24 @@ async def run(
     reader, writer = _streams(stream, server_side=server_side)
     lower = cast(_CarrierTransport, writer.transport)
 
-    async def release_lower() -> None:
-        lower.abort()
-        await asyncio.gather(lower._reader, lower._writer, return_exceptions=True)
-        await stream._release()
-
     try:
         r2, w2 = await layer(reader, writer)
     except BaseException:
         try:
-            await release_lower()
+            await lower.release()
         finally:
             end._bridge_done()
         raise
 
     # A failure either way ends that way: the carrier sees its end.
-    async def up() -> None:
+    async def up(revoked: asyncio.Event) -> None:
         try:
-            while data := await r2.read(65536):
-                await end.write(data)
+            await _pump_inbound(r2.read, end.write, revoked)
         except (OSError, EOFError, asyncio.IncompleteReadError, RuntimeError):
             pass
         finally:
-            end.close()
-
-    async def down() -> None:
-        while data := await end.read():
-            w2.write(data)
-            await w2.drain()
-        if getattr(w2, "can_write_eof", lambda: False)() and hasattr(w2, "write_eof"):
-            w2.write_eof()
+            if not revoked.is_set():
+                end.close()
 
     async def wait_closed() -> None:
         if wait := getattr(w2, "wait_closed", None):
@@ -276,11 +269,11 @@ async def run(
 
     _start_bridge(
         up,
-        down,
+        lambda revoked: _pump_outbound(end.read, w2, revoked),
         end._released,
         w2.close,
         wait_closed,
         abort,
         end._bridge_done,
-        release_lower,
+        lower.release,
     )

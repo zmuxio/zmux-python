@@ -150,7 +150,8 @@ jobs:
             "${py}" -m venv .venv-test
             if [[ -x .venv-test/bin/python ]]; then vpy=.venv-test/bin/python; else vpy=.venv-test/Scripts/python; fi
             "${vpy}" -m pip install --find-links dist --no-index --only-binary :all: zmuxio
-            "${vpy}" -m pip install "pytest>=9.2.0" "pytest-asyncio>=1.5.0" "hypothesis>=6.170.17" "cryptography>=50.0.2"
+            "${vpy}" -m pip install --upgrade pip
+            "${vpy}" -m pip install --group test --group test-tls
             "${vpy}" -m pytest -q tests
           done
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0

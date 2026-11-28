@@ -21,10 +21,10 @@ classifiers = [
     "Topic :: Internet",
 ]
 
-[project.optional-dependencies]
-test = ["pytest>=9.2.0", "pytest-asyncio>=1.5.0", "hypothesis>=6.170.17", "cryptography>=50.0.2"]
-
 [dependency-groups]
+build = ["maturin>=1.16.0,<2"]
+test = ["pytest>=9.2.0", "pytest-asyncio>=1.5.0", "hypothesis>=6.170.23"]
+test-tls = ["cryptography>=50.0.2"]
 lint = ["mypy>=2.4.1", "ruff==0.17.6"]
 
 [project.urls]

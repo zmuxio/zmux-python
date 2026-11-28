@@ -41,7 +41,7 @@ pub(crate) fn record_mode_obj(py: Python<'_>, m: RecordMode) -> PyResult<Bound<'
 }
 
 fn source_obj(s: Option<SocketAddr>) -> Option<(String, u16)> {
-    s.map(|a| (a.ip().to_string(), a.port()))
+    s.map(crate::host_port)
 }
 
 /// Calls `method` of `target` with the arguments `args` makes, on `lp`'s loop, and
@@ -996,6 +996,7 @@ impl SecureServer {
         app_data: Option<seal::AppDataSource>,
     ) -> PyResult<seal::ServerConfig> {
         let o = seal::ServerOptions {
+            handshake_limits: seal::HandshakeLimits::default(),
             accepted_profiles: self.accepted_profiles.clone(),
             allow_record_mode: check,
             shaper: self.shaper.clone(),
@@ -1065,19 +1066,10 @@ pub(crate) fn on_reject(f: Py<PyAny>, lp: LoopRef) -> zmux::proto::listener::OnR
 /// runtime's threads. A pipe's label in `by_label` picks its mode, else a
 /// secure carrier takes `secure` when given, else `default`.
 pub(crate) fn record_policy(v: &Bound<'_, PyAny>) -> PyResult<zmux::RecordPolicy> {
-    let mode = |m: &Bound<'_, PyAny>| -> PyResult<RecordMode> {
-        let m = record_mode_of(m)?;
-        if !m.joinable() {
-            return Err(PyValueError::new_err(
-                "a record policy chooses no unmanaged mode",
-            ));
-        }
-        Ok(m)
-    };
-    let default = mode(&v.getattr("default")?)?;
+    let default = record_mode_of(&v.getattr("default")?)?;
     let secure = Some(v.getattr("secure")?)
         .filter(|m| !m.is_none())
-        .map(|m| mode(&m))
+        .map(|m| record_mode_of(&m))
         .transpose()?;
     let mut by_label = std::collections::HashMap::<Arc<str>, RecordMode>::new();
     for item in v
@@ -1087,7 +1079,7 @@ pub(crate) fn record_policy(v: &Bound<'_, PyAny>) -> PyResult<zmux::RecordPolicy
         .iter()
     {
         let (k, m): (String, Bound<'_, PyAny>) = item.extract()?;
-        by_label.insert(k.into(), mode(&m)?);
+        by_label.insert(k.into(), record_mode_of(&m)?);
     }
     Ok(zmux::RecordPolicy::new(move |c| {
         c.label

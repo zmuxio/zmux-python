@@ -1,0 +1,62 @@
+{
+  "schema": "zmux-host-contract-1",
+  "feature": "splice-hooks",
+  "cases": [
+    {
+      "id": "one-to-many-logical-charge-on-first-handoff",
+      "setup": {"mode": "packet", "shape": "datagram", "target_representation": "native", "output_carrier_hold": true, "hook": {"replace_payloads_hex": ["6162", "636465"]}, "exact_credit": 5},
+      "steps": [
+        {"op": "carrier", "target": "source", "action": "receive_datagram", "args": {"context": 0, "hex": "7a"}},
+        {"op": "barrier", "action": "quiesce"},
+        {"op": "expect", "target": "relay", "values": {"hook_calls": 1, "enqueued_items": 2, "first_carrier_bytes": 0, "reserved_bytes": 5}},
+        {"op": "carrier", "target": "destination", "action": "handoff_outputs", "args": {"success_indices": [0], "terminal_failure_indices": [1]}},
+        {"op": "barrier", "action": "quiesce"},
+        {"op": "expect", "target": "relay", "values": {"hook_calls": 1, "first_carrier_bytes": 2, "refunded_bytes": 3, "reserved_bytes": 0}},
+        {"op": "expect", "target": "destination", "values": {"accepted_payloads_hex": ["6162"]}}
+      ]
+    },
+    {
+      "id": "capsule-write-prefix-and-receipt",
+      "setup": {"mode": "packet", "shape": "capsule", "output_carrier_hold": true, "hook": {"action": "pass"}, "exact_credit": 6},
+      "steps": [
+        {"op": "carrier", "target": "source", "action": "receive_reliable_bytes", "args": {"hex": "210161220162"}},
+        {"op": "barrier", "action": "quiesce"},
+        {"op": "carrier", "target": "destination", "action": "accept_complete_payload_ranges_then_stop", "args": {"accepted_output_ranges": [[0, 3]], "failed_partial_output_bytes": 1, "code": 0}},
+        {"op": "barrier", "action": "quiesce"},
+        {"op": "expect", "target": "relay", "values": {"first_carrier_bytes": 3, "refunded_bytes": 3, "reserved_bytes": 0, "end": "stopped", "code": 0}}
+      ]
+    },
+    {
+      "id": "stop-wins-over-resume",
+      "setup": {"mode": "stream", "watch": ["PauseAcknowledged", "DirectionFinished"]},
+      "steps": [
+        {"op": "call", "target": "a_to_b", "action": "pause", "args": {"id": "pause"}},
+        {"op": "barrier", "action": "quiesce"},
+        {"op": "call", "target": "a_to_b", "action": "inject", "args": {"id": "injection", "hex": "61"}},
+        {"op": "expect", "target": "injection", "values": {"status": "rejected", "reason": "paused"}},
+        {"op": "carrier", "target": "destination", "action": "stop_sending", "args": {"code": 0}},
+        {"op": "call", "target": "a_to_b", "action": "resume", "args": {"from": "pause"}},
+        {"op": "barrier", "action": "quiesce"},
+        {"op": "expect", "target": "a_to_b", "values": {"events": [{"name": "PauseAcknowledged"}, {"name": "DirectionFinished", "reason": "stopped", "code": 0}], "enqueued_items": 0}},
+        {"op": "expect", "target": "b_to_a", "values": {"running": true}}
+      ]
+    },
+    {
+      "id": "detach-keeps-admitted-generation",
+      "setup": {"mode": "stream", "hook_generation": 1, "hook": {"replace_payloads_hex": ["62"], "wait_until_us": 10}, "watch": ["HooksReplaced"]},
+      "steps": [
+        {"op": "carrier", "target": "source", "action": "receive_reliable_bytes", "args": {"hex": "61"}},
+        {"op": "barrier", "action": "quiesce"},
+        {"op": "call", "target": "a_to_b", "action": "replace_hooks", "args": {"hooks": []}},
+        {"op": "barrier", "action": "quiesce"},
+        {"op": "expect", "target": "a_to_b", "values": {"events": [{"name": "HooksReplaced", "generation": 2}], "hook_calls": 1, "first_carrier_bytes": 0}},
+        {"op": "advance", "at_us": 10},
+        {"op": "barrier", "action": "quiesce"},
+        {"op": "carrier", "target": "source", "action": "receive_reliable_bytes", "args": {"hex": "63"}},
+        {"op": "barrier", "action": "quiesce"},
+        {"op": "expect", "target": "destination", "values": {"received_reliable_hex": "6263"}},
+        {"op": "expect", "target": "a_to_b", "values": {"hook_calls": 1}}
+      ]
+    }
+  ]
+}

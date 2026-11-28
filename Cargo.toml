@@ -1,6 +1,6 @@
 [package]
 name = "zmux-python"
-version = "0.4.5"
+version = "0.5.0"
 edition = "2024"
 license = "Apache-2.0"
 publish = false
@@ -13,15 +13,15 @@ crate-type = ["cdylib"]
 pyo3 = { version = "0.30.1", features = ["abi3-py312"] }
 tokio = { version = "1.54.1", features = ["net", "rt-multi-thread", "sync", "io-util", "time"] }
 bytes = "1.12.2"
-zmux = "1.3.6"
-zmux-shaping = { version = "1.3.6", features = ["tokio"] }
-zmux-rustls = "1.3.6"
-zmux-quinn = { version = "1.3.6", features = ["rustls-ring"] }
-zmux-websocket = "1.3.6"
-zmux-seal = "1.3.6"
-zmux-http = { version = "1.3.6", features = ["websocket"] }
-zmux-h3 = "1.3.6"
-zmux-webtransport = "1.3.6"
+zmux = "1.4.0"
+zmux-shaping = { version = "1.4.0", features = ["tokio"] }
+zmux-rustls = "1.4.0"
+zmux-quinn = { version = "1.4.0", features = ["rustls-ring"] }
+zmux-websocket = "1.4.0"
+zmux-seal = "1.4.0"
+zmux-http = { version = "1.4.0", features = ["websocket"] }
+zmux-h3 = "1.4.0"
+zmux-webtransport = "1.4.0"
 http = "1.5.0"
 tokio-tungstenite = { version = "0.30.0", default-features = false }
 quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
@@ -32,7 +32,7 @@ webpki-roots = "1.0.12"
 [features]
 # Test-only entry points of the extension (`zmux._zmux._panic`); the test
 # builds enable it, the published wheels do not.
-test-hooks = []
+test-hooks = ["zmux/test-hooks"]
 
 [profile.release]
 lto = "thin"

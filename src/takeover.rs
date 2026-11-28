@@ -72,11 +72,7 @@ pub(crate) fn fallback(f: Py<PyAny>, lp: LoopRef) -> zmux::Fallback {
                 .await;
             if let Err(e) = r {
                 let original = Python::attach(|py| e.clone_ref(py));
-                lp.post(move |py| {
-                    if !e.is_instance_of::<pyo3::exceptions::asyncio::CancelledError>(py) {
-                        e.write_unraisable(py, Some(f.bind(py)));
-                    }
-                });
+                lp.report_callback_error(f, e);
                 return Err(std::io::Error::other(original));
             }
             Ok(())

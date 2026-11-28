@@ -6,7 +6,15 @@ deadlines; durations are seconds."""
 import ipaddress
 import os
 from types import TracebackType
-from collections.abc import Awaitable, Buffer, Callable, Iterable, Mapping
+from collections.abc import (
+    Awaitable,
+    Buffer,
+    Callable,
+    Coroutine,
+    Generator,
+    Iterable,
+    Mapping,
+)
 from typing import Any, ClassVar, Literal, Protocol, Self, final
 
 from . import _types as _t
@@ -50,6 +58,8 @@ type _Headers = Mapping[str, str] | Iterable[tuple[str, str]]
 type _Host = str | ipaddress.IPv4Address | ipaddress.IPv6Address
 type _HostPort = tuple[_Host, int]
 
+DEFAULT_MAX_PACKET: int
+"""Default bound of a packet payload in bytes."""
 DEFAULT_KEEP_ALIVE_PERIOD: float
 """Default keep-alive period, seconds (15)."""
 DEFAULT_MAX_IDLE_TIMEOUT: float
@@ -73,9 +83,6 @@ grants the peer as many streams as it can, in effect no limit. It is the top
 of the range of `Config.max_incoming_streams`,
 `Config.max_incoming_uni_streams` and `Session.raise_incoming_streams`, a
 value of that range and not a setting: 0 keeps meaning none."""
-MIN_RECHECK: float
-"""The shortest `PoolDecision.recheck` a pool honours, seconds (0.01): a
-shorter one is lengthened to it."""
 DIAL_TIMEOUT: float
 """The default bound of a TLS, QUIC, WebSocket, HTTP/3 or WebTransport dial,
 seconds (10)."""
@@ -102,7 +109,6 @@ DEFAULT_FIRST_RECORD_TIMEOUT: float
 """Default first-record timeout of a listener, seconds (2)."""
 MIN_MAX_LEN: int
 """Smallest shaping `max_len` honoured, bytes (64)."""
-DEFAULT_MAX_DELAY: float
 """Default longest delay a shaper may hold a record, seconds (1)."""
 DEFAULT_MAX_APP_DATA: int
 """Default bound of the application data of a received handshake message, bytes (256)."""
@@ -115,17 +121,121 @@ DEFAULT_RECOVERY_RATIO: float
 DEFAULT_MIN_INTERVAL: float
 """Default `QualityBand.min_interval`, seconds (1)."""
 
-def _check_pipe_liveness(liveness: _t.PipeLiveness) -> None:
-    """Internal: raises `ValueError` for a `PipeLiveness` out of range."""
+def _pipe_option_defaults() -> dict[str, Any]:
+    """Internal: the core defaults for the fields of PipeOptions."""
+
+def _check_pipe_option_sentinels(options: _t.PipeOptions) -> None:
+    """Internal: raises `TypeError` for an update sentinel in pipe options."""
+
+def _check_shaping_account(o: _t.ShapingAccount) -> None:
+    """Internal: raises `ValueError` for an invalid shaping account."""
+
+def _check_shaping_profile(o: _t.ShapingProfileLimits) -> None:
+    """Internal: raises `ValueError` for an invalid shaping profile."""
+
+def _check_shaper_sources(v: _t.Shaper) -> None:
+    """Internal: raises `ValueError` for conflicting shaping sources."""
+
+def _check_epoch_policy(policy: _t.EpochPolicy) -> None:
+    """Internal: raises `ValueError` for an invalid epoch policy."""
 
 def _check_quality_band(b: _t.QualityBand) -> None:
     """Internal: raises `ValueError` for a `QualityBand` out of range."""
 
-def _check_pool_decision(d: _t.PoolDecision) -> None:
-    """Internal: raises `ValueError` for a `PoolDecision` out of range."""
-
 def _config_defaults() -> dict[str, Any]:
     """Internal: the library's defaults of the `zmux.Config` fields."""
+
+@final
+class _TestRevision:
+    """Private observer of native commits, available in test builds."""
+
+    async def changed(self) -> None:
+        """Waits for an owner revision after the previous observation."""
+
+def _with_backoff_jitter[T](
+    sample: float, *, observe: Callable[[], T]
+) -> tuple[T, int]:
+    """Runs a test observation with a fixed jitter sample and counts the draws."""
+
+@final
+class _TestClock:
+    """Native manually advanced clock for the test build."""
+
+    @property
+    def domain(self) -> ClockDomain:
+        """The domain that uses this clock."""
+    def advance(self, seconds: float) -> None:
+        """Advances this clock by the given number of seconds."""
+    async def wait_for_timer(self, delay: float, *, count: int = 1) -> None:
+        """Waits for `count` timers at now + `delay` to register their wakeups."""
+
+@final
+class _MatrixWire:
+    """Test-build observer for actual socket reads and writes."""
+
+    def __init__(
+        self,
+        *,
+        join: bool = False,
+        client: bool = False,
+        signal: _MatrixWire | None = None,
+    ) -> None:
+        """Observes bootstrap or Join traffic and optionally shares a change signal."""
+    @property
+    def revision(self) -> int:
+        """The shared change watermark."""
+    async def changed(self, observed: int) -> None:
+        """Waits for a socket handoff after the observed watermark."""
+    def snapshot(
+        self,
+    ) -> tuple[int, int, dict[int, int], dict[int, bool], int, int, int]:
+        """Returns probe and eliciting ends, received ACKs, outbound streams, padding and datagrams."""
+    def hold_reads(self, held: bool) -> int:
+        """Holds or releases reads and returns the last complete inbound record position."""
+    def hold_writes(self, held: bool) -> None:
+        """Holds or releases writes while leaving the socket open."""
+
+@final
+class _MatrixTcp:
+    """Test-build loopback listening socket."""
+
+    @staticmethod
+    async def bind() -> _MatrixTcp:
+        """Binds on an ephemeral port."""
+    @property
+    def address(self) -> str:
+        """The bound address as published to the driver."""
+    async def accept(self, wire: _MatrixWire) -> tuple[PipeIo, tuple[str, int]]:
+        """Accepts a TCP carrier and installs its observer."""
+    async def upgrade(self, listener: Listener) -> _MatrixUpgrade:
+        """Upgrades a WebSocket through the production head admission path."""
+
+@final
+class _MatrixUpgrade:
+    """An upgraded WebSocket awaiting first-message admission in a test build."""
+
+    async def admit(self) -> bool:
+        """Runs admission to completion and attaches the carrier if accepted."""
+
+async def _matrix_dial_tcp(address: str, *, wire: _MatrixWire) -> PipeIo:
+    """Connects a TCP carrier and installs its observer."""
+
+async def _matrix_write_messages(pipe: PipeIo, *, messages: list[bytes]) -> PipeIo:
+    """Writes whole messages before returning the carrier for its next operation."""
+
+async def _matrix_read_messages(pipe: PipeIo, *, count: int) -> list[bytes]:
+    """Consumes the carrier and reads up to count messages or until it closes."""
+
+async def _matrix_established(session: Session) -> None:
+    """Waits for completed establishment on a test-build session."""
+
+def _matrix_stall_evidence(
+    session: Session, *, pipe: int, cost: float, waiting: bool
+) -> None:
+    """Installs deterministic ACK progress evidence through the core's fixture seam."""
+
+def _matrix_fire_timers(session: Session) -> None:
+    """Applies session timers at the current fixture-clock instant."""
 
 async def _panic() -> None:
     """Internal, only in builds with the `test-hooks` feature: a future that
@@ -186,6 +296,14 @@ class PipeIo:
     raises `PipeUsedError`); what a carrier's author sets once is a
     parameter of the function that builds the input (`pipe_pair`,
     `pipe_from_streams`)."""
+
+    def set_accounting_sources(
+        self,
+        *,
+        send: _t.CarrierHalfSource | None = None,
+        receive: _t.CarrierHalfSource | None = None,
+    ) -> None:
+        """Sets the host-provided attribution of the independent carrier halves."""
 
     @property
     def carrier_kind(self) -> _t.CarrierKind | str | None:
@@ -589,19 +707,23 @@ class Admission:
     ) -> None: ...
     @staticmethod
     def prefix_auth(
-        auth: PrefixAuth,
+        store: MemoryPrefixStore | _t.PrefixStore,
         *,
-        skew: int,
-        max_nonces: int = 65536,
+        binding: _t.PrefixBinding
+        | Literal["bound", "encrypted", "allow_cleartext"] = "bound",
+        header: str | None = None,
+        reject: _t.PrefixRejection | Literal["close", "stall", "fallback"] = "close",
+        max_skew: int | None = None,
         peek_timeout: float | _t.Auto | None = None,
         stall: tuple[float, float] | _t.Auto | None = None,
         fallback_on_peek_timeout: bool = False,
     ) -> Admission:
-        """Admission by `auth`'s tokens: `skew` slots of clock difference
-        accepted, at most `max_nonces` Nonces recorded. The token is the
-        carrier's first 32 bytes, or the request header field on a carrier
-        decided on its request head; a carrier without a valid one goes to
-        the fallback."""
+        """Redeem a 64-byte binary or request-header ticket through the authority."""
+    @staticmethod
+    def _fixture_first_message_ticket(
+        store: MemoryPrefixStore, *, unix_seconds: int
+    ) -> Admission:
+        """Verifies cleartext first-message fixture tickets at a fixed Unix time."""
     @property
     def peek(self) -> int: ...
     @property
@@ -617,27 +739,118 @@ class Admission:
     @property
     def stall(self) -> tuple[float, float]: ...
 
+PREFIX_TOKEN_LEN: int
+"""Length of a binary ticket presentation in bytes."""
+
 @final
-class PrefixAuth:
-    """Prefix authentication parameters both ends agree on: `psk`, `slot`
-    (whole seconds), `bind_tls` (tokens bound to the TLS or QUIC handshake
-    of the carrier) and `header`, the request header field of carriers
-    decided on their request head (default `Zmux-Prefix-Auth`). A client's
-    credential: a fresh token first on the carrier, or in the header field;
-    a server admits with `Admission.prefix_auth`."""
+class PrefixGeneration:
+    """An outer key for an inclusive issue-slot interval."""
+
+    def __init__(self, key: bytes, *, first_slot: int, last_slot: int) -> None:
+        """Use a dedicated 32-byte key for this generation."""
+
+@final
+class PrefixSchedule:
+    """Versioned outer key generations with disjoint issue intervals."""
+
+    def __init__(
+        self, generations: Iterable[PrefixGeneration], *, version: int = 1
+    ) -> None:
+        """Make a schedule for presenters or a custom authority."""
+    @property
+    def version(self) -> int:
+        """The authority revision of the schedule."""
+
+@final
+class PrefixTicket:
+    """A ticket record containing dedicated credentials and an inclusive lifetime."""
 
     def __init__(
         self,
-        psk: bytes,
+        id: bytes,
         *,
-        slot: int,
-        bind_tls: bool = False,
+        key: bytes,
+        first_slot: int,
+        last_slot: int,
+        version: int = 1,
+        single_use: bool = True,
+    ) -> None:
+        """Use an independently random 16-byte ID and dedicated 32-byte key."""
+
+@final
+class PrefixWindow:
+    """Whole seconds per slot and permitted verifier clock skew."""
+
+    def __init__(
+        self, slot_seconds: int, *, skew: int = 0, skew_limit: int | None = None
+    ) -> None:
+        """Set the slot length and its skew bound."""
+    @property
+    def slot_seconds(self) -> int:
+        """The slot length in whole seconds."""
+    @property
+    def skew(self) -> int:
+        """Maximum clock difference in slots."""
+
+@final
+class MemoryPrefixStore:
+    """In-process ticket authority. Retire the old domain after state loss."""
+
+    def __init__(
+        self,
+        generations: Iterable[PrefixGeneration],
+        *,
+        window: PrefixWindow,
+        capacity: int = 0,
+    ) -> None:
+        """Create an authority. Zero capacity selects the default."""
+    def add_ticket(self, ticket: PrefixTicket) -> None:
+        """Install a fresh ticket ID."""
+    def revoke_ticket(self, id: bytes) -> None:
+        """Revoke the ID and remember its tombstone."""
+    def set_generations(self, generations: Iterable[PrefixGeneration]) -> None:
+        """Publish a new schedule and invalidate the previous revision."""
+    def expire(self, unix_seconds: int) -> None:
+        """Retire expired claims and tickets at the given Unix time."""
+
+@final
+class PrefixDeadline:
+    """Deadline and cancellation indicator for one authority operation."""
+
+    @property
+    def deadline(self) -> float | None:
+        """Deadline on the monotonic clock, if set."""
+    @property
+    def ended(self) -> bool:
+        """Whether the operation was cancelled or reached its deadline."""
+
+@final
+class PrefixAuth:
+    """A client's ticket presenter, provisioned with a ticket and outer schedule."""
+
+    def __init__(
+        self,
+        ticket: PrefixTicket,
+        *,
+        schedule: PrefixSchedule,
+        slot_seconds: int,
+        binding: _t.PrefixBinding
+        | Literal["bound", "encrypted", "allow_cleartext"] = "bound",
         header: str | None = None,
-    ) -> None: ...
+    ) -> None:
+        """Configure the same slot, binding and header policy as the verifier."""
     @property
-    def bind_tls(self) -> bool: ...
+    def binding(self) -> _t.PrefixBinding:
+        """The carrier binding policy."""
     @property
-    def header(self) -> str: ...
+    def header_name(self) -> str:
+        """The field name used on head-admitted carriers."""
+    def prefix(self, info: CarrierInfo) -> bytes:
+        """Generate a fresh binary presentation for the carrier."""
+    def header(self, info: CarrierInfo) -> tuple[str, str]:
+        """Generate the field name and a fresh canonical base64url presentation."""
+    def _fixture_token(self, unix_seconds: int, *, nonce: bytes) -> bytes:
+        """Produces the unbound presentation for the given fixture time and nonce."""
 
 type _CarrierCredential = PrefixAuth | _t.CarrierCredential
 
@@ -699,7 +912,7 @@ async def dial_streaming(
     host: _Host,
     port: int,
     *,
-    path: str = "/zmux",
+    path: str | None = None,
     carrier_credential: _CarrierCredential | None = None,
     direction: _t.Direction | str = _t.Direction.BIDI,
     pair_field: str | None = None,
@@ -716,7 +929,7 @@ async def dial_split(
     host: _Host,
     port: int,
     *,
-    path: str = "/zmux",
+    path: str | None = None,
     carrier_credential: _CarrierCredential | None = None,
     pair_field: str | None = None,
 ) -> PipeIo:
@@ -731,7 +944,7 @@ async def join_split(
     host: _Host,
     port: int,
     *,
-    path: str = "/zmux",
+    path: str | None = None,
     carrier_credential: _CarrierCredential | None = None,
     pair_field: str | None = None,
     options: PipeOptions | None = None,
@@ -741,101 +954,11 @@ async def join_split(
     two directions, `options` choosing its direction; returns `[pipe]` as
     `add_pipe` does. A split bootstrap's carrier
     (`dial_split`) joins no session: `add_pipe` refuses it with
-    `PipeError`. A `PipePool(join=...)` keeps such pairs up."""
-
-@final
-class MachinePoolPolicy:
-    """A pool policy read from a JSON object, run natively: `PipePool(policy=...)` takes
-    it like any `PoolPolicy`, and no Python runs for its decisions.
-
-    Absent members keep the pool's own behaviour; unknown members raise
-    `ValueError`. Pools given the same object share its state."""
-
-    def __init__(self, definition: str | bytes | Mapping[str, Any]) -> None:
-        """Reads a policy from its JSON `definition`; an invalid one raises
-        `ValueError`."""
-    def decide(self, view: _t.PoolView) -> _t.PoolDecision:
-        """The decision for `view`, as the pool's look would get it: the policy's
-        values built into a `PoolDecision`. A value that `PoolDecision` refuses
-        (a probe interval between 0 and 1 s) raises `ValueError`, which rejects
-        the look of a pool."""
-    def evaluate(self, view: _t.PoolView) -> _t.PoolEvaluation:
-        """The policy's values for `view` as it evaluates them, unchanged and out
-        of range ones included: the way a policy file is tested."""
-
-@final
-class PipePool:
-    """Members to keep up over one path, `count` usable ones, given exactly
-    one way to make them (`TypeError` otherwise): with `dial()`, each a pipe
-    on the carrier it opens; with `join(session, options)`, each the pipes
-    it joins itself (such as `join_split`), usable while all of them
-    are, counted once, and redialled, rotated and retired as a whole; with
-    `choice` (a `CarrierChoice`, under `choice_policy`), each over the most
-    robust kind available (one the policy's cache holds as usable, else the
-    exchange carrier, else the last), skipping the kinds held as failed
-    unless all are, and a member of a kind a preferred kind not backing off
-    could replace is upgraded to it make before break, one upgrade at a
-    time and only with room within `max_pipes`: the replacement takes over
-    once it stayed usable for the policy's `settle`, and a kind whose join
-    fails, whose replacement ends before it settled, or whose member fails
-    within `drop_window` of being joined is recorded as failed; every try
-    is a `CarrierCandidate` event. An invalid choice or policy raises
-    `ValueError`.
-
-    Redials back off from the start of the previous attempt, by `backoff`
-    (a `Backoff`; `None`: the default one). Rotation
-    replaces a usable member make before break once it carried
-    `rotate_max_bytes` either way or is `rotate_max_age` seconds old, each
-    reduced by a random fraction of up to `rotate_jitter` (`None`: no
-    rotation by that measure). `policy` (a `PoolPolicy`: an object with
-    `decide(view)`, or a `MachinePoolPolicy`) is asked at each look of the
-    maintainer: at once after a pipe changed state or the session was
-    suspended or resumed (it keeps dialling while suspended), after each dial
-    attempt, no later than the `recheck` of its last decision, and every
-    100 ms. Its `decide` runs on the event loop that runs `maintain_pipes`
-    (a thread that is not a runtime worker waits for the answer, without a
-    bound: a `decide` that does not return holds the looks of this pool and
-    nothing else). Its `count`, `dial_after`, `retire_pipes`
-    and `recheck` steer the pool, and its `liveness` applies to the pipes
-    added after it. `options` are the `PipeOptions` of every pipe of the
-    pool. A look is rejected as a whole when `decide` raises, returns
-    anything but a `PoolDecision`, or returns a decision out of range: the
-    pool applies the default decision for that look and calls
-    `decision_rejected(exception)`, if given, on the event loop; without it
-    the exception is logged at warning level through the session's logger."""
-
-    def __init__(
-        self,
-        count: int = 1,
-        dial: Callable[[], Awaitable[PipeIo]] | None = None,
-        *,
-        join: Callable[[Session, PipeOptions], Awaitable[Iterable[Pipe]]] | None = None,
-        choice: CarrierChoice | None = None,
-        choice_policy: CarrierChoicePolicy | None = None,
-        rotate_max_bytes: int | None = None,
-        rotate_max_age: float | None = None,
-        rotate_jitter: float = 0.0,
-        backoff: _t.Backoff | None = None,
-        policy: _t.PoolPolicy | None = None,
-        options: PipeOptions | None = None,
-        decision_rejected: Callable[[BaseException], object] | None = None,
-    ) -> None: ...
-    @property
-    def count(self) -> int:
-        """Usable members to keep."""
-
-@final
-class MaintainHandle:
-    """Stops a pool's maintainer on `stop()` or when collected; it also ends with the session."""
-
-    def stop(self) -> None:
-        """Stops the maintainer; pipes it added stay in the session."""
-    @property
-    def finished(self) -> bool: ...
+    `PipeError`."""
 
 @final
 class Candidate:
-    """One carrier kind a `CarrierChoice` may use; each constructor is named
+    """A controller candidate. Each constructor is named
     after the `dial_*` function that opens the same carrier. Carrier
     credentials go on the candidate; the exchange authenticates with its
     options' PSK."""
@@ -845,7 +968,7 @@ class Candidate:
         host: _Host,
         port: int,
         *,
-        path: str = "/zmux",
+        path: str | None = None,
         carrier_credential: _CarrierCredential | None = None,
         pair_field: str | None = None,
     ) -> Candidate:
@@ -856,7 +979,7 @@ class Candidate:
         host: _Host,
         port: int,
         *,
-        path: str = "/zmux",
+        path: str | None = None,
         carrier_credential: _CarrierCredential | None = None,
         pair_field: str | None = None,
     ) -> Candidate:
@@ -913,6 +1036,22 @@ class Candidate:
     ) -> Candidate:
         """A WebTransport session to an `https://` URL (kind `webtransport`,
         as `dial_webtransport`)."""
+    @staticmethod
+    def custom(
+        kind: _t.CarrierKind | str,
+        *,
+        layout: Iterable[_t.AttachmentSpec],
+        open: Callable[
+            [_t.OpenRequest], Iterable[PipeIo] | Awaitable[Iterable[PipeIo]]
+        ],
+    ) -> Candidate:
+        """Registers a host opener and its exact Join carrier layout."""
+    def with_identity(self, id: str, *, cache_key: str) -> Candidate:
+        """Registers this candidate's identity and the host's cache key."""
+    def join_only(self) -> Candidate:
+        """Makes this candidate available for Join only."""
+    def with_preference(self, tier: int, *, standby: bool = False) -> Candidate:
+        """Sets the candidate's tier and standby preference."""
     def with_variant(self, variant: str) -> Candidate:
         """A copy of this candidate with its carriers labelled `variant`: a
         kind with different variants makes different candidates, each with
@@ -925,122 +1064,221 @@ class Candidate:
         """The candidate's variant, or `None`."""
 
 @final
-class CarrierChoice:
-    """How a client chooses the carrier (`connect_choice`,
-    `PipePool(choice=...)`)."""
-
-    @staticmethod
-    def explicit(candidate: Candidate) -> CarrierChoice:
-        """That kind only: a failure is reported, never replaced."""
-    @staticmethod
-    def auto(candidates: list[Candidate]) -> CarrierChoice:
-        """A choice among `candidates`, most preferred first."""
-    @property
-    def is_auto(self) -> bool:
-        """Whether the choice is automatic."""
+class CarrierReportSource:
+    """Authority to report sequenced observations for one cache key."""
 
 @final
-class CarrierChoicePolicy:
-    """How an automatic carrier choice orders, times and remembers its
-    candidates; durations in seconds. `cache` remembers outcomes across
-    dials under `key` (`None`: a cache private to the session). A
-    candidate's timer is the round trip of opening its carrier times
-    `timer_factor`, within `timer_min` and `timer_max`; a candidate whose
-    transport parameters do not arrive within it is abandoned. A joined pipe
-    of a preferred kind stays `settle` before the pipes it replaces retire;
-    a kind whose pipes fail within `drop_window` of being chosen counts as
-    failed. `no_join` tries the candidates one after another instead of
-    establishing on the most robust and joining the preferred ones (it does
-    not apply to a pool)."""
+class WallClock:
+    """An application-controlled UTC clock for anchoring carrier snapshots."""
 
-    def __init__(
-        self,
-        *,
-        cache: CarrierCache | None = None,
-        key: str = "",
-        timer_factor: float = 3.0,
-        timer_min: float = 1.0,
-        timer_max: float = 3.0,
-        settle: float = 1.0,
-        drop_window: float = 30.0,
-        no_join: bool = False,
-    ) -> None: ...
+    def __init__(self, timestamp_ns: int) -> None:
+        """Starts at a signed Unix timestamp in nanoseconds."""
+    def set(self, timestamp_ns: int) -> None:
+        """Sets the timestamp, which may move backward."""
     @property
-    def key(self) -> str: ...
-    @property
-    def timer_factor(self) -> float: ...
-    @property
-    def timer_min(self) -> float: ...
-    @property
-    def timer_max(self) -> float: ...
-    @property
-    def settle(self) -> float: ...
-    @property
-    def drop_window(self) -> float: ...
-    @property
-    def no_join(self) -> bool: ...
+    def timestamp_ns(self) -> int:
+        """Current signed Unix timestamp in nanoseconds."""
 
 @final
 class CarrierCache:
-    """Which carrier kinds worked per server and local network (`key`),
-    shared by the dials given it: a usable kind for `success_ttl`, a failed
-    one skipped for a backoff doubling from `backoff_min` to `backoff_max`
-    (seconds)."""
+    """Shared scoring history and retry admission for carrier candidates."""
 
     def __init__(
         self,
         *,
-        success_ttl: float = 21600.0,
-        backoff_min: float = 60.0,
-        backoff_max: float = 21600.0,
-    ) -> None: ...
-    def is_usable(
-        self, key: str, kind: _t.CarrierKind | str, *, variant: str | None = None
-    ) -> bool:
-        """Whether the carrier kind `kind` with `variant` is held as usable
-        under `key`."""
-    def is_failed(
-        self, key: str, kind: _t.CarrierKind | str, *, variant: str | None = None
-    ) -> bool:
-        """Whether the carrier kind `kind` with `variant` is backing off
-        under `key`."""
-    def report(
+        half_life: float | None = None,
+        drop_window: float | None = None,
+        performance_window: float | None = None,
+        health_reset: float | None = None,
+        backoff: _t.Backoff | None = None,
+        retry_profile: _t.CarrierRetryProfile | None = None,
+        kind_priors: dict[_t.CarrierKind | str, float] | None = None,
+        import_limit: int | None = None,
+        max_age: float | None = None,
+        min_weight: float = 0.0,
+        clock_domain: ClockDomain | None = None,
+        wall_clock: WallClock | None = None,
+    ) -> None:
+        """Creates an empty cache with optional scoring and retry settings.
+
+        A retry profile supplies its own settings in place of `backoff`.
+        """
+    def retry_metrics(
+        self, key: str, *, kind: _t.CarrierKind | str, variant: str = ""
+    ) -> _t.RetryMetrics:
+        """Read candidate retry pacing and suppression counters."""
+    def score(
+        self, key: str, *, kind: _t.CarrierKind | str, variant: str = ""
+    ) -> _t.CarrierScore:
+        """Reads the current score, evidence and cooldown for a key."""
+    def register_report_source(
         self,
         key: str,
-        kind: _t.CarrierKind | str,
-        outcome: _t.CacheOutcome | str,
         *,
-        variant: str | None = None,
-    ) -> None:
-        """Records an outcome the host learnt after a dial, under the rules
-        of the automatic results: `key` the key in use, `variant` the
-        candidate's. An unknown name raises `ValueError`."""
-    def snapshot(self) -> str:
-        """What the cache knows as JSON text (versioned, each entry with its
-        variant, times in RFC 3339 UTC, shared by every implementation), to `restore` later, such as
-        in the next run of the process. Expired entries are left out."""
-    def restore(self, snapshot: str) -> None:
-        """Merges a `snapshot` in: of two entries for one key, kind and variant the
-        newer is kept, a backoff outside this cache's bounds is brought
-        within them, and expired entries, unknown fields and unknown kinds
-        are dropped. Malformed text raises `ValueError` and changes nothing."""
+        kind: _t.CarrierKind | str,
+        variant: str = "",
+    ) -> CarrierReportSource:
+        """Registers an independent sequence space for observations."""
+    def report(
+        self,
+        source: CarrierReportSource,
+        *,
+        sequence: int,
+        outcome: _t.CacheOutcome | str,
+        observation: _t.CarrierObservation | None = None,
+    ) -> bool:
+        """Applies a sequenced observation. Returns whether it was new."""
+    def export(self) -> bytes:
+        """Exports a versioned UTF-8 JSON snapshot."""
+    def import_snapshot(self, snapshot: bytes) -> None:
+        """Validates and atomically merges a v2 snapshot."""
 
-async def connect_choice(
-    choice: CarrierChoice,
-    *,
-    config: _t.Config | None = None,
-    choice_policy: CarrierChoicePolicy | None = None,
-) -> Session:
-    """A client session over the carrier `choice` selects. An auto choice
-    sends no early data and races no candidates: it skips kinds the cache
-    holds as failed, abandons a candidate whose transport parameters do not
-    arrive within its timer, and with `max_pipes` above 1 establishes on the
-    most robust candidate and joins the preferred ones in the background,
-    retiring the replaced pipes once a join has settled (see
-    `CarrierChoicePolicy`). Every try and the choice are session events
-    (`CarrierCandidate`, `CarrierChosen`) and in `Session.stats()`. Raises
-    `CarrierChoiceError` when no candidate was usable, `ValueError` for an
-    invalid choice or policy."""
+@final
+class ClockDomain:
+    """A shared monotonic clock identity for sessions, controllers and caches."""
+
+    def __init__(self) -> None:
+        """Creates a distinct domain using the native monotonic clock."""
+    def now(self) -> float:
+        """Returns current time in seconds on the domain's monotonic clock."""
+
+@final
+class AccountingTicket:
+    """An independently awaitable handle to final record accounting."""
+
+    def __await__(self) -> Generator[Any, None, _t.PipeAccounting]:
+        """Awaits the final totals without consuming them."""
+    async def wait(self) -> _t.PipeAccounting:
+        """Waits for final totals without consuming them or changing other waits."""
+
+@final
+class AccountingTickets:
+    """An application-owned collection of tickets published at attachment handoff."""
+
+    def __init__(self) -> None:
+        """Creates an empty collection for use in a session or listener configuration."""
+    def take(
+        self, session: _t.SessionId, *, pipe: _t.PipeId
+    ) -> AccountingTicket | None:
+        """Takes the named ticket once, including after the pipe retires."""
+    def drain(self) -> tuple[tuple[_t.SessionId, _t.PipeId, AccountingTicket], ...]:
+        """Takes every published ticket, including retired attachments."""
+
+@final
+class Attempt:
+    """Observation and cancellation of one carrier opening and confirmation."""
+
+    def snapshot(self) -> _t.AttemptSnapshot:
+        """Reads progress and the retained terminal result, if available."""
+    async def wait(self) -> _t.AttemptResult:
+        """Waits for the terminal result. Cancelling the wait leaves the attempt running."""
+    def cancel(self) -> None:
+        """Requests cancellation before ownership of the carriers has committed."""
+
+@final
+class CapacityChange:
+    """An admitted batch of member additions and retirements."""
+
+    def start_member(
+        self,
+        index: int,
+        *,
+        open: Callable[
+            [_t.OpenRequest], Iterable[PipeIo] | Awaitable[Iterable[PipeIo]]
+        ],
+    ) -> Attempt:
+        """Starts one reserved member's opener on the calling event loop."""
+    def commit(self) -> _t.ChangeResult:
+        """Commits confirmed additions and drains replaced members after the native checks."""
+    def cancel(self) -> None:
+        """Cancels a batch that has not committed."""
+
+@final
+class SessionController:
+    """Owns a domain's carrier registrations, ranking and work bounds."""
+
+    def __init__(
+        self,
+        domain: str,
+        *,
+        candidates: Iterable[Candidate],
+        choice: Literal["static", "d160"] = "static",
+        cache: CarrierCache | None = None,
+        concurrent_openers: int | None = None,
+        attempt_timeout: float | None = None,
+        clock_domain: ClockDomain | None = None,
+    ) -> None:
+        """Registers candidates and retry policy for one controller domain."""
+    async def open(
+        self, target: _t.SessionTarget, *, config: _t.Config | None = None
+    ) -> tuple[Session, SessionControl | None]:
+        """Establishes a session. For an empty target, control is None when
+        the client and peer did not negotiate multipath."""
+    def manage(
+        self,
+        session: Session,
+        *,
+        target: _t.SessionTarget,
+        bootstrap: str | None = None,
+    ) -> SessionControl:
+        """Takes ownership of convergence for an established session."""
+    def take_over(
+        self,
+        previous: SessionControl,
+        *,
+        target: _t.SessionTarget,
+        bootstrap: str | None = None,
+    ) -> SessionControl:
+        """Replace the exact current binding while retaining the session."""
+    def close(self) -> None:
+        """Requests shutdown of the controller and its bindings."""
+    async def done(self) -> None:
+        """Waits for the controller and all its bindings to stop."""
+
+@final
+class QualityEvidence:
+    """An original path observation a replacement depends on."""
+
+    @property
+    def sampled_at(self) -> float:
+        """Original observation time in monotonic seconds."""
+    @property
+    def valid_until(self) -> float | None:
+        """Exclusive expiration in monotonic seconds, if the measurement expires."""
+
+@final
+class ControllerPath:
+    """A path observation captured with the controller's member table."""
+
+    @property
+    def member(self) -> int | None:
+        """The member that owns this attachment, if any."""
+    @property
+    def stats(self) -> _t.PipeStats:
+        """The captured statistics and directional health."""
+    def evidence(
+        self,
+        measurement: Literal[
+            "health", "current_rtt", "baseline_rtt", "delivery", "loss"
+        ] = "health",
+        *,
+        direction: _t.PipeHalf | Literal["Inbound", "Outbound"] = "Outbound",
+    ) -> QualityEvidence:
+        """Retains an observation and its original validity for a replacement.
+        Raises ValueError if the snapshot lacks the selected evidence."""
+
+@final
+class SessionControl:
+    """Control and progress for one managed session."""
+
+    def set_target(self, target: _t.SessionTarget) -> None:
+        """Installs a new target, or accepts the identical current revision."""
+    def snapshot(self) -> _t.ControllerSnapshot:
+        """Reads the latest committed controller plan and its coverage observation."""
+    def release(self) -> None:
+        """Release this binding and preserve confirmed coverage."""
+    async def done(self) -> None:
+        """Waits for the controller binding to stop."""
 
 @final
 class ExchangeOptions:
@@ -1117,6 +1355,29 @@ async def dial_exchange(
     its prefix starts the uplink, for a server's admission. Returns without
     a round trip."""
 
+@final
+class Http3Connection:
+    """One host-owned HTTP/3 connection for multiple request pipes."""
+
+    @staticmethod
+    async def dial(
+        url: str,
+        *,
+        tls: TlsConfig | None = None,
+        addr: tuple[_Host, int] | None = None,
+        lanes: int = DEFAULT_LANES,
+        carrier_credential: _CarrierCredential | None = None,
+        timeout: float = DIAL_TIMEOUT,
+    ) -> Http3Connection:
+        """Establishes a QUIC connection and binds it to the URL's HTTPS authority."""
+    async def open_pipe(self) -> PipeIo:
+        """Opens another request on the shared connection."""
+    @property
+    def http_datagrams(self) -> bool:
+        """Whether HTTP/3 and the QUIC transport negotiated native datagrams."""
+    def close(self) -> None:
+        """Closes the shared QUIC connection and its requests."""
+
 async def dial_http3(
     url: str,
     *,
@@ -1157,14 +1418,15 @@ class Http2Connection:
         host: _Host,
         port: int,
         *,
-        path: str = "/zmux",
+        path: str | None = None,
         tls: TlsConfig | None = None,
         server_name: str | None = None,
         carrier_credential: _CarrierCredential | None = None,
         pair_field: str | None = None,
     ) -> Http2Connection:
-        """With `carrier_credential` (unbound), its prefix is the first bytes
-        of every request body."""
+        """A shared HTTP/2 carrier connection. Ticket credentials use a
+        binary prefix on a request body and the header form on a downlink."""
+
     async def open_pipe(
         self, *, direction: _t.Direction | str = _t.Direction.BIDI
     ) -> PipeIo:
@@ -1194,6 +1456,44 @@ class ZeroRtt:
         """Rejected 0-RTT data was sent again after the handshake."""
 
 @final
+class QuicConnection:
+    """An established QUIC connection shared by pipes and owned by its handle."""
+
+    async def open_pipe(self) -> PipeIo:
+        """Opens a zmux pipe. Closing the pipe leaves this connection open."""
+    def close(self) -> None:
+        """Closes this connection and its pipes. Dropping the handle also closes it."""
+
+@final
+class QuicServer:
+    """A QUIC endpoint whose connections the application admits individually."""
+
+    @staticmethod
+    async def bind(
+        host: _Host, *, port: int = 0, tls: TlsConfig, lanes: int = DEFAULT_LANES
+    ) -> QuicServer:
+        """Binds a QUIC endpoint for established connections."""
+    @property
+    def local_addr(self) -> tuple[str, int]:
+        """The bound address and port."""
+    async def accept(self, listener: Listener) -> QuicService | None:
+        """Accepts one established connection and starts its listener service.
+        Returns `None` if the listener refuses the connection at its limits."""
+    def close(self) -> None:
+        """Closes the endpoint and its connections."""
+
+@final
+class QuicService:
+    """Admission and teardown of one QUIC connection on a listener."""
+
+    def stop_admission(self) -> None:
+        """Stops pipe admission and cancels setups still owned by the service.
+        Handed-off pipes and their lanes continue. Dropping the handle also stops admission."""
+    async def wait(self) -> None:
+        """Waits for the service's pipe and lane receivers to finish.
+        Cancelling the wait leaves the service running."""
+
+@final
 class QuicClient:
     """A QUIC client endpoint reused across connections so TLS sessions resume.
     With `zero_rtt` it remembers each server's parameters and sends a
@@ -1218,6 +1518,10 @@ class QuicClient:
         self, host: _Host, port: int, *, server_name: str | None = None
     ) -> PipeIo:
         """A pipe input on a new connection."""
+    async def open_connection(
+        self, host: _Host, port: int, *, server_name: str | None = None
+    ) -> QuicConnection:
+        """Establishes a connection to reuse for zmux pipes."""
     async def connect(
         self,
         host: _Host,
@@ -1254,6 +1558,19 @@ class SendStream:
     stream ended with the value held last. An assignment does not take the
     part either: it works while a write, a flush or a wait is in progress, and
     fails only as the stream does (`StreamClosedError`)."""
+
+    def send_datagram_with(
+        self,
+        payload: Buffer,
+        *,
+        options: _t.DatagramSendOptions,
+        context: int = 0,
+    ) -> None:
+        """Admits a flow datagram with local send options."""
+    def datagram_path(self, *, context: int = 0) -> _t.DatagramPath:
+        """Reads the flow's original-copy and native payload limits during any write."""
+    def set_datagram_options(self, options: _t.DatagramSendOptions) -> None:
+        """Sets the default local datagram options for the flow."""
 
     @property
     def id(self) -> int | None:
@@ -1422,8 +1739,11 @@ class RecvStream:
         the session's error; the exit of `async with` ignores it."""
     async def read_chunk(self, n: int = 65536) -> memoryview:
         """Up to `n` bytes as a read-only view of the received buffer,
-        without a copy; empty at the end of the stream."""
+        without a copy. The view is empty at the end of the stream.
+        `BorrowLimitError` leaves the bytes available for a copying read."""
     def _take(self, max: int, view: bool, /) -> bytes | memoryview | None: ...
+    def _test_fail_read_allocation(self) -> None:
+        """Makes the next read result allocation fail in the test-hooks build."""
     async def wait_readable(self) -> None:
         """Waits until the next read returns at once: data is readable, or the
         receiving part has ended (FIN, a reset, a stop by this endpoint, the
@@ -1438,6 +1758,8 @@ class RecvStream:
         with a FIN and everything was read. A reset, or the session's end,
         raises as a read does. `StreamBusyError` while another call holds
         the part."""
+    def try_read_chunk(self, n: int = 65536) -> memoryview | None:
+        """Read available bytes as a read-only view, or return None if it would wait."""
     def _put_back(self, chunks: list[bytes], /) -> None: ...
     def reject(self) -> None:
         """Declines the stream before reading it (ZMUX_REJECTED); the handle,
@@ -1488,6 +1810,13 @@ class Pipe:
     its end. Watch `Session.events()` for its state changes. Its runtime
     settings change only through `update`."""
 
+    def health(self) -> _t.PipeHealth | None:
+        """Reads the committed health of both local attachment directions."""
+    def observe_stability(self) -> None:
+        """Requests evidence for the attachment's current stability round."""
+    def accounting(self) -> AccountingTicket | None:
+        """Acquires a handle to final record accounting when enabled."""
+
     @property
     def id(self) -> _t.PipeId:
         """The pipe's ID."""
@@ -1504,7 +1833,7 @@ class Pipe:
         A setting that follows the session, or is unset, reads as `INHERIT`;
         `direction`, `record_mode`, `key_group`, `label` and `fate_group` read
         as the pipe has them (the record mode and key group the join used),
-        and `return_on_reply` as it was given. A pipe the peer added reads as
+        as given. A pipe the peer added reads as
         the join made it (`direction` from this endpoint's view, `record_mode`,
         `key_group`), the rest as `PipeOptions()` has it until an update sets
         it. The values in effect, which may follow the peer's request, are in
@@ -1607,6 +1936,10 @@ class Session:
     `capacity_floor`, `shaper`, `shaping_limits` and `liveness` are writable
     properties; an invalid value raises `ValueError` and changes nothing."""
 
+    def _test_revision(self) -> _TestRevision:
+        """Subscribes to owner commits in the test-hooks build."""
+    def _test_read_loan_slots(self, slots: int) -> None:
+        """Sets the borrow slot limit before the first loan in the test-hooks build."""
     @staticmethod
     async def connect(pipe: PipeIo, *, config: _t.Config | None = None) -> Session:
         """Establishes a session as the dialling side of `pipe`."""
@@ -1617,6 +1950,40 @@ class Session:
     async def symmetric(pipe: PipeIo, *, config: _t.Config | None = None) -> Session:
         """Establishes a session over a symmetric carrier: the roles are
         negotiated (role auto)."""
+    def capacity(self) -> _t.CapacitySnapshot:
+        """Reads local occupancy and directional coverage in one snapshot."""
+    async def capacity_changed(self, observed: int) -> _t.CapacitySnapshot:
+        """Waits for capacity to change after the observation watermark."""
+    def members(self) -> tuple[_t.MemberSnapshot, ...]:
+        """Returns the members currently indexed by the session."""
+    def member_for_pipe(self, pipe: int) -> int | None:
+        """Looks up the member owning an indexed attachment."""
+    def set_session_policy(self, policy: _t.SessionPolicy) -> None:
+        """Installs a newer local capacity and authenticated Join policy."""
+    def begin_change(self, request: _t.ChangeRequest) -> CapacityChange:
+        """Reserves capacity for additions and retirements immediately."""
+    async def queue_change(self, request: _t.ChangeRequest) -> CapacityChange:
+        """Waits for admission. Cancelling the wait withdraws the request."""
+    def subscribe_pipe_health(self) -> None:
+        """Starts buffering directional service transitions with their evidence."""
+    def send_datagram_with(
+        self, data: Buffer, *, options: _t.DatagramSendOptions
+    ) -> None:
+        """Admits one session datagram with local send options."""
+    def datagram_path(self) -> _t.DatagramPath:
+        """Reads currently eligible original-copy and native payload limits."""
+    def datagram_stats(self) -> _t.DatagramStats:
+        """Reads the Rust scheduler's additional outcome counters."""
+    def datagram_feedback(
+        self, pipe: int, *, native: bool
+    ) -> _t.DatagramFeedback | None:
+        """Reads DATAGRAM_ACK feedback for an outbound attachment and carrier mode."""
+
+    def datagram_arrivals(
+        self, pipe: int, *, native: bool
+    ) -> _t.DatagramArrivals | None:
+        """Reads reportable arrivals for one inbound attachment and carrier mode."""
+
     @property
     def admitted(self) -> Any:
         """The value the listener's admission gave the carrier that started
@@ -1707,7 +2074,8 @@ class Session:
         tlvs: list[Tlv] | list[tuple[int, bytes]] | None = None,
         priority: _Prio | None = None,
     ) -> SendStream:
-        """Opens a unidirectional stream."""
+        """Waits for unidirectional stream credit with `info` and `tlvs`
+        fixed for the first frame. Cancellation withdraws the opener."""
     def try_open_uni(
         self,
         *,
@@ -1723,12 +2091,13 @@ class Session:
     async def accept_uni(self) -> RecvStream:
         """The next unidirectional stream the peer opened."""
     def send_datagram(self, data: Buffer) -> None:
-        """Queues an unreliable datagram (copied unless it is `bytes`); never waits. When the queue is full
-        the oldest datagram is dropped. `DatagramError` if datagrams are not
+        """Queues an unreliable datagram (copied unless it is `bytes`); never waits. At capacity, the oldest queued original makes room. If native carrier
+        outcomes hold every slot, the new original raises `DatagramDroppedError`.
+        Raises `DatagramError` if datagrams are not
         negotiated or `data` exceeds `max_datagram_size`."""
     async def send_datagram_wait(self, data: Buffer) -> None:
         """Queues a datagram, any buffer-protocol object (copied unless it is
-        `bytes`), waiting while the queue is full instead of dropping the oldest; the
+        `bytes`), waiting for a free slot in the send queue; the
         same errors as `send_datagram`. Cancellation-safe: cancelled while
         it waits, it queued nothing (a cancellation that lands as it
         completes cannot take the datagram back)."""
@@ -1861,20 +2230,13 @@ class Session:
         `ValueError` and changes nothing."""
     def shaping_meters(self) -> dict[str, int]:
         """Shaping readings: wire_left and stall_left (2**64-1 when unbounded), wire_spent, stall_spent (microseconds), sent_bytes."""
-    def shaping_stats(self) -> dict[str, int | float]:
+    def shaping_stats(self) -> _t.ShapingStats:
         """Shaping counters: wire_spent, stall_spent (s), clamped, injected, inject_dropped, faults, handshake_unplanned."""
     async def add_pipe(
         self, pipe: PipeIo, *, options: PipeOptions | None = None
     ) -> Pipe:
-        """Adds a carrier as a further pipe (multipath). Returns once the peer
-        attached it, or with `options.return_on_reply` once the Reply was
-        verified; `Config.join_timeout` bounds the call. A pipe not attached
-        by then is aborted and `DeadlineExceededError` raised; one that fails or is
-        removed first raises the pipe error, the session's end the session
-        error; a cancelled call aborts the pipe. A failed call leaves no pipe."""
-    def maintain_pipes(self, pool: PipePool) -> MaintainHandle:
-        """Keeps `pool`'s pipes up (dials, redials with backoff, rotation, the
-        pool policy's decisions); needs a running event loop, on which `dial` runs."""
+        """Adds a carrier and returns after the peer confirms its attachment.
+        Cancelling before commit releases the carrier."""
     def revalidate_pipes(self) -> None:
         """Probes every live outbound pipe again, for example after a network change."""
     def advance_epoch(self) -> None:
@@ -1882,15 +2244,6 @@ class Session:
         secret, the join keys and the Session Locators advance. Never waits;
         `EpochCommitted` and `EpochDeleted` report it. A session without multipath
         raises `PipeError`."""
-    async def replace_pipes(self) -> None:
-        """For a suspected leak of a session-level secret only: advances the
-        epoch, waits until new joins use it, then replaces each pipe that
-        existed when called through the `Config.redial` hook, make before
-        break. Unbounded: bound it with `asyncio.timeout(seconds)`, a
-        relative bound; cancelled, it stops where it is, the pipes already
-        replaced staying replaced. While the previous epoch is still kept,
-        the exchange waits until it is deleted. Without `redial` it raises
-        `ValueError`; outside a multipath session `NotNegotiatedError`."""
     def pipes(self) -> list[Pipe]:
         """The session's pipes."""
     def pipe_stats(self) -> list[PipeStats]:
@@ -1973,6 +2326,8 @@ class Listener:
     `ListenerClosedError`). `config` is the `Config` of its sessions,
     `listener_config` the `ListenerConfig`; each left out is the default."""
 
+    def _test_revision(self) -> _TestRevision:
+        """Subscribes to counter commits in the test-hooks build."""
     def __init__(
         self,
         *,
@@ -2020,7 +2375,7 @@ class Listener:
         host: _Host,
         port: int,
         *,
-        path: str = "/zmux",
+        path: str | None = None,
         tls: TlsConfig | None = None,
         exchange: ExchangeOptions | None = None,
         websocket: bool = False,
@@ -2107,45 +2462,30 @@ def stream_pipe(send: SendStream, recv: RecvStream) -> PipeIo:
     PIPE_CARRIER, or any the application knows to be a carrier. The two
     handles are used up."""
 
-async def splice(
+def _splice_start(
     a: tuple[SendStream, RecvStream],
     b: tuple[SendStream, RecvStream],
     *,
-    chunk: int = 65536,
+    packets: bool,
+    controlled: bool,
+    chunk: int | None = None,
     a_to_b: Limiter | None = None,
     b_to_a: Limiter | None = None,
     abort: SpliceAbort | None = None,
-) -> SpliceResult:
-    """Forwards two bidirectional streams into each other until both
-    directions ended; the handles are used up. Splicing a stream into
-    itself raises `ValueError`; cancelling the task cancels the splice (the
-    streams are reset with `ZMUX_CANCELLED`, stopped with 0, and there is no
-    result). `abort.abort(code)` ends it with that code instead: both
-    downstream parts are reset and both upstream parts stopped with it, and
-    the directions still running report `SpliceEnd.CANCELLED` with `code`;
-    a handle aborted before the start ends the splice at once. The limiters
-    run on the event loop running when it is called (`NoRunningLoopError`
-    without one): a direction takes `acquire(1, k)` for each chunk it reads
-    and refunds what it did not forward, and a forwarded stream datagram
-    `try_acquire(n, n)`, dropped without a grant. A failing `acquire` ends
-    the direction with `SpliceEnd.LIMITER_FAILED`."""
-
-async def splice_packets(
-    a: tuple[SendStream, RecvStream],
-    b: tuple[SendStream, RecvStream],
-    *,
-    chunk: int = 65536,
-    a_to_b: Limiter | None = None,
-    b_to_a: Limiter | None = None,
-    abort: SpliceAbort | None = None,
-) -> SpliceResult:
-    """Relays two packet streams as `splice` does: stream bytes pass through
-    with only capsule headers parsed, and a stream datagram that does not fit
-    the next hop's datagrams goes on as a DATAGRAM capsule at the next
-    capsule boundary (`SpliceDirection.datagrams_as_capsules`). A capsule never
-    becomes a datagram. A direction's limiter is asked `acquire(n, n)` once
-    for each whole capsule (n its Type, Length and Value bytes) and
-    `try_acquire(n, n)` for each datagram it forwards."""
+    a_to_b_datagrams: _t.DatagramSendOptions | None = None,
+    b_to_a_datagrams: _t.DatagramSendOptions | None = None,
+    a_to_b_hooks: _t.SpliceHooks | None = None,
+    b_to_a_hooks: _t.SpliceHooks | None = None,
+    a_to_b_label: str = "",
+    b_to_a_label: str = "",
+    a_to_b_mirror: SpliceMirror | None = None,
+    b_to_a_mirror: SpliceMirror | None = None,
+    limits: _t.SpliceLimits | None = None,
+    max_packet_payload: int | None = None,
+    max_opaque_value: int | None = None,
+    on_event: Callable[[_t.SpliceEvent], None] | None = None,
+) -> tuple[SpliceController | None, Coroutine[Any, Any, SpliceResult]]:
+    """Transfer the streams into the native relay and return its driver."""
 
 @final
 class SpliceAbort:
@@ -2162,6 +2502,184 @@ class SpliceAbort:
         """The code of the abort, `None` while not aborted."""
 
 @final
+class SpliceSignal:
+    """A one-shot readiness signal shared by a hook and its resumer."""
+
+    def __init__(self) -> None: ...
+    def resume(self) -> None:
+        """Set the signal, including before the relay begins waiting."""
+
+@final
+class SpliceDecision:
+    """An immutable decision for the current hook's group."""
+
+    @staticmethod
+    def pass_(
+        *,
+        delay: float | None = None,
+        timeout: float | None = None,
+        resume: SpliceSignal | None = None,
+    ) -> SpliceDecision:
+        """Keep the group. Delay and timeout are seconds from the decision."""
+
+    @staticmethod
+    def replace(
+        *,
+        delay: float | None = None,
+        timeout: float | None = None,
+        resume: SpliceSignal | None = None,
+    ) -> SpliceDecision:
+        """Use the outputs built by the step, or drop if it built none."""
+
+    @staticmethod
+    def drop() -> SpliceDecision:
+        """Discard the current group."""
+
+    @staticmethod
+    def reset(code: int) -> SpliceDecision:
+        """Reset the target and stop the source, including with code zero."""
+
+@final
+class SpliceUnit:
+    """Scoped payload reader and bounded replacement builder."""
+
+    @property
+    def meta(self) -> _t.SpliceMeta:
+        """Immutable metadata that can be retained after the hook returns."""
+
+    def __len__(self) -> int:
+        """Return the number of items seen by this step."""
+
+    def size(self, item: int = 0) -> int:
+        """Return one item's payload size."""
+
+    def byte_at(self, offset: int, *, item: int = 0) -> int:
+        """Read one byte of an item by index without copying the payload."""
+
+    def read(self, item: int = 0) -> bytes:
+        """Copy one item to independent Python bytes."""
+
+    def append_slice(
+        self,
+        start: int = 0,
+        *,
+        stop: int | None = None,
+        item: int = 0,
+    ) -> None:
+        """Build one output sharing the selected immutable input bytes."""
+
+    def append(self, data: bytes) -> None:
+        """Build one output from immutable Python bytes."""
+
+@final
+class SpliceMirror:
+    """Single-direction, bounded diagnostic tap."""
+
+    def __init__(
+        self,
+        items: int,
+        *,
+        prefix: int = 0,
+        mode: Literal["copy", "lease"] = "copy",
+        backing_bytes: int | None = None,
+    ) -> None:
+        """Reserve a queue of copied or shared prefixes. Lease mode requires a backing limit."""
+
+    async def recv(self) -> _t.SpliceSample | None:
+        """Receive a sample, or None after the mirror closes."""
+
+@final
+class SpliceReceipt:
+    """An admitted injection and its eventual local target disposition."""
+
+    @property
+    def sequence(self) -> int:
+        """The direction-local input sequence."""
+
+    @property
+    def generation(self) -> int:
+        """The hook generation used by this injection."""
+
+    async def disposition(self) -> _t.SpliceDisposition:
+        """Wait for the target disposition. A cancelled wait may be retried."""
+
+@final
+class SplicePause:
+    """Owns one pause generation. Dropping the token also releases the pause."""
+
+    @property
+    def generation(self) -> int:
+        """The direction-local pause generation."""
+
+    async def acknowledged(self) -> None:
+        """Wait for a safe output boundary. This wait can be retried."""
+
+@final
+class SpliceHandoffs:
+    """Live settlement of bytes accepted by a splice direction."""
+
+    def snapshot(self) -> _t.SpliceHandoffStats:
+        """Read a consistent snapshot of local carrier handoffs and refunds."""
+
+@final
+class SpliceControl:
+    """The ordered command channel of one controlled splice direction."""
+
+    @property
+    def handoffs(self) -> SpliceHandoffs:
+        """Observe local carrier settlement during and after the direction."""
+
+    @property
+    def pre_admission_refunded_bytes(self) -> int:
+        """Bytes the relay refunded before target acceptance, including late grants."""
+
+    async def replace_hooks(self, chain: _t.SpliceHooks) -> int:
+        """Install a new chain at an admission boundary and return its generation.
+
+        A committed replacement remains installed after cancellation.
+        """
+
+    async def pause(self) -> SplicePause:
+        """Request a pause and return the token that owns it."""
+
+    async def resume(self, pause: SplicePause) -> None:
+        """Resume using the current direction's pause token.
+
+        A committed resume stays in effect after cancellation.
+        """
+
+    async def inject(
+        self,
+        payload: Buffer,
+        *,
+        kind: _t.SpliceKind = "stream",
+        capsule_type: int | None = None,
+        context: int | None = None,
+    ) -> SpliceReceipt:
+        """Admit an input to the current chain and return its local receipt.
+
+        Once admitted, the input can be forwarded even if the awaiter is cancelled.
+        """
+
+    async def finished(self) -> tuple[_t.SpliceEnd, int | None]:
+        """Wait for this direction's reliable end and optional application code."""
+
+@final
+class SpliceController:
+    """The two direction handles and abort control of a controlled splice."""
+
+    @property
+    def a_to_b(self) -> SpliceControl:
+        """Control the direction from the first stream to the second."""
+
+    @property
+    def b_to_a(self) -> SpliceControl:
+        """Control the direction from the second stream to the first."""
+
+    def abort(self, code: int) -> None:
+        """Abort both remaining directions with this application code."""
+
+@final
 class PacketStream:
     """Packets over a bidirectional stream, each as a datagram of the stream
     or as a DATAGRAM capsule in its bytes, as `policy` says. Packets are
@@ -2173,6 +2691,15 @@ class PacketStream:
     direction. Every coroutine is cancellation-safe: a cancelled send is
     completed by the next send or `close`, and a packet whose receive was
     cancelled is returned by the next one."""
+
+    async def send_with(
+        self,
+        payload: bytes,
+        *,
+        options: _t.DatagramSendOptions,
+        context: int = 0,
+    ) -> _t.Sent:
+        """Sends with local datagram options. Cancellation may write a capsule prefix."""
 
     def __init__(
         self,
@@ -2212,6 +2739,15 @@ class PacketSender:
         """See `PacketStream.send`."""
     async def close(self) -> None:
         """See `PacketStream.close`."""
+    async def send_with(
+        self,
+        payload: bytes,
+        *,
+        options: _t.DatagramSendOptions,
+        context: int = 0,
+    ) -> _t.Sent:
+        """Sends with local datagram options. Cancellation may write a capsule prefix."""
+
     def stats(self) -> PacketStats:
         """The counters of the sending direction."""
 

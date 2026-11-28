@@ -6,40 +6,20 @@ import contextlib
 import dataclasses
 import datetime
 import math
-from collections.abc import AsyncIterator, Callable
 from typing import Any, cast
 
 import pytest
 import zmux
-
-
-@contextlib.asynccontextmanager
-async def pair(
-    client: zmux.Config | None = None,
-    server: zmux.Config | None = None,
-    max_record: int = 0,
-) -> AsyncIterator[tuple[zmux.Session, zmux.Session, zmux.Listener]]:
-    """A connected session pair over TCP, and the server's listener; the
-    client's carrier takes records of at most `max_record` (0: the
-    default)."""
-    async with zmux.Listener(config=server) as listener:
-        addr = await listener.serve_tcp("127.0.0.1", 0)
-        pipe = await zmux.dial_tcp(*addr)
-        pipe.set_max_record(max_record)
-        c = await zmux.Session.connect(pipe, config=client)
-        s = await listener.accept()
-        try:
-            yield c, s, listener
-        finally:
-            c.abort(0)
-            s.abort(0)
-            await asyncio.gather(c.wait_closed(), s.wait_closed())
-
-
-async def until(cond: Callable[[], object], limit: float = 5.0) -> None:
-    async with asyncio.timeout(limit):
-        while not cond():
-            await asyncio.sleep(0.005)
+from support import CallbackSignal
+from support import (
+    QUIET_LIVENESS,
+    TEST_HOOKS,
+    WATCHDOG,
+    manual_clock,
+    start_pending,
+    until,
+)
+from support import tcp_pair as pair
 
 
 def test_config_fields() -> None:
@@ -51,20 +31,24 @@ def test_config_fields() -> None:
         memory_budget=None,
         max_incoming_uni_streams=0,
         send_buffer_max=1 << 22,
-        max_pipes=4,
-        pipe_headroom=2,
-        replay_window=64,
+        session_policy=zmux.SessionPolicy(
+            limits=zmux.CapacityLimits(steady_attachments=4, join_headroom=2)
+        ),
         max_lanes=1,
         scheduler="spread-eta",
         spread_chunk=8192,
         overflow_delay=0.5,
         redundancy="off",
         pipe_auth=zmux.PipeAuth.exporter().with_psk(b"k" * 32),
-        early_data=False,
         carrier_early_data=False,
         latency_budget=0.001,
     )
-    assert c.replace(max_pipes=2).max_pipes == 2
+    updated = c.replace(
+        session_policy=zmux.SessionPolicy(
+            limits=zmux.CapacityLimits(steady_attachments=2)
+        )
+    )
+    assert updated.session_policy.limits.steady_attachments == 2
     assert c.memory_budget is None and c.liveness.keep_alive_period is None
     with pytest.raises(TypeError):
         zmux.Config(idle_timeout=5)  # type: ignore[call-arg]
@@ -72,6 +56,23 @@ def test_config_fields() -> None:
         zmux.Config(scheduler="fastest")
     with pytest.raises(ValueError):
         zmux.Config(redundancy="always")
+
+
+async def test_explicit_config_defaults_match_omitted_config() -> None:
+    config = zmux.Config()
+    async with (
+        pair() as (implicit, _, _),
+        pair(config, config) as (explicit, _, _),
+    ):
+        assert implicit.liveness == explicit.liveness == config.liveness
+        assert (
+            implicit.shaping_limits
+            == explicit.shaping_limits
+            == zmux.shaping.ShapingLimits()
+        )
+        assert implicit.scheduler == explicit.scheduler == config.scheduler
+        assert implicit.max_datagram_size == explicit.max_datagram_size
+        assert implicit.pipes()[0].options == explicit.pipes()[0].options
 
 
 async def test_keep_alive_and_standby_probe_values() -> None:
@@ -84,6 +85,7 @@ async def test_keep_alive_and_standby_probe_values() -> None:
     assert lv.dead_timeout is zmux.AUTO
     assert c.max_stream_receive_window is zmux.AUTO
     assert c.max_incoming_uni_streams is zmux.STAGED
+    assert c.memory_budget == 1 << 30
     off: dict[str, Any] = {
         "handshake_timeout": None,
         "max_idle_timeout": None,
@@ -94,10 +96,12 @@ async def test_keep_alive_and_standby_probe_values() -> None:
     }
     async with pair(client=zmux.Config(**off)):
         pass
-    async with pair(
-        client=zmux.Config(liveness=zmux.Liveness(keep_alive_period=1), memory_budget=0)
-    ):
+    minimum = zmux.Config(liveness=zmux.Liveness(keep_alive_period=1))
+    async with pair(client=minimum):
         pass
+    with pytest.raises(zmux.MemoryBudgetError):
+        async with pair(client=minimum.replace(memory_budget=0)):
+            pytest.fail("a zero budget cannot fund session setup")
     bad: dict[str, Any]
     for bad in (
         {"liveness": zmux.Liveness(standby_probe=0.5)},
@@ -121,7 +125,7 @@ async def test_keep_alive_and_standby_probe_values() -> None:
 
 
 def test_none_only_where_a_field_has_an_off_setting() -> None:
-    for field in ("join_timeout", "max_pipes", "latency_budget", "scheduler"):
+    for field in ("join_timeout", "session_policy", "latency_budget", "scheduler"):
         with pytest.raises(ValueError):
             zmux.Config(**cast("dict[str, Any]", {field: None}))
     zmux.Config(join_early_hello=None, resume_timeout=None, probation=None)
@@ -150,44 +154,22 @@ async def test_listener_set_limits() -> None:
             listener.set_limits(dataclasses.replace(lim, max_pending_per_source=1))
         assert listener.limits() == lim
         new = dataclasses.replace(
-            lim, max_pending=7, first_record_timeout=0.5, memory_budget=None
+            lim,
+            max_pending=7,
+            first_record_timeout=0.5,
+            memory_budget=None,
+            session_receive_growth_limit=65536,
         )
         listener.set_limits(new)
         assert listener.limits() == new
 
 
-async def test_hold_first_flight() -> None:
-    async with zmux.Listener() as listener:
-        addr = await listener.serve_tcp("127.0.0.1", 0)
-        c = await zmux.Session.connect(
-            await zmux.dial_tcp(*addr),
-            config=zmux.Config(early_data=True, hold_first_flight=True),
-        )
-        send, _recv = await c.open_bi()
-        await send.write(b"first flight")
-        await asyncio.wait_for(send.flush(), 1)
-        accepted = asyncio.ensure_future(listener.accept())
-        await asyncio.sleep(0.05)
-        assert not accepted.done()
-        assert c.stats().bytes_sent == 0
-        c.release_first_flight()
-        c.release_first_flight()
-        s = await asyncio.wait_for(accepted, 5)
-        _send, recv = await s.accept_bi()
-        assert await recv.read_exact(12) == b"first flight"
-        assert c.stats().first_flight_timeouts == 0
-        c.abort(0)
-        s.abort(0)
-        await asyncio.gather(c.wait_closed(), s.wait_closed())
-
-
-async def test_hold_first_flight_needs_client_early_data() -> None:
-    async with zmux.Listener() as listener:
-        addr = await listener.serve_tcp("127.0.0.1", 0)
-        with pytest.raises(Exception, match="hold_first_flight"):
-            await zmux.Session.connect(
-                await zmux.dial_tcp(*addr), config=zmux.Config(hold_first_flight=True)
-            )
+async def test_connect_memory_budget_error() -> None:
+    carrier, other = zmux.adapter.pipe_pair()
+    with pytest.raises(zmux.MemoryBudgetError) as denied:
+        await zmux.Session.connect(carrier, config=zmux.Config(memory_budget=1))
+    assert denied.value.kind is zmux.ErrorKind.MEMORY_BUDGET
+    assert await other.read() == b""
 
 
 def test_pipe_auth_is_immutable() -> None:
@@ -213,6 +195,49 @@ async def test_try_open_bi_without_credit_raises() -> None:
         assert sr.preamble.info == b"i" and not sr.preamble.pipe_carrier
 
 
+@pytest.mark.skipif(not TEST_HOOKS, reason="requires observing pending stream credit")
+@pytest.mark.parametrize("unidirectional", [False, True])
+async def test_async_preamble_open_waits_for_credit(unidirectional: bool) -> None:
+    limits = zmux.Config(max_incoming_streams=0, max_incoming_uni_streams=0)
+    tlv = zmux.Tlv(0x1000, b"route")
+    async with pair(server=limits) as (client, server, _):
+
+        async def open_with_info(
+            info: bytes,
+        ) -> tuple[zmux.SendStream, zmux.RecvStream | None]:
+            if unidirectional:
+                return await client.open_uni(info=info, tlvs=[tlv]), None
+            return await client.open_bi(info=info, tlvs=[tlv])
+
+        withdrawn = await start_pending(lambda: open_with_info(b"withdrawn"))
+        withdrawn.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await withdrawn
+
+        waiting = await start_pending(lambda: open_with_info(b"survivor"))
+        try:
+            server.raise_incoming_streams(
+                bidi=int(not unidirectional), uni=int(unidirectional)
+            )
+            send, reply = await waiting
+        finally:
+            if not waiting.done():
+                waiting.cancel()
+                await asyncio.gather(waiting, return_exceptions=True)
+
+        await send.write(b"payload")
+        await send.finish()
+        if unidirectional:
+            recv = await server.accept_uni()
+        else:
+            peer_send, recv = await server.accept_bi()
+            await peer_send.finish()
+        assert recv.preamble == zmux.Preamble(info=b"survivor", tlvs=(tlv,))
+        assert await recv.read_to_end() == b"payload"
+        if reply is not None:
+            assert await reply.read_to_end() == b""
+
+
 async def test_chunks_without_copying() -> None:
     async with pair() as (c, s, _l):
         send, _recv = await c.open_bi()
@@ -228,6 +253,56 @@ async def test_chunks_without_copying() -> None:
                 break
             got += chunk.tobytes()
         assert got == b"abcd"
+
+
+@pytest.mark.skipif(not TEST_HOOKS, reason="requires read allocation fault injection")
+@pytest.mark.parametrize("chunk", [False, True])
+@pytest.mark.parametrize("returned", [False, True])
+async def test_read_allocation_failure_preserves_data(
+    chunk: bool, returned: bool
+) -> None:
+    async with pair() as (client, server, _):
+        server._test_read_loan_slots(1)
+        send = await client.open_uni()
+        await send.write(b"payload")
+        await send.finish()
+        recv = await server.accept_uni()
+        await recv.wait_readable()
+        if returned:
+            recv._put_back([b"returned"])
+        read = recv.read_chunk if chunk else recv.read
+        payload = b"returned" if returned else b"payload"
+        recv._test_fail_read_allocation()
+        with pytest.raises(MemoryError):
+            await read(len(payload))
+        assert bytes(await read(len(payload))) == payload
+        if returned:
+            assert await recv.read_exact(7) == b"payload"
+        assert await recv.read() == b""
+
+
+@pytest.mark.skipif(not TEST_HOOKS, reason="requires a constrained read lease budget")
+async def test_derived_views_hold_the_lease_and_copying_read_can_progress() -> None:
+    async with pair() as (client, server, _):
+        server._test_read_loan_slots(1)
+        send = await client.open_uni()
+        await send.write(b"abc")
+        await send.finish()
+        recv = await server.accept_uni()
+        await recv.wait_readable()
+        first = recv.try_read_chunk(1)
+        assert first is not None
+        with first:
+            derived = first[:]
+        with derived:
+            assert derived.tobytes() == b"a"
+            with pytest.raises(zmux.BorrowLimitError) as limited:
+                await recv.read_chunk(1)
+            assert limited.value.kind == zmux.ErrorKind.BORROW_LIMIT
+            assert await recv.read(1) == b"b"
+        last = await recv.read_chunk(1)
+    with last:
+        assert last.readonly and last.tobytes() == b"c"
 
 
 async def test_send_capacity_and_stream_settings() -> None:
@@ -299,13 +374,13 @@ async def test_reject_and_final_stream_stats() -> None:
         await send.write(b"abc")
         await send.finish()
         keep, sr = await s.accept_bi()
-        await until(lambda: keep.stats().bytes_received == 3)
+        await until(s, lambda: keep.stats().bytes_received == 3)
         sr.reject()
         with pytest.raises(zmux.StreamError):
             await sr.read()
         with pytest.raises(zmux.StreamError):
             sr.reject()
-        await until(lambda: s.stats().streams_active == 0)
+        await until(s, lambda: s.stats().streams_active == 0)
         # The session released the stream; the handle keeps its last values.
         assert keep.stats().bytes_received == 3
         with pytest.raises(zmux.StreamError):
@@ -324,11 +399,6 @@ async def test_pipe_and_listener_stats() -> None:
         assert st.bytes_sent > 0 and st.records_sent > 0 and st.request_seq == 0
         assert st.rtt_source is None or isinstance(st.rtt_source, zmux.RttSource)
         assert st.since_last_traffic is not None
-        await asyncio.sleep(0.2)
-        # Measured at the time of the snapshot.
-        later = c.pipes()[0].stats()
-        assert later is not None and later.since_last_traffic is not None
-        assert later.since_last_traffic >= 0.2
         ls = listener.stats()
         assert isinstance(ls, zmux.ListenerStats)
         assert (ls.sessions, ls.joins, ls.rejected) == (1, 0, 0)
@@ -378,7 +448,7 @@ async def test_negotiation_results() -> None:
         send, _recv = await c.open_bi()
         assert send.max_datagram_size() is None
         closing = asyncio.ensure_future(c.shutdown())
-        await until(lambda: s.goaway is not None)
+        await until(s, lambda: s.goaway is not None)
         assert isinstance(s.goaway, zmux.GoAwayReceived)
         closing.cancel()
         with contextlib.suppress(asyncio.CancelledError, zmux.ZmuxError):
@@ -397,7 +467,7 @@ async def test_datagram_queue_sizes() -> None:
     ):
         for i in range(3):
             c.send_datagram(bytes([i]))
-        await until(lambda: s.stats().datagrams_dropped_recv == 1)
+        await until(s, lambda: s.stats().datagrams_dropped_recv == 1)
         # The receive queue keeps the newest two.
         assert await asyncio.wait_for(s.read_datagram(), 5) == b"\x01"
         assert await asyncio.wait_for(s.read_datagram(), 5) == b"\x02"
@@ -452,50 +522,103 @@ async def test_quality_band_and_capacity_floor() -> None:
         zmux.CapacityFloor(rate=0)
 
 
+@pytest.mark.skipif(not TEST_HOOKS, reason="requires the test-hooks build")
 async def test_quality_band_every_change_reports_every_change() -> None:
     """A `rate_ratio` of 1 with no minimum interval reports every change of
     the delivery rate."""
-    async with pair() as (c, s, _l):
-        c.quality_band = zmux.QualityBand(rate_ratio=1.0, min_interval=None)
+    clock, peer_clock = manual_clock(), manual_clock()
+    release_ack = asyncio.Event()
+    release_ack.set()
 
-        async def drain() -> None:
-            _send, recv = await s.accept_bi()
-            while await recv.read(65536):
-                pass
+    async with asyncio.timeout(WATCHDOG), asyncio.TaskGroup() as tasks:
+        client, near = zmux.adapter.pipe_pair()
+        server, far = zmux.adapter.pipe_pair()
 
-        async def watch() -> None:
-            async for e in c.events():
-                if isinstance(e, zmux.PipeQualityChanged):
-                    return
+        async def pump(
+            source: zmux.adapter.PipeEnd,
+            target: zmux.adapter.PipeEnd,
+            *,
+            gate: asyncio.Event | None = None,
+        ) -> None:
+            while data := await source.read():
+                if gate is not None:
+                    await gate.wait()
+                await target.write(data)
 
-        tasks = [asyncio.create_task(drain()), asyncio.create_task(watch())]
-        send, _recv = await c.open_bi()
+        up = tasks.create_task(pump(near, far))
+        down = tasks.create_task(pump(far, near, gate=release_ack))
+        accept = tasks.create_task(
+            zmux.Session.accept(
+                server,
+                config=zmux.Config(
+                    clock_domain=peer_clock.domain, liveness=QUIET_LIVENESS
+                ),
+            )
+        )
+        c = await zmux.Session.connect(
+            client,
+            config=zmux.Config(clock_domain=clock.domain, liveness=QUIET_LIVENESS),
+        )
+        s = await accept
         try:
-            async with asyncio.timeout(15):
-                while not tasks[1].done():
-                    await send.write(b"x" * 65536)
-                    await asyncio.sleep(0)
-                await tasks[1]
+            await c.ping()
+            c.quality_band = zmux.QualityBand(rate_ratio=1.0, min_interval=None)
+            send, _ = await c.open_bi()
+            await send.flush()
+            _, recv = await s.accept_bi()
+
+            async def sample(delay: float) -> None:
+                data = b"x" * 8192
+                release_ack.clear()
+                await send.write(data)
+                assert await recv.read_exact(len(data)) == data
+                clock.advance(delay)
+                # The peer's default delayed ACK is now due on its own clock.
+                peer_clock.advance(0.025)
+                release_ack.set()
+                await c.ping()
+
+            await sample(0.001)
+            baseline = c.pipe_stats()[0].delivery_rate
+            assert baseline is not None
+            # The second short round makes both intervals used by the rate
+            # estimator shorter than they were in the slow round.
+            await sample(0.000001)
+            await sample(0.000001)
+            async for event in c.events():
+                if isinstance(event, zmux.PipeQualityChanged):
+                    assert event.pipe == 0
+                    assert event.delivery_rate is not None
+                    assert event.delivery_rate > baseline
+                    break
+            else:
+                pytest.fail("the session ended before reporting the changed rate")
         finally:
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            c.abort(0)
+            s.abort(0)
+            up.cancel()
+            down.cancel()
+            await near.write(b"")
+            await far.write(b"")
+            await asyncio.gather(c.wait_closed(), s.wait_closed())
 
 
 async def test_nested_session_over_a_carrier_stream() -> None:
     async with pair() as (c, s, _l):
 
         async def inner_server() -> zmux.Session:
-            send, recv = await s.accept_bi()
-            assert recv.preamble.pipe_carrier
-            assert recv.preamble.tlvs == (zmux.Tlv(0x1000, b"route"),)
-            inner = await zmux.Session.accept(zmux.adapter.stream_pipe(send, recv))
+            carrier_send, carrier_recv = await s.accept_bi()
+            assert carrier_recv.preamble.pipe_carrier
+            assert carrier_recv.preamble.tlvs == (zmux.Tlv(0x1000, b"route"),)
+            nested = await zmux.Session.accept(
+                zmux.adapter.stream_pipe(carrier_send, carrier_recv)
+            )
             with pytest.raises(zmux.StreamError):
-                send.send_capacity()  # used up by stream_pipe
-            a, b = await inner.accept_bi()
+                carrier_send.send_capacity()  # used up by stream_pipe
+            a, b = await nested.accept_bi()
             await a.write(await b.read_to_end())
             await a.finish()
-            return inner
+            return nested
 
         task = asyncio.create_task(inner_server())
         carrier = await c.open_pipe_stream(tlvs=[(0x1000, b"route")])
@@ -516,6 +639,8 @@ async def test_nested_session_over_a_carrier_stream() -> None:
 class Counting:
     """A limiter that allows everything and counts what it handed out and
     got back."""
+
+    max_burst_bytes = (1 << 64) - 1
 
     def __init__(self) -> None:
         self.taken = 0
@@ -545,16 +670,16 @@ async def test_splice_forwards_and_takes_what_it_forwards() -> None:
         async def relay() -> tuple[zmux.helpers.SpliceResult, Counting]:
             a = await relay_in.accept_bi()
             b = await relay_out.open_bi()
-            limiter = Counting()
+            budget = Counting()
             with pytest.raises(ValueError):
                 await zmux.helpers.splice(a, a)
-            done = await zmux.helpers.splice(a, b, chunk=4096, a_to_b=limiter)
-            return done, limiter
+            result = await zmux.helpers.splice(a, b, chunk=4096, a_to_b=budget)
+            return result, budget
 
         async def echo() -> None:
-            send, recv = await server.accept_bi()
-            await send.write(await recv.read_to_end())
-            await send.finish()
+            reply, request = await server.accept_bi()
+            await reply.write(await request.read_to_end())
+            await reply.finish()
 
         tasks = asyncio.gather(relay(), echo())
         send, recv = await c.open_bi()
@@ -613,10 +738,10 @@ def test_negative_durations_raise() -> None:
                 limits=zmux.ListenerLimits(first_record_timeout=float("nan"))
             )
         ),
-        lambda: zmux.CarrierCache(success_ttl=-1),
+        lambda: zmux.CarrierCache(half_life=-1),
         lambda: zmux.ExchangeOptions(idle_timeout=-1),
         lambda: zmux.Admission.prefix_auth(
-            zmux.PrefixAuth(b"k" * 32, slot=30), skew=1, peek_timeout=-1
+            zmux.MemoryPrefixStore([], window=zmux.PrefixWindow(30)), peek_timeout=-1
         ),
     ):
         with pytest.raises(ValueError):
@@ -647,25 +772,29 @@ def test_pipe_options_defaults_and_sentinels() -> None:
 
 async def test_stream_credit_maximum_and_datagram_stream_bytes() -> None:
     assert zmux.MAX_STREAM_CREDIT == 1 << 60
-    c = zmux.Config()
-    assert c.datagram_stream_bytes == 512 * 1024
-    assert zmux.Config(datagram_stream_bytes=None).datagram_stream_bytes is None
-    assert c.replace(datagram_stream_bytes=1 << 20).datagram_stream_bytes == 1 << 20
+    assert zmux.DatagramConfig().stream_receive_bytes == 512 * 1024
     big = zmux.Config(
+        memory_budget=None,
         max_incoming_streams=zmux.MAX_STREAM_CREDIT,
         max_incoming_uni_streams=zmux.MAX_STREAM_CREDIT,
         enable_datagrams=True,
-        datagram_stream_bytes=None,
+        datagram=zmux.DatagramConfig(stream_receive_bytes=None),
     )
-    async with pair(client=big, server=big) as (client, server, _):
+    async with pair(client=big, server=zmux.Config(enable_datagrams=True)) as (
+        client,
+        server,
+        _,
+    ):
         client.raise_incoming_streams(bidi=zmux.MAX_STREAM_CREDIT)
         with pytest.raises(ValueError):
             client.raise_incoming_streams(bidi=zmux.MAX_STREAM_CREDIT + 1)
-        send, _ = await client.open_bi()
+        send, _ = await server.open_bi()
         await send.write(b"x")
-        assert await server.accept_bi()
+        await send.finish()
+        _, receive = await client.accept_bi()
+        assert await receive.read_to_end() == b"x"
     invalid: list[dict[str, Any]] = [
-        {"datagram_stream_bytes": 0},
+        {"datagram": zmux.DatagramConfig(stream_receive_bytes=0)},
         {"max_incoming_streams": zmux.MAX_STREAM_CREDIT + 1},
         {"max_incoming_uni_streams": zmux.MAX_STREAM_CREDIT + 1},
     ]
@@ -674,11 +803,13 @@ async def test_stream_credit_maximum_and_datagram_stream_bytes() -> None:
             async with pair(client=zmux.Config(**bad)):
                 pass
     with pytest.raises(ValueError):
-        zmux.Config(datagram_stream_bytes=-1)
+        zmux.Config(datagram=zmux.DatagramConfig(stream_receive_bytes=-1))
 
 
 async def test_the_stream_datagram_queue_is_bounded_by_its_bytes() -> None:
-    cfg = zmux.Config(enable_datagrams=True, datagram_stream_bytes=4096)
+    cfg = zmux.Config(
+        enable_datagrams=True, datagram=zmux.DatagramConfig(stream_receive_bytes=4096)
+    )
     async with pair(client=cfg, server=cfg) as (client, server, _):
         send, _ = await client.open_bi()
         await send.write(b"x")
@@ -686,14 +817,14 @@ async def test_the_stream_datagram_queue_is_bounded_by_its_bytes() -> None:
         await recv.read_exact(1)
         for i in range(8):
             send.send_datagram(bytes([i]) * 1500)
-        await asyncio.sleep(0.2)
-        got = []
-        with contextlib.suppress(TimeoutError):
-            async with asyncio.timeout(0.3):
-                while True:
-                    got.append(await recv.read_datagram())
-        # Two 1500-byte datagrams fit in 4096 bytes: the oldest made room.
-        assert len(got) <= 2 and got[-1][1] == bytes([7]) * 1500
+        await until(server, lambda: recv.stats().datagrams_received == 8)
+        # The queue can hold only the last two 1500-byte datagrams.
+        got = [await recv.read_datagram(), await recv.read_datagram()]
+        assert [body for _, body in got] == [bytes([i]) * 1500 for i in (6, 7)]
+        empty = await start_pending(recv.read_datagram)
+        empty.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await empty
 
 
 async def test_listener_source_prefixes() -> None:
@@ -764,7 +895,6 @@ async def test_splice_abort_ends_with_the_code(packets: bool) -> None:
         await send.write(b"hello")
         _s_send, s_recv = await server.accept_bi()
         assert await s_recv.read_exact(5) == b"hello"
-        await asyncio.sleep(0.05)
         abort.abort(0x77)
         abort.abort(0x99)  # the first code stays
         assert abort.code == 0x77
@@ -777,17 +907,10 @@ async def test_splice_abort_ends_with_the_code(packets: bool) -> None:
         with pytest.raises(zmux.StreamResetError) as r:
             await asyncio.wait_for(s_recv.read_to_end(), 5)
         assert r.value.code == 0x77
+        assert await send.stopped() == 0x77
         with pytest.raises(zmux.StreamStoppedError) as w:
-            await until_raises(send)
+            await send.write(b"x")
         assert w.value.code == 0x77
-
-
-async def until_raises(*sends: zmux.SendStream) -> None:
-    async with asyncio.timeout(5):
-        while True:
-            for s in sends:
-                await s.write(b"x")
-            await asyncio.sleep(0.01)
 
 
 async def test_splice_abort_before_start_ends_at_once() -> None:
@@ -824,10 +947,12 @@ async def test_flush_succeeds_once_data_left_and_the_stop_comes_after() -> None:
 
 def test_hooks_bind_to_the_loop_of_first_use() -> None:
     seen: list[tuple[int, int]] = []
+    notifications = CallbackSignal()
 
     class Trace(zmux.Tracer):
         def established(self, session: int) -> None:
             seen.append((session, threading.get_ident()))
+            notifications.notify()
 
     # Made with no loop running: bound when the connect uses it.
     config = zmux.Config(tracer=Trace())
@@ -836,7 +961,7 @@ def test_hooks_bind_to_the_loop_of_first_use() -> None:
         async with zmux.Listener() as listener:
             addr = await listener.serve_tcp("127.0.0.1", 0)
             async with await zmux.connect_tcp(*addr, config=config) as c:
-                await until(lambda: bool(seen))
+                await until(notifications, lambda: bool(seen))
                 return c.id, threading.get_ident()
 
     assert seen == [asyncio.run(main())]
@@ -866,5 +991,5 @@ async def test_datagram_queue_delay_and_path_datagram_size() -> None:
         assert client.path_datagram_size == client.max_datagram_size
         send, _ = await client.open_bi()
         assert send.path_datagram_size(3) == send.max_datagram_size(3)
-    ev = zmux.DatagramPathChanged(1200)
-    assert ev.kind is zmux.EventKind.DATAGRAM_PATH_CHANGED and ev.size == 1200
+    ev = zmux.DatagramPathChanged(zmux.DatagramPath(1200, 1200, 1100))
+    assert ev.kind is zmux.EventKind.DATAGRAM_PATH_CHANGED and ev.path.payload == 1200

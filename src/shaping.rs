@@ -3,39 +3,51 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyMapping;
-use zmux::shaping::{Account, Budget, Factory, ShapedPipe, Shaper, ShapingBudget};
+use pyo3::types::{PyBool, PyInt, PyMapping};
+use zmux::shaping::{Account, Budget, Factory, ProfileLimits, ShapedPipe, Shaper, ShapingBudget};
 use zmux_shaping::{MachineFactory, Options, SizeLimits, Source};
 
 fn attr<'py, T: FromPyObjectOwned<'py>>(o: &Bound<'py, PyAny>, name: &str) -> PyResult<T> {
     o.getattr(name)?.extract().map_err(Into::into)
 }
 
-/// A wait bound: seconds, or `None` for none.
-fn wait_of(o: &Bound<'_, PyAny>) -> PyResult<Option<Duration>> {
-    let v: Option<f64> = attr(o, "max_delay")?;
-    v.map(|v| crate::seconds("max_delay", v)).transpose()
-}
-
-fn wait_obj(d: Option<Duration>) -> Option<f64> {
-    d.map(|d| d.as_secs_f64())
-}
-
-fn account_of(o: &Bound<'_, PyAny>) -> PyResult<Account> {
-    let w = o.getattr("wire")?;
+fn account(w: &Bound<'_, PyAny>) -> PyResult<Account> {
+    use zmux::shaping::{MAX_ACCOUNT_INITIAL, MAX_ACCOUNT_RATE};
+    let field = |name, max| {
+        let v = w.getattr(name)?;
+        v.extract::<u64>()
+            .ok()
+            .filter(|n| v.is_instance_of::<PyInt>() && !v.is_instance_of::<PyBool>() && *n <= max)
+            .ok_or_else(|| PyValueError::new_err(format!("{name} is an integer in [0, {max}]")))
+    };
     Ok(Account::new(
-        attr(&w, "initial")?,
-        attr(&w, "per_mb")?,
-        attr(&w, "per_sec")?,
+        field("ceiling", MAX_ACCOUNT_INITIAL)?,
+        field("initial", MAX_ACCOUNT_INITIAL)?,
+        field("per_mb", MAX_ACCOUNT_RATE)?,
+        field("per_sec", MAX_ACCOUNT_RATE)?,
     ))
+}
+
+#[pyfunction(name = "_check_shaping_account")]
+pub(crate) fn check_account(o: &Bound<'_, PyAny>) -> PyResult<()> {
+    let mut l = zmux::shaping::Limits::default();
+    l.wire = Some(account(o)?);
+    l.validate().map_err(crate::value_err)
+}
+
+#[pyfunction(name = "_check_shaping_profile")]
+pub(crate) fn check_profile(o: &Bound<'_, PyAny>) -> PyResult<()> {
+    Budget::new(None, Some(profile_value(o)?), false)
+        .validate()
+        .map_err(crate::value_err)
 }
 
 fn account_obj<'p>(py: Python<'p>, a: &Account) -> PyResult<Bound<'p, PyAny>> {
     let d = pyo3::types::PyDict::new(py);
+    d.set_item("ceiling", a.ceiling)?;
     d.set_item("initial", a.initial)?;
     d.set_item("per_mb", a.per_mb)?;
     d.set_item("per_sec", a.per_sec)?;
@@ -44,16 +56,49 @@ fn account_obj<'p>(py: Python<'p>, a: &Account) -> PyResult<Bound<'p, PyAny>> {
         .call((), Some(&d))
 }
 
+fn optional_account(value: &Bound<'_, PyAny>) -> PyResult<Option<Account>> {
+    crate::optional(value).map(account).transpose()
+}
+
+fn profile_value(value: &Bound<'_, PyAny>) -> PyResult<ProfileLimits> {
+    let delay = value.getattr("max_added_delay")?;
+    if delay.is_instance_of::<PyBool>() {
+        return Err(PyValueError::new_err(
+            "max_added_delay is a duration in seconds",
+        ));
+    }
+    Ok(ProfileLimits::new(
+        crate::field_count("window_seconds", &value.getattr("window_seconds")?)?,
+        crate::field_count("extra_bytes_ppm", &value.getattr("extra_bytes_ppm")?)?,
+        crate::field_count("floor_bytes", &value.getattr("floor_bytes")?)?,
+        crate::field_secs("max_added_delay", &delay)?,
+    ))
+}
+
+fn profile(value: &Bound<'_, PyAny>) -> PyResult<Option<ProfileLimits>> {
+    crate::optional(value).map(profile_value).transpose()
+}
+
+pub(crate) fn profile_obj(py: Python<'_>, value: ProfileLimits) -> PyResult<Bound<'_, PyAny>> {
+    let d = pyo3::types::PyDict::new(py);
+    d.set_item("window_seconds", value.window_seconds)?;
+    d.set_item("extra_bytes_ppm", value.extra_bytes_ppm)?;
+    d.set_item("floor_bytes", value.floor_bytes)?;
+    d.set_item("max_added_delay", value.max_added_delay.as_secs_f64())?;
+    crate::types(py)?
+        .getattr("ShapingProfileLimits")?
+        .call((), Some(&d))
+}
+
 /// The local limits of a `zmux.ShapingLimits`.
 pub(crate) fn limits_of(o: &Bound<'_, PyAny>) -> PyResult<zmux::shaping::Limits> {
     let mut l = zmux::shaping::Limits::default();
-    l.wire = account_of(o)?;
-    l.max_delay = wait_of(o)?;
+    l.wire = optional_account(&o.getattr("wire")?)?;
+    l.profile = profile(&o.getattr("profile")?)?;
     l.no_padding = attr(o, "no_padding")?;
     l.no_pause = attr(o, "no_pause")?;
     l.no_injection = attr(o, "no_injection")?;
-    l.validate()
-        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    l.validate().map_err(crate::value_err)?;
     Ok(l)
 }
 
@@ -63,8 +108,14 @@ pub(crate) fn limits_obj<'p>(
     l: &zmux::shaping::Limits,
 ) -> PyResult<Bound<'p, PyAny>> {
     let d = pyo3::types::PyDict::new(py);
-    d.set_item("wire", account_obj(py, &l.wire)?)?;
-    d.set_item("max_delay", wait_obj(l.max_delay))?;
+    d.set_item(
+        "wire",
+        l.wire.as_ref().map(|a| account_obj(py, a)).transpose()?,
+    )?;
+    d.set_item(
+        "profile",
+        l.profile.map(|p| profile_obj(py, p)).transpose()?,
+    )?;
     d.set_item("no_padding", l.no_padding)?;
     d.set_item("no_pause", l.no_pause)?;
     d.set_item("no_injection", l.no_injection)?;
@@ -75,8 +126,14 @@ pub(crate) fn limits_obj<'p>(
 
 fn budget_obj<'p>(py: Python<'p>, b: &Budget) -> PyResult<Bound<'p, PyAny>> {
     let d = pyo3::types::PyDict::new(py);
-    d.set_item("wire", account_obj(py, &b.wire)?)?;
-    d.set_item("max_delay", wait_obj(b.max_delay))?;
+    d.set_item(
+        "wire",
+        b.wire.as_ref().map(|a| account_obj(py, a)).transpose()?,
+    )?;
+    d.set_item(
+        "profile",
+        b.profile.map(|p| profile_obj(py, p)).transpose()?,
+    )?;
     d.set_item("no_injection", b.no_injection)?;
     crate::types(py)?
         .getattr("ShapingBudget")?
@@ -87,7 +144,12 @@ fn budget_obj<'p>(py: Python<'p>, b: &Budget) -> PyResult<Bound<'p, PyAny>> {
 /// value, so that no session asks Python on the runtime's threads (a
 /// shaping bundle draws one per session).
 pub(crate) fn budget_of(v: &Bound<'_, PyAny>) -> PyResult<ShapingBudget> {
-    let b = Budget::new(account_of(v)?, wait_of(v)?, attr(v, "no_injection")?);
+    let b = Budget::new(
+        optional_account(&v.getattr("wire")?)?,
+        profile(&v.getattr("profile")?)?,
+        attr(v, "no_injection")?,
+    );
+    b.validate().map_err(crate::value_err)?;
     Ok(ShapingBudget::new(move || b))
 }
 
@@ -143,10 +205,7 @@ fn fold(seed: &[u8]) -> u64 {
 
 /// The executor options of `limits` (definition bounds, default when
 /// absent) and `seed` (absent: the operating system's generator).
-pub(crate) fn options(
-    limits: Option<&Bound<'_, PyAny>>,
-    seed: Option<Vec<u8>>,
-) -> PyResult<Options> {
+fn options(limits: Option<&Bound<'_, PyAny>>, seed: Option<Vec<u8>>) -> PyResult<Options> {
     let mut o = Options::default();
     if let Some(l) = limits {
         o = o.with_limits(size_limits(l)?);
@@ -160,7 +219,7 @@ pub(crate) fn options(
 
 /// A factory that picks a definition by the pipe's carrier: its variant's
 /// own, else its kind's, else the default (`None` key), else no shaping.
-pub(crate) struct ByKind {
+struct ByKind {
     variants: HashMap<Arc<str>, MachineFactory>,
     kinds: HashMap<zmux::CarrierKind, MachineFactory>,
     default: Option<MachineFactory>,
@@ -184,8 +243,7 @@ pub(crate) fn carrier_kind(k: &Bound<'_, PyAny>) -> PyResult<zmux::CarrierKind> 
         Ok(v) if !k.is_instance_of::<pyo3::types::PyString>() => v.extract()?,
         _ => k.extract()?,
     };
-    zmux::CarrierKind::from_name(&name)
-        .ok_or_else(|| PyValueError::new_err(format!("unknown carrier kind {name:?}")))
+    crate::choice::kind(&name)
 }
 
 /// The items of the mapping `m`, the argument `name`.
@@ -198,7 +256,7 @@ fn items<'p>(name: &str, m: &Bound<'p, PyAny>) -> PyResult<Bound<'p, pyo3::types
 /// The factory of `by_kind`, a mapping of carrier kinds (members or names,
 /// `None` for the default), and `by_variant`, a mapping of variants, to
 /// definitions in the JSON form, each parsed and checked with `o`.
-pub(crate) fn by_carrier(
+fn by_carrier(
     by_kind: Option<&Bound<'_, PyAny>>,
     by_variant: Option<&Bound<'_, PyAny>>,
     o: &Options,
@@ -230,6 +288,161 @@ pub(crate) fn by_carrier(
         }
     }
     Ok(f)
+}
+
+/// Outbound shaping and the budget and handshake plans that came with it.
+#[derive(Default)]
+struct Outbound {
+    factory: Option<Arc<dyn Factory>>,
+    budget: Option<ShapingBudget>,
+    handshake: Option<zmux::shaping::HandshakeShaper>,
+}
+
+impl Outbound {
+    fn bundle(v: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let b = v.cast::<ShapingBundle>()?.get().0.clone();
+        Ok(Self {
+            budget: b
+                .resolve("default")
+                .and_then(zmux_shaping::Compiled::budget),
+            handshake: Some(b.handshake_shaper()),
+            factory: Some(b),
+        })
+    }
+}
+
+#[derive(Default)]
+struct Mappings<'py> {
+    kinds: Option<Bound<'py, PyAny>>,
+    variants: Option<Bound<'py, PyAny>>,
+}
+
+impl<'py> Mappings<'py> {
+    fn of(v: &Bound<'py, PyAny>) -> PyResult<Self> {
+        Ok(Self {
+            kinds: crate::optional(&v.getattr("by_kind")?).cloned(),
+            variants: crate::optional(&v.getattr("by_variant")?).cloned(),
+        })
+    }
+
+    fn exclusive(&self, single: bool, message: &str) -> PyResult<()> {
+        if single && (self.kinds.is_some() || self.variants.is_some()) {
+            return Err(PyValueError::new_err(message.to_owned()));
+        }
+        Ok(())
+    }
+
+    fn factory(&self, o: &Options) -> PyResult<Option<Arc<dyn Factory>>> {
+        if self.kinds.is_none() && self.variants.is_none() {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(by_carrier(
+            self.kinds.as_ref(),
+            self.variants.as_ref(),
+            o,
+        )?)))
+    }
+}
+
+/// Collect Config inputs before selecting one outbound source and its budget.
+#[derive(Default)]
+pub(crate) struct ConfigShaping<'py> {
+    pub(crate) bundle: Option<Bound<'py, PyAny>>,
+    pub(crate) kinds: Option<Bound<'py, PyAny>>,
+    pub(crate) variants: Option<Bound<'py, PyAny>>,
+    pub(crate) budget: Option<Bound<'py, PyAny>>,
+    pub(crate) handshake: Option<Bound<'py, PyAny>>,
+}
+
+impl ConfigShaping<'_> {
+    pub(crate) fn apply(self, c: &mut zmux::Config) -> PyResult<()> {
+        let mappings = Mappings {
+            kinds: self.kinds,
+            variants: self.variants,
+        };
+        mappings.exclusive(
+            self.bundle.is_some(),
+            "shaping_bundle cannot be combined with another outbound shaping source",
+        )?;
+        let outbound = match self.bundle.as_ref() {
+            Some(b) => Outbound::bundle(b)?,
+            None => Outbound {
+                factory: mappings.factory(&Options::default())?,
+                ..Outbound::default()
+            },
+        };
+        if let Some(factory) = outbound.factory {
+            c.shaper = Some(factory);
+        }
+        if let Some(budget) = self
+            .budget
+            .as_ref()
+            .map(budget_of)
+            .transpose()?
+            .or(outbound.budget)
+        {
+            c.shaping_budget = Some(budget);
+        }
+        if let Some(handshake) = self
+            .handshake
+            .as_ref()
+            .map(hook_of)
+            .transpose()?
+            .or(outbound.handshake)
+        {
+            c.handshake_shaper = Some(handshake);
+        }
+        Ok(())
+    }
+}
+
+fn shaper_sources<'py>(v: &Bound<'py, PyAny>) -> PyResult<(Option<String>, Mappings<'py>)> {
+    let definition: Option<String> = attr(v, "definition")?;
+    let mappings = Mappings::of(v)?;
+    mappings.exclusive(
+        definition.is_some(),
+        "definition and by_kind or by_variant exclude each other",
+    )?;
+    Ok((definition, mappings))
+}
+
+#[pyfunction(name = "_check_shaper_sources")]
+pub(crate) fn check_sources(v: &Bound<'_, PyAny>) -> PyResult<()> {
+    shaper_sources(v).map(|_| ())
+}
+
+pub(crate) fn set_shaper(session: &zmux::Session, v: Option<&Bound<'_, PyAny>>) -> PyResult<()> {
+    let Some(v) = v else {
+        return session.set_shaper(None, None).map_err(crate::value_err);
+    };
+    if let Ok(i) = v.cast::<InstalledShaper>() {
+        return session
+            .set_shaper(Some(i.get().0.clone()), None)
+            .map_err(crate::value_err);
+    }
+    let outbound = if v.is_instance_of::<ShapingBundle>() {
+        Outbound::bundle(v)?
+    } else {
+        let (definition, mappings) = shaper_sources(v)?;
+        let limits = v.getattr("limits")?;
+        let o = options(crate::optional(&limits), attr(v, "seed")?)?;
+        let factory: Option<Arc<dyn Factory>> = match definition {
+            Some(json) => Some(Arc::new(
+                MachineFactory::from_json(json.as_bytes(), o).map_err(crate::value_err)?,
+            )),
+            None => mappings.factory(&o)?,
+        };
+        Outbound {
+            factory,
+            budget: crate::optional(&v.getattr("budget")?)
+                .map(budget_of)
+                .transpose()?,
+            handshake: None,
+        }
+    };
+    session
+        .set_shaper(outbound.factory, outbound.budget)
+        .map_err(crate::value_err)
 }
 
 fn plan_obj<'p>(py: Python<'p>, p: &zmux::shaping::UnitPlan) -> PyResult<Bound<'p, PyAny>> {
@@ -269,9 +482,10 @@ impl ShapingBundle {
         limits: Option<&Bound<'_, PyAny>>,
         seed: Option<Vec<u8>>,
     ) -> PyResult<Self> {
-        let b: Vec<u8> = match definition.extract::<String>() {
-            Ok(s) => s.into_bytes(),
-            Err(_) => definition.extract()?,
+        let b = if let Some(text) = crate::json_text(definition)? {
+            std::borrow::Cow::Borrowed(text)
+        } else {
+            std::borrow::Cow::Owned(definition.extract::<Vec<u8>>()?)
         };
         let o = options(limits, seed)?
             .with_features(features)
@@ -311,7 +525,7 @@ impl ShapingBundle {
         self.0
             .resolve(kind)
             .and_then(zmux_shaping::Compiled::budget)
-            .map(|b| budget_obj(py, &b.ask()))
+            .map(|b| budget_obj(py, &b.ask().map_err(crate::value_err)?))
             .transpose()
     }
 }

@@ -1,7 +1,10 @@
-//! Carrier choice: `Candidate`, `CarrierChoice`, `CarrierChoicePolicy`,
-//! `CarrierCache` and `connect_choice`, over the Rust crate's.
+//! Carrier candidates and shared scoring history.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicI64, Ordering},
+};
+use std::time::{Duration, SystemTime};
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -10,9 +13,8 @@ use pyo3::types::PyDict;
 use crate::Host;
 use crate::ranged;
 
-use crate::rt::future_into_py;
 use crate::{
-    ExchangeOptions, H3Dial, QuicDial, Session, TlsConfig, WebTransportDial, admission, hostport,
+    ExchangeOptions, H3Dial, QuicDial, TlsConfig, WebSocketDial, WebTransportDial, hostport,
     http_client_options, seconds,
 };
 
@@ -34,37 +36,45 @@ pub(crate) fn result_obj(
     }
 }
 
-async fn tcp(addr: String) -> std::io::Result<tokio::net::TcpStream> {
-    let tcp = tokio::net::TcpStream::connect(addr).await?;
-    let _ = tcp.set_nodelay(true);
-    Ok(tcp)
-}
-
-fn connect(
+pub(crate) fn connect(
     addr: &str,
 ) -> impl Fn() -> std::pin::Pin<Box<dyn Future<Output = std::io::Result<tokio::net::TcpStream>> + Send>>
 + Send
 + Sync
 + 'static {
     let addr = addr.to_owned();
-    move || Box::pin(tcp(addr.clone()))
+    move || Box::pin(crate::tcp_nodelay(addr.clone()))
 }
 
 /// One carrier kind a carrier choice may use; each constructor is named
 /// after the `dial_*` function that opens the same carrier.
 #[pyclass(frozen, module = "zmux")]
-pub(crate) struct Candidate(zmux::Candidate);
+pub(crate) struct Candidate(pub(crate) zmux::Candidate);
+
+impl Candidate {
+    fn from_dial<D, F>(
+        kind: zmux::CarrierKind,
+        dial: D,
+        open: impl Fn(D) -> F + Send + Sync + 'static,
+    ) -> Self
+    where
+        D: Clone + Send + Sync + 'static,
+        F: Future<Output = std::io::Result<zmux::PipeIo>> + Send + 'static,
+    {
+        Self(zmux::Candidate::new(kind, move || open(dial.clone())))
+    }
+}
 
 #[pymethods]
 impl Candidate {
     /// A bidirectional streaming `POST` over HTTP/1.1 to `addr` (kind
     /// `streaming`, as `dial_streaming`).
     #[staticmethod]
-    #[pyo3(signature = (host, port, *, path="/zmux", carrier_credential=None, pair_field=None))]
+    #[pyo3(signature = (host, port, *, path=None, carrier_credential=None, pair_field=None))]
     fn streaming(
         host: Host,
         #[pyo3(from_py_with = ranged)] port: u16,
-        path: &str,
+        path: Option<&str>,
         carrier_credential: Option<Bound<'_, PyAny>>,
         pair_field: Option<String>,
     ) -> PyResult<Self> {
@@ -77,11 +87,11 @@ impl Candidate {
     /// HTTP/1.1 to `addr` (kind `split`, as `dial_split`); as a
     /// further pipe it joins as a downlink and an uplink.
     #[staticmethod]
-    #[pyo3(signature = (host, port, *, path="/zmux", carrier_credential=None, pair_field=None))]
+    #[pyo3(signature = (host, port, *, path=None, carrier_credential=None, pair_field=None))]
     fn split(
         host: Host,
         #[pyo3(from_py_with = ranged)] port: u16,
-        path: &str,
+        path: Option<&str>,
         carrier_credential: Option<Bound<'_, PyAny>>,
         pair_field: Option<String>,
     ) -> PyResult<Self> {
@@ -118,26 +128,9 @@ impl Candidate {
         carrier_credential: Option<Bound<'_, PyAny>>,
         no_subprotocol: bool,
     ) -> PyResult<Self> {
-        let mut opts = zmux_websocket::Options::default().with_no_subprotocol(no_subprotocol);
-        if let Some(c) = admission::carrier_credential(carrier_credential)? {
-            opts = opts.with_carrier_credential(c);
-        }
-        if url.starts_with("wss://") {
-            let c = match tls {
-                Some(t) => t.client_alpn(crate::http1)?,
-                None => TlsConfig::web().client_alpn(crate::http1)?,
-            };
-            let connector = tokio_rustls::TlsConnector::from(Arc::new(c));
-            return Ok(Self(zmux_websocket::candidate_tls(&url, connector, &opts)));
-        }
-        let uri: http::Uri = url
-            .parse()
-            .map_err(|e| PyValueError::new_err(format!("{e}")))?;
-        let host = uri
-            .host()
-            .ok_or_else(|| PyValueError::new_err("URL without a host"))?;
-        let addr = format!("{host}:{}", uri.port_u16().unwrap_or(80));
-        Ok(Self(zmux_websocket::candidate(connect(&addr), &url, &opts)))
+        Ok(Self(
+            WebSocketDial::new(&url, tls, carrier_credential, no_subprotocol)?.candidate(&url),
+        ))
     }
 
     /// A QUIC connection to `addr`, where the client reaches the server
@@ -161,13 +154,11 @@ impl Candidate {
             carrier_credential,
             zmux::adapter::DIAL_TIMEOUT,
         )?;
-        Ok(Self(zmux::Candidate::new(
+        Ok(Self::from_dial(
             zmux::CarrierKind::Quic,
-            move || {
-                let d = d.clone();
-                async move { d.open().await }
-            },
-        )))
+            d,
+            |d| async move { d.open().await },
+        ))
     }
 
     /// An HTTP/3 request to `url` (`https://`), sent to `addr` when given
@@ -178,7 +169,7 @@ impl Candidate {
         url: String,
         tls: Option<PyRef<'_, TlsConfig>>,
         addr: Option<(Host, u16)>,
-        lanes: u32,
+        #[pyo3(from_py_with = ranged)] lanes: u32,
         carrier_credential: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let d = H3Dial::new(
@@ -189,13 +180,11 @@ impl Candidate {
             carrier_credential,
             zmux::adapter::DIAL_TIMEOUT,
         )?;
-        Ok(Self(zmux::Candidate::new(
+        Ok(Self::from_dial(
             zmux::CarrierKind::Http3,
-            move || {
-                let d = d.clone();
-                async move { d.open().await }
-            },
-        )))
+            d,
+            |d| async move { d.open().await },
+        ))
     }
 
     /// A WebTransport session to `url` (`https://`; kind `webtransport`,
@@ -215,13 +204,49 @@ impl Candidate {
             carrier_credential,
             zmux::adapter::DIAL_TIMEOUT,
         )?;
-        Ok(Self(zmux::Candidate::new(
+        Ok(Self::from_dial(
             zmux::CarrierKind::WebTransport,
-            move || {
-                let d = d.clone();
-                async move { d.open().await }
-            },
-        )))
+            d,
+            |d| async move { d.open().await },
+        ))
+    }
+
+    /// Registers a host opener and its exact Join carrier layout.
+    #[staticmethod]
+    #[pyo3(signature = (kind, *, layout, open))]
+    fn custom(
+        py: Python<'_>,
+        kind: &str,
+        layout: &Bound<'_, PyAny>,
+        open: Py<PyAny>,
+    ) -> PyResult<Self> {
+        let kind = self::kind(kind)?;
+        let layout = crate::control::layout(layout)?;
+        let lp = crate::rt::LoopRef::running(py, "Candidate.custom")?;
+        let opener = crate::control::opener(open, lp);
+        let candidate = zmux::Candidate::new(kind, || async {
+            Err(std::io::Error::other(
+                "candidate requires an opener request",
+            ))
+        });
+        Ok(Self(candidate.with_opener(layout, opener)))
+    }
+
+    /// Registers this candidate's identity and the host's cache key.
+    #[pyo3(signature = (id, *, cache_key))]
+    fn with_identity(&self, id: String, cache_key: &str) -> Self {
+        Self(self.0.clone().with_identity(id.as_str(), cache_key))
+    }
+
+    /// Makes this candidate available for Join only.
+    fn join_only(&self) -> Self {
+        Self(self.0.clone().join_only())
+    }
+
+    /// Sets this candidate's tier and standby preference.
+    #[pyo3(signature = (tier, *, standby=false))]
+    fn with_preference(&self, tier: u64, standby: bool) -> Self {
+        Self(self.0.clone().with_tier(tier).with_standby(standby))
     }
 
     /// The candidate's `CarrierKind`.
@@ -251,244 +276,308 @@ impl Candidate {
     }
 }
 
-/// How a client chooses the carrier: `explicit(candidate)` or
-/// `auto(candidates)`.
+/// Authority to report sequenced observations for one cache key.
 #[pyclass(frozen, module = "zmux")]
-pub(crate) struct CarrierChoice(pub(crate) zmux::CarrierChoice);
+struct CarrierReportSource(zmux::CarrierReportSource);
+
+/// An application-controlled UTC clock for anchoring carrier snapshots.
+#[pyclass(frozen, module = "zmux")]
+struct WallClock(Arc<AtomicI64>);
 
 #[pymethods]
-impl CarrierChoice {
-    /// `candidate` only: a failure is reported, never replaced.
-    #[staticmethod]
-    fn explicit(candidate: PyRef<'_, Candidate>) -> Self {
-        Self(zmux::CarrierChoice::explicit(candidate.0.clone()))
-    }
-
-    /// A choice among `candidates`, most preferred first.
-    #[staticmethod]
-    fn auto(candidates: Vec<PyRef<'_, Candidate>>) -> PyResult<Self> {
-        if candidates.is_empty() {
-            return Err(PyValueError::new_err("an auto choice without a candidate"));
-        }
-        Ok(Self(zmux::CarrierChoice::auto(
-            candidates.iter().map(|c| c.0.clone()),
-        )))
-    }
-
-    /// Whether the choice is automatic.
-    #[getter]
-    fn is_auto(&self) -> bool {
-        self.0.is_auto()
-    }
-
-    fn __repr__(&self) -> String {
-        let kinds: Vec<_> = self
-            .0
-            .candidates()
-            .iter()
-            .map(|c| c.kind().name())
-            .collect();
-        format!(
-            "CarrierChoice.{}({})",
-            if self.0.is_auto() { "auto" } else { "explicit" },
-            kinds.join(", ")
-        )
-    }
-}
-
-/// How an automatic carrier choice orders, times and remembers its
-/// candidates. Durations in seconds.
-#[pyclass(frozen, module = "zmux")]
-pub(crate) struct CarrierChoicePolicy(pub(crate) zmux::CarrierChoicePolicy);
-
-#[pymethods]
-impl CarrierChoicePolicy {
-    /// `cache` remembers outcomes across dials under `key` (`None`: a cache
-    /// private to the session). A candidate's timer is the round trip of
-    /// opening its carrier times `timer_factor`, within `timer_min` and
-    /// `timer_max`. A joined pipe of a preferred kind stays `settle` before
-    /// the pipes it replaces retire; a kind whose pipes fail within
-    /// `drop_window` of being chosen counts as failed. `no_join` tries the
-    /// candidates one after another instead of establishing on the most
-    /// robust and joining the preferred ones (it does not apply to a pool).
+impl WallClock {
+    /// Starts at the supplied signed Unix timestamp in nanoseconds.
     #[new]
-    #[pyo3(signature = (*, cache=None, key=String::new(), timer_factor=3.0, timer_min=1.0,
-        timer_max=3.0, settle=1.0, drop_window=30.0, no_join=false))]
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        cache: Option<PyRef<'_, CarrierCache>>,
-        key: String,
-        timer_factor: f64,
-        timer_min: f64,
-        timer_max: f64,
-        settle: f64,
-        drop_window: f64,
-        no_join: bool,
-    ) -> PyResult<Self> {
-        let mut p = zmux::CarrierChoicePolicy::default();
-        match cache {
-            Some(c) => p = p.with_cache(c.0.clone(), key),
-            None => p.key = key,
-        }
-        if !(timer_factor.is_finite() && timer_factor >= 0.0) {
-            return Err(PyValueError::new_err(
-                "timer_factor is a non-negative finite number",
-            ));
-        }
-        p.timer_factor = timer_factor;
-        p.timer_min = seconds("timer_min", timer_min)?;
-        p.timer_max = seconds("timer_max", timer_max)?;
-        p.settle = seconds("settle", settle)?;
-        p.drop_window = seconds("drop_window", drop_window)?;
-        p.no_join = no_join;
-        Ok(Self(p))
+    fn new(timestamp_ns: i64) -> Self {
+        Self(Arc::new(AtomicI64::new(timestamp_ns)))
     }
 
-    #[getter]
-    fn key(&self) -> &str {
-        &self.0.key
+    /// Replaces the stored timestamp. The clock may move backward.
+    fn set(&self, timestamp_ns: i64) {
+        self.0.store(timestamp_ns, Ordering::Relaxed);
     }
+
+    /// Returns the stored Unix timestamp in nanoseconds.
     #[getter]
-    fn timer_factor(&self) -> f64 {
-        self.0.timer_factor
-    }
-    #[getter]
-    fn timer_min(&self) -> f64 {
-        self.0.timer_min.as_secs_f64()
-    }
-    #[getter]
-    fn timer_max(&self) -> f64 {
-        self.0.timer_max.as_secs_f64()
-    }
-    #[getter]
-    fn settle(&self) -> f64 {
-        self.0.settle.as_secs_f64()
-    }
-    #[getter]
-    fn drop_window(&self) -> f64 {
-        self.0.drop_window.as_secs_f64()
-    }
-    #[getter]
-    fn no_join(&self) -> bool {
-        self.0.no_join
+    fn timestamp_ns(&self) -> i64 {
+        self.0.load(Ordering::Relaxed)
     }
 }
 
-/// Which carrier kinds worked per server and local network, shared across
-/// dials.
+fn wall_time(nanos: i64) -> SystemTime {
+    let duration = Duration::from_nanos(nanos.unsigned_abs());
+    if nanos < 0 {
+        SystemTime::UNIX_EPOCH - duration
+    } else {
+        SystemTime::UNIX_EPOCH + duration
+    }
+}
+
+/// Shared scoring history and retry admission for carrier candidates.
 #[pyclass(frozen, module = "zmux")]
 pub(crate) struct CarrierCache(pub(crate) zmux::CarrierCache);
 
+fn cache_error(error: zmux::CarrierCacheError) -> PyErr {
+    use zmux::CarrierCacheError as E;
+    let name = match error {
+        E::Version => "CarrierCacheVersionError",
+        E::Format => "CarrierCacheFormatError",
+        _ => "CarrierCacheValueError",
+    };
+    crate::new_err(name, error.to_string())
+}
+
 #[pymethods]
 impl CarrierCache {
+    /// Creates an empty cache with optional scoring and retry settings.
     #[new]
-    #[pyo3(signature = (*, success_ttl=21600.0, backoff_min=60.0, backoff_max=21600.0))]
-    fn new(success_ttl: f64, backoff_min: f64, backoff_max: f64) -> PyResult<Self> {
-        Ok(Self(zmux::CarrierCache::new(
-            seconds("success_ttl", success_ttl)?,
-            seconds("backoff_min", backoff_min)?,
-            seconds("backoff_max", backoff_max)?,
+    #[pyo3(signature = (*, half_life=None, drop_window=None, performance_window=None,
+        health_reset=None, backoff=None, retry_profile=None, kind_priors=None,
+        import_limit=None, max_age=None, min_weight=0.0, clock_domain=None, wall_clock=None))]
+    fn new(
+        half_life: Option<f64>,
+        drop_window: Option<f64>,
+        performance_window: Option<f64>,
+        health_reset: Option<f64>,
+        backoff: Option<Bound<'_, PyAny>>,
+        retry_profile: Option<&str>,
+        kind_priors: Option<Bound<'_, PyDict>>,
+        #[pyo3(from_py_with = crate::ranged_opt)] import_limit: Option<usize>,
+        max_age: Option<f64>,
+        min_weight: f64,
+        clock_domain: Option<&crate::host::ClockDomain>,
+        wall_clock: Option<&WallClock>,
+    ) -> PyResult<Self> {
+        let mut config = zmux::CarrierCacheConfig::default();
+        if let Some(clock) = wall_clock {
+            let timestamp = clock.0.clone();
+            config = config.with_wall_clock(move || wall_time(timestamp.load(Ordering::Relaxed)));
+        }
+        if let Some(domain) = clock_domain {
+            config.clock_domain = domain.0.clone();
+        }
+        for (name, input, target) in [
+            ("half_life", half_life, &mut config.half_life),
+            ("drop_window", drop_window, &mut config.drop_window),
+            (
+                "performance_window",
+                performance_window,
+                &mut config.performance_window,
+            ),
+            ("health_reset", health_reset, &mut config.health_reset),
+        ] {
+            if let Some(input) = input {
+                *target = seconds(name, input)?;
+            }
+        }
+        if let Some(backoff) = &backoff {
+            config.backoff = crate::backoff_of(backoff)?;
+        }
+        match retry_profile {
+            None => {}
+            Some("short_drop_resilient") if backoff.is_none() => {
+                config = config.with_short_drop_resilience();
+            }
+            Some("short_drop_resilient") => {
+                return Err(PyValueError::new_err(
+                    "backoff and retry_profile are mutually exclusive",
+                ));
+            }
+            Some(_) => return Err(PyValueError::new_err("unknown cache retry profile")),
+        }
+        if let Some(priors) = kind_priors {
+            for (key, prior) in priors.iter() {
+                config
+                    .kind_priors
+                    .insert(kind(key.extract::<&str>()?)?, prior.extract()?);
+            }
+        }
+        config.import_limit = import_limit;
+        config.max_age = max_age.map(|v| seconds("max_age", v)).transpose()?;
+        config.min_weight = min_weight;
+        Ok(Self(
+            zmux::CarrierCache::new(config).map_err(crate::config_err)?,
+        ))
+    }
+
+    /// Reads retry pacing and suppression counters for a candidate.
+    #[pyo3(signature = (key, *, kind, variant=""))]
+    fn retry_metrics<'py>(
+        &self,
+        py: Python<'py>,
+        key: &str,
+        kind: &str,
+        variant: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let m = self.0.retry_metrics(key, self::kind(kind)?, variant);
+        let suppressions = pyo3::types::PyDict::new(py);
+        for (reason, count) in m.suppressions {
+            suppressions.set_item(crate::helpers::snake(&crate::kind_of(&reason)), count)?;
+        }
+        crate::types(py)?.getattr("RetryMetrics")?.call1((
+            m.attempted_starts,
+            m.recovery_nominal.as_secs_f64(),
+            m.recovery_sampled.as_secs_f64(),
+            crate::host::at(py, m.recovery_retry_at)?,
+            m.faults,
+            suppressions,
+            crate::dur(m.elapsed),
+            m.remaining.as_secs_f64(),
+        ))
+    }
+
+    /// Reads the decayed score, observations and current cooldown.
+    #[pyo3(signature = (key, *, kind, variant=""))]
+    fn score<'py>(
+        &self,
+        py: Python<'py>,
+        key: &str,
+        kind: &str,
+        variant: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let score = self.0.score(key, self::kind(kind)?, variant);
+        let types = crate::types(py)?;
+        let cooldown = score
+            .cooldown
+            .map(|value| {
+                types.getattr("Cooldown")?.call1((
+                    value.reason.map(|v| crate::kind_of(&v)),
+                    crate::host::at(py, value.started_at)?,
+                    value.nominal_wait.as_secs_f64(),
+                    crate::dur(value.sampled_wait),
+                    crate::monotonic(py, value.retry_at)?,
+                    value.remaining.as_secs_f64(),
+                ))
+            })
+            .transpose()?;
+        types.getattr("CarrierScore")?.call1((
+            score.score,
+            score.attempts,
+            score.weight,
+            score.success_weight,
+            score.window_survived,
+            score.short_drops,
+            score.post_window_faults,
+            crate::dur(score.age),
+            cooldown,
+            score.post_window_seconds,
+            measurement(py, score.rtt)?,
+            measurement(py, score.rate)?,
+        ))
+    }
+
+    /// Registers an independent sequence space for observations of one carrier key.
+    #[pyo3(signature = (key, *, kind, variant=""))]
+    fn register_report_source(
+        &self,
+        key: &str,
+        kind: &str,
+        variant: &str,
+    ) -> PyResult<CarrierReportSource> {
+        Ok(CarrierReportSource(self.0.register_report_source(
+            key,
+            self::kind(kind)?,
+            variant,
         )))
     }
 
-    /// Whether the carrier kind `kind` with `variant` is held as usable
-    /// under `key`.
-    #[pyo3(signature = (key, kind, *, variant=None))]
-    fn is_usable(&self, key: &str, kind: &str, variant: Option<&str>) -> PyResult<bool> {
-        Ok(self.0.is_usable(key, self::kind(kind)?, variant))
-    }
-
-    /// Whether the carrier kind `kind` with `variant` is backing off under
-    /// `key`.
-    #[pyo3(signature = (key, kind, *, variant=None))]
-    fn is_failed(&self, key: &str, kind: &str, variant: Option<&str>) -> PyResult<bool> {
-        Ok(self
-            .0
-            .failed_until(key, self::kind(kind)?, variant)
-            .is_some())
-    }
-
-    /// Records an outcome learnt after a dial (a `CacheOutcome` or its
-    /// name), under `key`, the carrier kind `kind` and the candidate's
-    /// `variant`.
-    #[pyo3(signature = (key, kind, outcome, *, variant=None))]
-    fn report(&self, key: &str, kind: &str, outcome: &str, variant: Option<&str>) -> PyResult<()> {
+    /// Applies a typed observation once. Returns whether the observation was new.
+    #[pyo3(signature = (source, *, sequence, outcome, observation=None))]
+    fn report(
+        &self,
+        source: &CarrierReportSource,
+        #[pyo3(from_py_with = ranged)] sequence: u64,
+        outcome: &str,
+        observation: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        use zmux::CacheOutcome as O;
         let outcome = match outcome {
-            "usable" => zmux::CacheOutcome::Usable,
-            "failed" => zmux::CacheOutcome::Failed,
-            "rejected" => zmux::CacheOutcome::Rejected,
-            o => return Err(PyValueError::new_err(format!("unknown outcome {o:?}"))),
+            "usable" => O::Usable,
+            "failed" => O::Failed,
+            "rejected" => O::Rejected,
+            "survived" => O::Survived,
+            "short_drop" => O::ShortDrop,
+            "late_drop" => O::LateDrop,
+            "lifetime" => O::Lifetime,
+            "performance" => O::Performance,
+            "recovered" => O::Recovered,
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown cache outcome {outcome:?}"
+                )));
+            }
         };
-        self.0.report(key, self::kind(kind)?, variant, outcome);
-        Ok(())
+        let mut sample = zmux::CarrierObservation::default();
+        if let Some(value) = observation {
+            sample.at = value
+                .getattr("at")?
+                .extract::<Option<f64>>()?
+                .map(|v| crate::host::instant(value.py(), "at", v))
+                .transpose()?;
+            sample.duration = crate::field_secs("duration", &value.getattr("duration")?)?;
+            sample.rtt = crate::field_secs("rtt", &value.getattr("rtt")?)?;
+            sample.rate = crate::field_count("rate", &value.getattr("rate")?)?;
+            sample.valid_for = crate::field_secs("valid_for", &value.getattr("valid_for")?)?;
+        }
+        self.0
+            .report_from(&source.0, sequence, outcome, sample)
+            .map_err(cache_error)
     }
 
-    /// What the cache knows, as JSON text (versioned; times in RFC 3339
-    /// UTC), for `restore` later, such as in the next run of the process.
-    /// Expired entries are left out.
-    fn snapshot(&self) -> String {
-        self.0.snapshot().to_json()
+    /// Exports the versioned cache snapshot as UTF-8 JSON bytes.
+    fn export(&self, py: Python<'_>) -> PyResult<crate::rt::Bin> {
+        py.detach(|| self.0.export())
+            .map(crate::rt::Bin::from)
+            .map_err(cache_error)
     }
 
-    /// Merges a `snapshot` into the cache: of two entries for one key, kind
-    /// and variant, the newer is kept; a backoff outside this cache's bounds is
-    /// brought within them; expired entries, unknown fields and kinds are
-    /// dropped. Malformed text raises `ValueError` and changes nothing.
-    fn restore(&self, snapshot: &str) -> PyResult<()> {
-        let s = zmux::CacheSnapshot::from_json(snapshot)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        self.0.restore(&s);
-        Ok(())
+    /// Validates and atomically merges a snapshot in the shared v2 format.
+    fn import_snapshot(
+        &self,
+        py: Python<'_>,
+        snapshot: &Bound<'_, pyo3::types::PyBytes>,
+    ) -> PyResult<()> {
+        let snapshot = snapshot.as_bytes();
+        py.detach(|| self.0.import(snapshot)).map_err(cache_error)
     }
 }
 
-fn kind(name: &str) -> PyResult<zmux::CarrierKind> {
+fn measurement(
+    py: Python<'_>,
+    value: Option<zmux::CarrierMeasurement>,
+) -> PyResult<Option<Bound<'_, PyAny>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let source = match value.source {
+        Some(zmux::CarrierMeasurementSource::Protocol) => Some("protocol"),
+        Some(zmux::CarrierMeasurementSource::HostReport) => Some("host_report"),
+        _ => None,
+    };
+    let types = crate::types(py)?;
+    let source = source
+        .map(|source| types.getattr("CarrierMeasurementSource")?.call1((source,)))
+        .transpose()?;
+    types
+        .getattr("CarrierMeasurement")?
+        .call1((
+            value.value,
+            value.age.as_secs_f64(),
+            value.valid_for.as_secs_f64(),
+            source,
+        ))
+        .map(Some)
+}
+
+pub(crate) fn kind(name: &str) -> PyResult<zmux::CarrierKind> {
     zmux::CarrierKind::from_name(name)
         .ok_or_else(|| PyValueError::new_err(format!("unknown carrier kind {name:?}")))
 }
 
-/// Establishes a client session over the carrier `choice` selects:
-/// explicit, its one candidate; auto, the most robust candidate first, then
-/// the preferred ones joined (see `CarrierChoicePolicy`). No usable
-/// candidate raises `CarrierChoiceError`, an invalid choice or policy
-/// `ValueError`.
-#[pyfunction]
-#[pyo3(signature = (choice, *, config=None, choice_policy=None))]
-fn connect_choice<'p>(
-    py: Python<'p>,
-    choice: PyRef<'_, CarrierChoice>,
-    config: Option<Bound<'p, PyAny>>,
-    choice_policy: Option<PyRef<'_, CarrierChoicePolicy>>,
-) -> PyResult<Bound<'p, PyAny>> {
-    let config = crate::cfg(config)?;
-    let policy = choice_policy.map_or_else(Default::default, |p| p.0.clone());
-    let choice = choice.0.clone();
-    future_into_py(py, async move {
-        match zmux::dial_choice(&choice, config, &policy).await {
-            Ok(s) => Ok(Session::new(s)),
-            Err(e) if e.invalid.is_some() => Err(PyValueError::new_err(e.to_string())),
-            Err(e) => Err(crate::rt::lazy_err(move |py| {
-                let results = match e
-                    .results
-                    .iter()
-                    .map(|r| result_obj(r)(py))
-                    .collect::<PyResult<Vec<_>>>()
-                {
-                    Ok(r) => r,
-                    Err(err) => return err,
-                };
-                let t = crate::err_type(py, "CarrierChoiceError");
-                PyErr::from_type(t, (e.to_string(), results))
-            })),
-        }
-    })
-}
-
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Candidate>()?;
-    m.add_class::<CarrierChoice>()?;
-    m.add_class::<CarrierChoicePolicy>()?;
     m.add_class::<CarrierCache>()?;
-    m.add_function(wrap_pyfunction!(connect_choice, m)?)?;
+    m.add_class::<CarrierReportSource>()?;
+    m.add_class::<WallClock>()?;
     Ok(())
 }

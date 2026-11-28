@@ -3,10 +3,12 @@ without a subprotocol and a stream's requested priority."""
 
 import asyncio
 import contextlib
+import socket
 from collections.abc import AsyncIterator
 
 import pytest
 import zmux
+from support import LOOPBACK, TEST_HOOKS, WATCHDOG, manual_clock, native_call
 
 
 @contextlib.asynccontextmanager
@@ -45,35 +47,51 @@ async def test_join_prefix_needs_a_hello() -> None:
         assert kind == zmux.adapter.JoinPrefix.NEED_MORE and need > 1
 
 
+def test_fallback_on_peek_timeout_config() -> None:
+    def decide(info: zmux.CarrierInfo, prefix: bytes) -> zmux.AdmissionVerdict:
+        return zmux.AdmissionVerdict.accept()
+
+    assert not zmux.Admission(decide).fallback_on_peek_timeout
+    assert zmux.Admission(
+        decide, fallback_on_peek_timeout=True
+    ).fallback_on_peek_timeout
+
+
+@pytest.mark.skipif(not TEST_HOOKS, reason="requires the test-hooks build")
 async def test_fallback_on_peek_timeout() -> None:
+    clock = manual_clock()
+    peek_timeout = 7
+
+    def decide(*_: object) -> zmux.AdmissionVerdict:
+        pytest.fail("a partial prefix reached the decider")
+
     admission = zmux.Admission(
-        lambda info, prefix: zmux.AdmissionVerdict.accept(0),
+        decide,
         peek=8,
-        peek_timeout=0.3,
+        peek_timeout=peek_timeout,
         fallback_on_peek_timeout=True,
     )
-    assert admission.fallback_on_peek_timeout
-    assert not zmux.Admission(
-        lambda i, p: zmux.AdmissionVerdict.CLOSE
-    ).fallback_on_peek_timeout
     replayed: asyncio.Queue[bytes] = asyncio.Queue()
     config = zmux.ListenerConfig(
         admission=admission, fallback=lambda taken: replayed.put_nowait(taken.replayed)
     )
-    async with asyncio.timeout(5), zmux.Listener(listener_config=config) as listener:
-        reader, writer = await asyncio.open_connection(
-            *await listener.serve_tcp("127.0.0.1", 0)
-        )
-        try:
-            writer.write(b"ab")
-            await writer.drain()
-            assert await replayed.get() == b"ab"
-            assert await reader.read() == b""
-            stats = listener.stats().admission
-            assert (stats.peek_timed_out, stats.fallback, stats.stalled) == (0, 1, 0)
-        finally:
-            writer.close()
-            await writer.wait_closed()
+    async with (
+        asyncio.timeout(WATCHDOG),
+        zmux.Listener(
+            config=zmux.Config(clock_domain=clock.domain), listener_config=config
+        ) as listener,
+        asyncio.TaskGroup() as tasks,
+    ):
+        carrier, peer = zmux.adapter.pipe_pair()
+        await peer.write(b"ab")
+        tasks.create_task(listener.handle_pipe(carrier))
+        await clock.wait_for_timer(peek_timeout)
+        assert replayed.empty()
+        clock.advance(peek_timeout)
+        assert await replayed.get() == b"ab"
+        assert await peer.read() == b""
+        stats = listener.stats().admission
+        assert (stats.peek_timed_out, stats.fallback, stats.stalled) == (0, 1, 0)
 
 
 async def test_http_split_pair_field() -> None:
@@ -138,7 +156,7 @@ async def test_stream_pair_reader_and_writer() -> None:
 
 
 async def test_stream_pair_writer_raises_the_first_send_error() -> None:
-    async with zmux.Listener() as listener:
+    async with asyncio.timeout(WATCHDOG), zmux.Listener() as listener:
         addr = await listener.serve_tcp("127.0.0.1", 0)
         async with (
             await zmux.Session.connect(await zmux.dial_tcp(*addr)) as c,
@@ -146,20 +164,19 @@ async def test_stream_pair_writer_raises_the_first_send_error() -> None:
         ):
             _reader, writer = await c.open_stream_pair()
             writer.write(b"x")
-            await writer.drain()
-            _send, recv = await asyncio.wait_for(s.accept_bi(), 5)
+            await writer.flush()
+            _send, recv = await s.accept_bi()
             recv.stop(9)
-            with pytest.raises(zmux.StreamStoppedError):
-                async with asyncio.timeout(5):
-                    while True:
-                        writer.write(b"y" * 1000)
-                        await writer.drain()
-                        await asyncio.sleep(0.01)
+            assert await writer.stream.stopped() == 9
+            writer.write(b"y")
+            with pytest.raises(zmux.StreamStoppedError) as first:
+                await writer.flush()
             # Kept: every later call raises it again.
-            with pytest.raises(zmux.StreamStoppedError):
+            with pytest.raises(zmux.StreamStoppedError) as write:
                 writer.write(b"z")
-            with pytest.raises(zmux.StreamStoppedError):
+            with pytest.raises(zmux.StreamStoppedError) as drain:
                 await writer.drain()
+            assert first.value is write.value is drain.value
             writer.abort(1)
 
 
@@ -208,7 +225,7 @@ def test_exception_hierarchy() -> None:
         "SessionClosedError",
         "ApplicationClosedError",
         "TransportClosedError",
-        "CarrierChoiceError",
+        "BootstrapError",
         "VerifyRejectedError",
         "NoExporterError",
     ):
@@ -237,18 +254,17 @@ async def test_carrier_credential_error_surfaces_as_itself() -> None:
 
 
 async def test_listener_closed_while_serving_stops_the_server() -> None:
-    listener = zmux.Listener()
-    serving = asyncio.ensure_future(listener.serve_tcp("127.0.0.1", 0))
-    await asyncio.sleep(0)
-    listener.close()
-    addr = await asyncio.wait_for(serving, 5)
-    host, port = addr
-    async with asyncio.timeout(5):
+    async with asyncio.timeout(WATCHDOG), zmux.Listener() as listener:
+        addr = await native_call(
+            lambda: listener.serve_tcp(LOOPBACK, 0), on_create=listener.close
+        )
+        loop = asyncio.get_running_loop()
+
+        # Aborting the carrier server releases its socket on the runtime.
         while True:
-            try:
-                _r, w = await asyncio.open_connection(host, int(port))
-            except OSError:
-                break
-            w.close()
-            await w.wait_closed()
-            await asyncio.sleep(0.05)
+            with socket.socket() as probe:
+                probe.setblocking(False)
+                try:
+                    await loop.sock_connect(probe, addr)
+                except ConnectionRefusedError:
+                    return

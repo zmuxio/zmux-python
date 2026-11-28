@@ -62,7 +62,6 @@ fn sent_obj(py: Python<'_>, s: h::Sent) -> Py<PyAny> {
     let name = match s {
         h::Sent::Datagram => "datagram",
         h::Sent::Capsule => "capsule",
-        h::Sent::Dropped => "dropped",
         other => {
             return crate::helpers::snake(&crate::kind_of(&other))
                 .into_pyobject(py)
@@ -74,31 +73,31 @@ fn sent_obj(py: Python<'_>, s: h::Sent) -> Py<PyAny> {
     typed(py, "Sent", name.into()).unbind()
 }
 
-fn stats_obj(py: Python<'_>, s: h::PacketStats) -> PyResult<Py<PyAny>> {
+fn stats_obj(
+    py: Python<'_>,
+    s: h::PacketStats,
+    other: Option<h::PacketStats>,
+) -> PyResult<Py<PyAny>> {
     let d = PyDict::new(py);
-    d.set_item("sent_datagrams", s.sent_datagrams)?;
-    d.set_item("sent_capsules", s.sent_capsules)?;
-    d.set_item("dropped_too_large", s.dropped_too_large)?;
-    d.set_item("dropped_limited", s.dropped_limited)?;
-    d.set_item("received_datagrams", s.received_datagrams)?;
-    d.set_item("received_capsules", s.received_capsules)?;
-    d.set_item("skipped_capsules", s.skipped_capsules)?;
+    let other = other.unwrap_or_default();
+    macro_rules! counters {
+        ($($field:ident),+ $(,)?) => {
+            $(d.set_item(stringify!($field), s.$field + other.$field)?;)+
+        };
+    }
+    counters!(
+        sent_datagrams,
+        sent_capsules,
+        dropped_too_large,
+        dropped_limited,
+        received_datagrams,
+        received_capsules,
+        skipped_capsules,
+    );
     Ok(types(py)?
         .getattr("PacketStats")?
         .call((), Some(&d))?
         .unbind())
-}
-
-fn merge(a: h::PacketStats, b: h::PacketStats) -> h::PacketStats {
-    let mut m = a;
-    m.sent_datagrams += b.sent_datagrams;
-    m.sent_capsules += b.sent_capsules;
-    m.dropped_too_large += b.dropped_too_large;
-    m.dropped_limited += b.dropped_limited;
-    m.received_datagrams += b.received_datagrams;
-    m.received_capsules += b.received_capsules;
-    m.skipped_capsules += b.skipped_capsules;
-    m
 }
 
 /// A half and the counters it had when its last operation completed, read
@@ -160,12 +159,13 @@ fn send<'p>(
     tx: &Half<h::PacketSender>,
     payload: PyBackedBytes,
     context: u64,
+    options: zmux::DatagramSendOptions,
 ) -> PyResult<Bound<'p, PyAny>> {
     let tx = tx.clone();
     future_into_py(py, async move {
         let mut g = held(&tx.part).await?;
         let r = g
-            .send_with_context(context, Bytes::from_owner(payload))
+            .send_packet_with(context, Bytes::from_owner(payload), options)
             .await;
         tx.record(&g);
         drop(g);
@@ -211,20 +211,9 @@ impl Rx {
             py,
             async move {
                 let mut g = held(&rx.half.part).await?;
-                // A packet taken back while this waits is taken instead:
-                // the receive is cancel-safe and packets are unordered.
-                let got = loop {
-                    if let Some(v) = lock(&back).pop_front() {
-                        break Ok(v);
-                    }
-                    tokio::select! {
-                        r = g.recv() => break Err(r),
-                        () = wake.notified() => {}
-                    }
-                };
-                let got = match got {
-                    Ok(v) => Ok(v),
-                    Err(r) => {
+                let got = match crate::receive_returned_first(back, wake, g.recv()).await {
+                    crate::Next::Again(v) => Ok(v),
+                    crate::Next::New(r) => {
                         rx.half.record(&g);
                         Err(r.map_err(packet_err)?)
                     }
@@ -288,7 +277,31 @@ impl PacketStream {
         payload: PyBackedBytes,
         #[pyo3(from_py_with = ranged)] context: u64,
     ) -> PyResult<Bound<'p, PyAny>> {
-        send(py, &self.tx, payload, context)
+        send(
+            py,
+            &self.tx,
+            payload,
+            context,
+            zmux::DatagramSendOptions::default(),
+        )
+    }
+
+    /// Sends a packet with local datagram options. Cancellation may have written a capsule prefix.
+    #[pyo3(signature = (payload, *, options, context=0))]
+    fn send_with<'p>(
+        &self,
+        py: Python<'p>,
+        payload: PyBackedBytes,
+        options: &Bound<'_, PyAny>,
+        #[pyo3(from_py_with = ranged)] context: u64,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        send(
+            py,
+            &self.tx,
+            payload,
+            context,
+            crate::datagram::options(Some(options))?,
+        )
     }
 
     fn recv<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
@@ -308,30 +321,17 @@ impl PacketStream {
     }
 
     fn stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        stats_obj(py, merge(self.tx.stats(), self.rx.half.stats()))
+        stats_obj(py, self.tx.stats(), Some(self.rx.half.stats()))
     }
 
     fn split(&self) -> PyResult<(PacketSender, PacketReceiver)> {
-        let (s, r) = (&self.tx.part, &self.rx.half.part);
-        let mut sg = crate::rt::when_free(|| s.try_lock()).map_err(|_| crate::busy())?;
-        let mut rg = crate::rt::when_free(|| r.try_lock()).map_err(|_| crate::busy())?;
-        match (sg.take(), rg.take()) {
-            (Some(s), Some(r)) => {
-                // The same queue of packets taken back: a receive started
-                // before the split and cancelled after it requeues where
-                // the receiver takes from.
-                let rx = Rx {
-                    half: Half::new(r),
-                    back: self.rx.back.clone(),
-                };
-                Ok((PacketSender(Half::new(s)), PacketReceiver(rx)))
-            }
-            (s, r) => {
-                *sg = s;
-                *rg = r;
-                Err(crate::stream_err(zmux::StreamError::ClosedLocally))
-            }
-        }
+        let (s, r) = crate::take_parts(&self.tx.part, &self.rx.half.part, |_, _| Ok(()))?;
+        // A receive started before the split can be returned after it.
+        let rx = Rx {
+            half: Half::new(r),
+            back: self.rx.back.clone(),
+        };
+        Ok((PacketSender(Half::new(s)), PacketReceiver(rx)))
     }
 }
 
@@ -348,7 +348,31 @@ impl PacketSender {
         payload: PyBackedBytes,
         #[pyo3(from_py_with = ranged)] context: u64,
     ) -> PyResult<Bound<'p, PyAny>> {
-        send(py, &self.0, payload, context)
+        send(
+            py,
+            &self.0,
+            payload,
+            context,
+            zmux::DatagramSendOptions::default(),
+        )
+    }
+
+    /// Sends a packet with local datagram options. Cancellation may have written a capsule prefix.
+    #[pyo3(signature = (payload, *, options, context=0))]
+    fn send_with<'p>(
+        &self,
+        py: Python<'p>,
+        payload: PyBackedBytes,
+        options: &Bound<'_, PyAny>,
+        #[pyo3(from_py_with = ranged)] context: u64,
+    ) -> PyResult<Bound<'p, PyAny>> {
+        send(
+            py,
+            &self.0,
+            payload,
+            context,
+            crate::datagram::options(Some(options))?,
+        )
     }
 
     fn close<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
@@ -356,7 +380,7 @@ impl PacketSender {
     }
 
     fn stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        stats_obj(py, self.0.stats())
+        stats_obj(py, self.0.stats(), None)
     }
 }
 
@@ -379,7 +403,7 @@ impl PacketReceiver {
     }
 
     fn stats(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        stats_obj(py, self.0.half.stats())
+        stats_obj(py, self.0.half.stats(), None)
     }
 }
 

@@ -5,28 +5,13 @@ import asyncio
 import contextlib
 import math
 import sys
-from collections.abc import AsyncIterator
 
 import pytest
 import zmux
+from support import start_pending, until
+from support import session_pair as pair
 
 CANCELLED = zmux.ApplicationErrorCode.ZMUX_CANCELLED
-
-
-@contextlib.asynccontextmanager
-async def pair(
-    config: zmux.Config | None = None,
-) -> AsyncIterator[tuple[zmux.Session, zmux.Session]]:
-    async with zmux.Listener(config=config) as listener:
-        host, port = await listener.serve_tcp("127.0.0.1", 0)
-        c = await zmux.connect_tcp(host, port, config=config)
-        s = await listener.accept()
-        try:
-            yield c, s
-        finally:
-            c.abort(0)
-            s.abort(0)
-            await asyncio.gather(c.wait_closed(), s.wait_closed())
 
 
 async def test_serve_reports_host_and_port() -> None:
@@ -180,9 +165,8 @@ async def test_errors_are_classified_by_what_happened() -> None:
         # holds none.
         other, _ = await c.open_bi()
         # The peer reads nothing: the write never ends and holds its part.
-        waiting = asyncio.ensure_future(other.write(b"x" * (16 << 20)))
-        read = asyncio.ensure_future(recv.read())
-        await asyncio.sleep(0.05)
+        waiting = await start_pending(lambda: other.write(b"x" * (16 << 20)))
+        read = await start_pending(recv.read)
         with pytest.raises(zmux.StreamBusyError):
             other.set_reliable_boundary()
         assert recv.receive_window[0] > 0
@@ -296,27 +280,20 @@ def test_backoff_is_one_top_level_type() -> None:
         zmux.DEFAULT_BACKOFF_JITTER,
     )
     assert b.jitter == 0.2
-    assert zmux.Config().redial_backoff == b
-    zmux.Config(redial_backoff=zmux.Backoff(0.1, 1.0, jitter=0))
+    zmux.CarrierCache(backoff=zmux.Backoff(0.1, max=1.0, jitter=1, jitter_up=1))
     for bad in (
         zmux.Backoff(jitter=-0.1),
-        zmux.Backoff(jitter=1.0),
+        zmux.Backoff(jitter=1.1),
+        zmux.Backoff(jitter_up=1.1),
         zmux.Backoff(jitter=math.nan),
-        zmux.Backoff(5.0, 1.0),
-        zmux.Backoff(0.0, 1.0),
+        zmux.Backoff(5.0, max=1.0),
+        zmux.Backoff(0.0, max=1.0),
     ):
         with pytest.raises(ValueError):
-            zmux.Config(redial_backoff=bad)
-        with pytest.raises(ValueError):
-            zmux.helpers.PipePool(1, _no_dial, backoff=bad)
+            zmux.CarrierCache(backoff=bad)
         with pytest.raises(ValueError):
             zmux.ExchangeOptions(backoff=bad, unauthenticated=True)
-    zmux.helpers.PipePool(1, _no_dial, backoff=zmux.Backoff(jitter=0))
-    zmux.ExchangeOptions(backoff=zmux.Backoff(0.01, 1.0), unauthenticated=True)
-
-
-async def _no_dial() -> zmux.PipeIo:
-    raise AssertionError("not dialled")
+    zmux.ExchangeOptions(backoff=zmux.Backoff(0.01, max=1.0), unauthenticated=True)
 
 
 def test_listener_takes_its_configuration_as_a_dataclass() -> None:
@@ -346,7 +323,7 @@ async def test_adapter_entries_are_in_their_namespace() -> None:
 def test_the_namespaces_hold_what_they_say() -> None:
     assert {"Scheduler", "Redundancy"} == set(zmux.sched.__all__)
     assert "ShapingBundle" in zmux.shaping.__all__
-    assert {"PipePool", "splice", "Limiter"} <= set(zmux.helpers.__all__)
+    assert {"PacketStream", "splice", "Limiter"} <= set(zmux.helpers.__all__)
     for ns in (zmux.adapter, zmux.sched, zmux.shaping, zmux.helpers):
         for name in ns.__all__:
             assert name not in zmux.__all__, name
@@ -403,8 +380,8 @@ async def test_a_stream_datagram_goes_while_a_write_is_in_progress() -> None:
     async with pair(config) as (c, s):
         send, _ = await c.open_bi()
         # The peer reads nothing: the write never ends and holds its part.
-        waiting = asyncio.ensure_future(send.write(b"x" * (16 << 20)))
-        await asyncio.sleep(0.05)
+        waiting = await start_pending(lambda: send.write(b"x" * (16 << 20)))
+        await until(c, lambda: send.id is not None)
         assert not waiting.done()
         with pytest.raises(zmux.StreamBusyError):
             send.set_reliable_boundary()
@@ -476,7 +453,6 @@ def test_exported_defaults() -> None:
     assert zmux.DEFAULT_MAX_LANES == 258 == zmux.Config().max_lanes
     assert zmux.DEFAULT_RECOVERY_RATIO == 1.25
     assert zmux.DEFAULT_MIN_INTERVAL == 1.0 == zmux.QualityBand(rtt=1).min_interval
-    assert zmux.helpers.MIN_RECHECK == 0.01
 
 
 def test_session_id_is_a_new_type() -> None:

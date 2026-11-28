@@ -2,19 +2,12 @@
 and the next use from a running loop binds them to that loop."""
 
 import asyncio
-import time
-from collections.abc import Callable
 
 import pytest
 
 import zmux
+from support import LOOPBACK, CallbackSignal, until
 from zmux._zmux import pipe_pair
-
-
-async def until(cond: Callable[[], object], limit: float = 5.0) -> None:
-    async with asyncio.timeout(limit):
-        while not cond():
-            await asyncio.sleep(0.005)
 
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
@@ -63,27 +56,31 @@ def test_a_decider_of_a_closed_loop_refuses_at_once() -> None:
 
 def test_events_of_a_closed_loop_are_dropped_and_not_reported() -> None:
     seen: list[tuple[str, int]] = []
+    notifications = CallbackSignal()
 
     class Trace(zmux.Tracer):
         def established(self, session: zmux.SessionId) -> None:
             seen.append(("established", session))
+            notifications.notify()
 
         def dropped(self, session: zmux.SessionId, count: int) -> None:
             seen.append(("dropped", session))
+            notifications.notify()
 
         def closed(self, session: zmux.SessionId, reason: BaseException) -> None:
             seen.append(("closed", session))
+            notifications.notify()
 
     config = zmux.Config(tracer=Trace())
     li = zmux.Listener()
     held: dict[str, zmux.Session] = {}
 
     async def first() -> tuple[str, int]:
-        addr = await li.serve_tcp("127.0.0.1", 0)
-        held["c"] = await zmux.connect_tcp(*addr, config=config)
+        address = await li.serve_tcp(LOOPBACK, 0)
+        held["c"] = await zmux.connect_tcp(*address, config=config)
         held["s"] = await asyncio.wait_for(li.accept(), 5)
-        await until(lambda: seen)
-        return addr
+        await until(notifications, lambda: seen)
+        return address
 
     addr = asyncio.run(first())
     c1 = held["c"].id
@@ -92,30 +89,23 @@ def test_events_of_a_closed_loop_are_dropped_and_not_reported() -> None:
     # The client's session ends with its loop closed: its `closed` is not
     # told, and nothing is reported later.
     held["s"].close()
-    time.sleep(0.5)
 
     async def again() -> int:
+        await held["s"].wait_closed()
+        await held["c"].wait_closed()
         # `li` first: its use binds it to this loop.
         async with (
             li,
             await zmux.connect_tcp(*addr, config=config) as c,
             await asyncio.wait_for(li.accept(), 5),
         ):
-            await until(lambda: ("established", c.id) in seen)
+            await until(notifications, lambda: ("established", c.id) in seen)
             return c.id
 
     asyncio.run(again())
     # Nothing of the first session was reported after its loop closed.
     assert [e for e in seen[1:] if e[1] == c1] == []
     assert all(k != "dropped" for k, _ in seen)
-
-
-def test_min_recheck() -> None:
-    assert zmux.helpers.MIN_RECHECK == 0.01
-    # As in the crate: shorter is lengthened by the pool, not refused; zero is.
-    assert zmux.helpers.PoolDecision(recheck=0.001).recheck == 0.001
-    with pytest.raises(ValueError):
-        zmux.helpers.PoolDecision(recheck=0)
 
 
 def test_hooks_outside_a_running_loop_say_so() -> None:

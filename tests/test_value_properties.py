@@ -15,6 +15,7 @@ import pytest
 import zmux
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
+from support import LOOPBACK
 
 # The pure checks are cheap; the native ones go through a live session.
 PURE = settings(max_examples=300, deadline=None)
@@ -92,31 +93,6 @@ def test_capacity_floor_accepts_exactly_the_documented_values(
 
 # ---- PoolDecision ------------------------------------------------------------------
 
-count_or_inherit = ints | st.just(zmux.INHERIT)
-dial_after = floats | st.just(zmux.INHERIT)
-
-
-@PURE
-@given(count=count_or_inherit, dial_after=dial_after, recheck=seconds)
-def test_pool_decision_accepts_exactly_the_documented_values(
-    count: Any, dial_after: Any, recheck: float | None
-) -> None:
-    valid = (
-        (count is zmux.INHERIT or count >= 1)
-        and (dial_after is zmux.INHERIT or 0 <= dial_after < TWO64)
-        and (recheck is None or (ns(recheck) >= 1 and recheck < TWO64))
-    )
-    if not valid:
-        with pytest.raises(ValueError):
-            zmux.helpers.PoolDecision(
-                count=count, dial_after=dial_after, recheck=recheck
-            )
-        return
-    d = zmux.helpers.PoolDecision(count=count, dial_after=dial_after, recheck=recheck)
-    assert (d.count, d.dial_after, d.recheck) == (count, dial_after, recheck)
-    assert d.retire_pipes == ()
-
-
 # ---- PipeOptions -------------------------------------------------------------------
 
 UPDATABLE = (
@@ -140,25 +116,24 @@ def test_clear_is_refused_in_every_updatable_option(name: str) -> None:
     zmux.PipeOptions(**options)
 
 
-async def _no_dial() -> zmux.PipeIo:
-    raise AssertionError("not dialled")
-
-
 @PURE
 @given(
     field=st.sampled_from(["send_priority", "receive_priority", "weight"]), value=ints
 )
-def test_unsigned_pipe_options_take_a_u64(field: str, value: int) -> None:
-    """The tier and the weight of a pipe are unsigned 64-bit integers; the pool
-    checks the options where it takes them."""
+def test_unsigned_pipe_options_take_a_u64(
+    field: str, value: int, live: tuple[asyncio.Runner, zmux.Session, zmux.SendStream]
+) -> None:
+    """The native pipe accepts the full unsigned range of its tier and weight."""
     kwargs: dict[str, Any] = {field: value}
     options = zmux.PipeOptions(**kwargs)
     assert getattr(options, field) == value
+    _, session, _ = live
+    pipe = session.pipes()[0]
     if 0 <= value < 2**64:
-        zmux.helpers.PipePool(1, _no_dial, options=options)
+        pipe.update(**kwargs)
     else:
         with pytest.raises(ValueError):
-            zmux.helpers.PipePool(1, _no_dial, options=options)
+            pipe.update(**kwargs)
 
 
 @PURE
@@ -168,9 +143,12 @@ def test_unsigned_pipe_options_take_a_u64(field: str, value: int) -> None:
     probe_jitter=floats | st.just(zmux.INHERIT),
 )
 def test_pipe_liveness_is_checked_where_it_is_used(
-    suspect_floor: Any, probe_interval: Any, probe_jitter: Any
+    suspect_floor: Any,
+    probe_interval: Any,
+    probe_jitter: Any,
+    live: tuple[asyncio.Runner, zmux.Session, zmux.SendStream],
 ) -> None:
-    live = zmux.PipeLiveness(
+    liveness = zmux.PipeLiveness(
         suspect_floor=suspect_floor,
         probe_interval=probe_interval,
         probe_jitter=probe_jitter,
@@ -185,12 +163,13 @@ def test_pipe_liveness_is_checked_where_it_is_used(
     floor_ok = suspect_floor is zmux.INHERIT or (
         50_000_000 <= ns(suspect_floor) < TWO64 * 1e9
     )
-    options = zmux.PipeOptions(liveness=live)
+    _, session, _ = live
+    pipe = session.pipes()[0]
     if jitter_ok and interval_ok and floor_ok:
-        zmux.helpers.PipePool(1, _no_dial, options=options)
+        pipe.update(liveness=liveness)
     else:
         with pytest.raises(ValueError):
-            zmux.helpers.PipePool(1, _no_dial, options=options)
+            pipe.update(liveness=liveness)
 
 
 # ---- Priority and the session settings, through a live session ---------------------
@@ -202,12 +181,18 @@ def live() -> Iterator[tuple[asyncio.Runner, zmux.Session, zmux.SendStream]]:
     runner = asyncio.Runner()
 
     async def setup() -> tuple[zmux.Listener, zmux.Session, zmux.Session, Any]:
-        listener = zmux.Listener()
-        host, port = await listener.serve_tcp("127.0.0.1", 0)
-        client = await zmux.connect_tcp(host, port)
-        server = await listener.accept()
-        send, _recv = await client.open_bi()
-        return listener, client, server, send
+        config = zmux.Config(
+            session_policy=zmux.SessionPolicy(
+                limits=zmux.CapacityLimits(steady_attachments=2)
+            ),
+            pipe_auth=zmux.PipeAuth.psk(bytes(32)).with_end_to_end(),
+        )
+        local_listener = zmux.Listener(config=config)
+        host, port = await local_listener.serve_tcp(LOOPBACK, 0)
+        dialer = await zmux.connect_tcp(host, port, config=config)
+        accepted = await local_listener.accept()
+        sender, _recv = await dialer.open_bi()
+        return local_listener, dialer, accepted, sender
 
     listener, client, server, send = runner.run(setup())
 
@@ -224,11 +209,13 @@ def live() -> Iterator[tuple[asyncio.Runner, zmux.Session, zmux.SendStream]]:
         runner.close()
 
 
-urgency = st.integers(-(2**70), 2**70) | st.sampled_from([-1, 0, 7, 8, 255, 256])
+urgency_strategy = st.integers(-(2**70), 2**70) | st.sampled_from(
+    [-1, 0, 7, 8, 255, 256]
+)
 
 
 @NATIVE
-@given(urgency=urgency, incremental=st.booleans())
+@given(urgency=urgency_strategy, incremental=st.booleans())
 def test_priority_urgency_is_zero_to_seven(
     live: Any, urgency: int, incremental: bool
 ) -> None:
