@@ -335,9 +335,7 @@ def test_a_bundle_chooses_a_candidate_and_plans() -> None:
             '{"kinds":{"default":[{"requires":["later"]}]}}'
         )
     with pytest.raises(ValueError, match="duplicate_key"):
-        zmux.shaping.ShapingBundle.from_json(
-            '{"kinds":{"default":[]},"kinds":{}}'
-        )
+        zmux.shaping.ShapingBundle.from_json('{"kinds":{"default":[]},"kinds":{}}')
 
 
 async def test_a_refused_establish_goes_to_on_reject() -> None:
